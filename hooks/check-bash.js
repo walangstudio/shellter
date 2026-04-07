@@ -260,10 +260,10 @@ const DENY_PATTERNS = [
 // Each segment must match one of these for auto-approval.
 
 const APPROVE_PATTERNS = [
-  // Read-only git
-  /^\s*git\s+(status|log|diff|show|branch|tag|remote|describe|rev-parse|ls-files|shortlog|stash\s+list)\b/,
-  // Safe git writes
-  /^\s*git\s+(add|commit|fetch|stash\s+(save|push|pop|apply))\b/,
+  // Read-only git (with optional -C <path> prefix)
+  /^\s*git\s+(-C\s+\S+\s+)?(status|log|diff|show|branch|tag|remote|describe|rev-parse|ls-files|shortlog|stash\s+list)\b/,
+  // Safe git writes (with optional -C <path> prefix)
+  /^\s*git\s+(-C\s+\S+\s+)?(add|commit|fetch|checkout\s+-b|stash\s+(save|push|pop|apply))\b/,
   // Safe system commands
   /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|find|sort|uniq|tr|cut|paste|tee|xargs|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq)\b/,
   // Read-only system inspection
