@@ -268,13 +268,34 @@ const APPROVE_PATTERNS = [
   /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|find|sort|uniq|tr|cut|paste|tee|xargs|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq)\b/,
   // Read-only system inspection
   /^\s*(ss|ps|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link)|ping|dig|nslookup|traceroute|env|printenv|locale|timedatectl|journalctl|systemctl\s+status|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt)\b/,
+  // HTTP requests (deny patterns already block data uploads and pipe-to-shell)
+  /^\s*(curl|wget)\b/,
   // Version checks
-  /^\s*(cargo|npm|yarn|pnpm|uv|pip|go|rustc|gcc|node|python3?|ruby|java|dotnet)\s+--version\s*$/,
-  // Build/test (not install/publish)
+  /^\s*(cargo|npm|yarn|pnpm|uv|pip|go|rustc|gcc|node|python3?|ruby|java|dotnet|mvn|docker|kubectl)\s+(--version|-v(ersion)?)\b/,
+  // Build/test
   /^\s*cargo\s+(build|test|check|clippy|fmt|doc)\b/,
   /^\s*npm\s+(run|test|ci)\b/,
   /^\s*make(\s+(all|build|test|check|lint|fmt|debug|release))?\s*$/,
   /^\s*uv\s+run\b/,
+  // Java/Maven
+  /^\s*mvn\s+(clean|compile|test|install|package|verify|dependency:tree|dependency:resolve|help:effective-pom)\b/,
+  /^\s*(java|javac)\s/,
+  // Docker (read-only)
+  /^\s*docker\s+(ps|images|logs|inspect|stats|top|port|network\s+(ls|inspect)|volume\s+(ls|inspect)|compose\s+(ps|logs|config))\b/,
+  // Python
+  /^\s*python3?\s/,
+  /^\s*pytest\b/,
+  // Shell control flow (deny checks still run on each segment inside)
+  /^\s*(for|while|until|do|done|if|then|else|elif|fi|case|esac|select)\b/,
+  /^\s*do\s/,
+  /^\s*done\s*$/,
+  /^\s*then\s*$/,
+  /^\s*fi\s*$/,
+  // Shell builtins and common dev tools
+  /^\s*(source|export|set|type|command|hash|builtin|timeout|time)\s/,
+  /^\s*(tmux|screen)\s/,
+  /^\s*(tar|zip|unzip|gzip|gunzip|bzip2|xz)\s/,
+  /^\s*(chmod|chown)\s/,
 ];
 
 function checkDeny(segment) {
@@ -286,8 +307,10 @@ function checkDeny(segment) {
 }
 
 function checkApprove(segment) {
+  // Strip leading VAR=value pairs (e.g., JAVA_HOME=/path mvn test)
+  const stripped = segment.replace(/^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   for (const pattern of APPROVE_PATTERNS) {
-    if (pattern.test(segment)) {
+    if (pattern.test(segment) || pattern.test(stripped)) {
       return true;
     }
   }
