@@ -110,6 +110,64 @@ function splitChainSegments(cmd) {
   return segments.map(s => s.trim()).filter(s => s.length > 0);
 }
 
+function extractSubshellContent(value) {
+  if (!value.startsWith('$(')) return null;
+
+  let i = 2;
+  let depth = 1;
+  let inSingle = false;
+  let inDouble = false;
+
+  while (i < value.length && depth > 0) {
+    const ch = value[i];
+
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = true;
+      i++;
+      continue;
+    }
+    if (ch === '\\' && inDouble) {
+      i += 2;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = !inDouble;
+      i++;
+      continue;
+    }
+    if (inDouble) {
+      i++;
+      continue;
+    }
+    if (ch === '$' && i + 1 < value.length && value[i + 1] === '(') {
+      depth++;
+      i += 2;
+      continue;
+    }
+    if (ch === '(') {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === ')') {
+      depth--;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  if (depth === 0) {
+    return { inner: value.slice(2, i - 1), rest: value.slice(i).trim() };
+  }
+  return null;
+}
+
 function deny(reason) {
   const output = JSON.stringify({
     hookSpecificOutput: {
@@ -307,6 +365,55 @@ function checkDeny(segment) {
 }
 
 function checkApprove(segment) {
+  // Handle variable assignments: VAR=value or VAR=$(cmd)
+  const assignMatch = segment.match(/^\s*[A-Za-z_][A-Za-z0-9_]*=(.*)$/);
+  if (assignMatch) {
+    const value = assignMatch[1].trim();
+
+    // Empty value - safe
+    if (value === '') return true;
+
+    // Simple literal value (no command substitution or backticks)
+    if (!value.includes('$(') && !value.includes('`')) {
+      return true;
+    }
+
+    // Command substitution: $(...)
+    if (value.startsWith('$(')) {
+      const extracted = extractSubshellContent(value);
+      if (extracted && extracted.rest === '') {
+        const innerSegments = splitChainSegments(extracted.inner);
+        for (const seg of innerSegments) {
+          if (!checkApprove(seg)) return false;
+        }
+        return true;
+      }
+    }
+
+    // Quoted command substitution: "$(...)""
+    if (value.startsWith('"$(') && value.endsWith(')"')) {
+      const innerValue = value.slice(1, -1); // Remove outer quotes
+      const extracted = extractSubshellContent(innerValue);
+      if (extracted && extracted.rest === '') {
+        const innerSegments = splitChainSegments(extracted.inner);
+        for (const seg of innerSegments) {
+          if (!checkApprove(seg)) return false;
+        }
+        return true;
+      }
+    }
+
+    // Backtick substitution: `...`
+    if (value.startsWith('`') && value.endsWith('`') && value.length > 2) {
+      const inner = value.slice(1, -1);
+      const innerSegments = splitChainSegments(inner);
+      for (const seg of innerSegments) {
+        if (!checkApprove(seg)) return false;
+      }
+      return true;
+    }
+  }
+
   // Strip leading VAR=value pairs (e.g., JAVA_HOME=/path mvn test)
   const stripped = segment.replace(/^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   for (const pattern of APPROVE_PATTERNS) {
