@@ -1,23 +1,40 @@
 #!/usr/bin/env node
-// PreToolUse hook for Bash commands.
-//
-// Protocol:
-//   stdin:  JSON with .tool_input.command
-//   stdout: JSON with .hookSpecificOutput.permissionDecision = allow|deny|ask
-//   exit 0: structured decision (or fallthrough if no output)
-//   exit 2: hard block (stderr shown to user)
-//
-// Policy:
-//   - Deny destructive commands (rm -rf system dirs, force push main, drop db, etc.)
-//   - Auto-approve genuinely safe read-only commands
-//   - Everything else falls through to normal permission prompt
-//
-// Chain handling:
-//   Splits on &&, ||, ; (outside quotes/subshells) and checks each segment.
-//   DENY if ANY segment matches a deny pattern.
-//   APPROVE only if ALL segments match an approve pattern.
+// PreToolUse hook for Bash. Splits chains and checks each segment, recursively
+// into `bash -c`, `find -exec`, `xargs`, and `<(...) / >(...)`.
+// CLAUDE_HOOK_LOG=/path or CLAUDE_HOOK_DEBUG=1 to record decisions.
 
 'use strict';
+
+const fs = require('fs');
+
+function audit(decision, reason, snippet) {
+  const log = process.env.CLAUDE_HOOK_LOG;
+  const debug = process.env.CLAUDE_HOOK_DEBUG;
+  if (!log && !debug) return;
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    hook: 'check-bash',
+    decision,
+    reason,
+    snippet: String(snippet || '').slice(0, 500),
+  });
+  if (log) {
+    try { fs.appendFileSync(log, line + '\n'); } catch {}
+  }
+  if (debug) {
+    try { process.stderr.write(line + '\n'); } catch {}
+  }
+}
+
+// Strip invisible/steganographic chars so `b<U+200B>ash -c …` can't slip past regex.
+function normalizeUnicode(s) {
+  if (typeof s !== 'string') return s;
+  return s
+    .replace(/[\u{E0000}-\u{E007F}]/gu, '')
+    .replace(/[‪-‮⁦-⁩]/g, '')
+    .replace(/[​-‍⁠﻿]/g, '')
+    .replace(/[  -   　]/g, ' ');
+}
 
 function splitChainSegments(cmd) {
   const len = cmd.length;
@@ -77,6 +94,11 @@ function splitChainSegments(cmd) {
       i += 2;
       continue;
     }
+    if ((ch === '<' || ch === '>') && next === '(') {
+      depth++;
+      i += 2;
+      continue;
+    }
     if (ch === '(') {
       depth++;
       i++;
@@ -110,10 +132,8 @@ function splitChainSegments(cmd) {
   return segments.map(s => s.trim()).filter(s => s.length > 0);
 }
 
-function extractSubshellContent(value) {
-  if (!value.startsWith('$(')) return null;
-
-  let i = 2;
+function extractParenContent(value, openIdx) {
+  let i = openIdx + 1;
   let depth = 1;
   let inSingle = false;
   let inDouble = false;
@@ -144,11 +164,6 @@ function extractSubshellContent(value) {
       i++;
       continue;
     }
-    if (ch === '$' && i + 1 < value.length && value[i + 1] === '(') {
-      depth++;
-      i += 2;
-      continue;
-    }
     if (ch === '(') {
       depth++;
       i++;
@@ -156,19 +171,117 @@ function extractSubshellContent(value) {
     }
     if (ch === ')') {
       depth--;
+      if (depth === 0) {
+        return { inner: value.slice(openIdx + 1, i), end: i + 1 };
+      }
       i++;
       continue;
     }
     i++;
   }
-
-  if (depth === 0) {
-    return { inner: value.slice(2, i - 1), rest: value.slice(i).trim() };
-  }
   return null;
 }
 
-function deny(reason) {
+// Returns {innerCmd, opaque} for `bash -c '...'` style invocations, or null.
+function parseShellCInvocation(segment) {
+  const m = segment.match(
+    /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh)\s+(?:-[a-zA-Z]*c|--command)\s+(.+)$/
+  );
+  if (!m) return null;
+  const arg = m[2].trim();
+
+  if (arg.startsWith("'")) {
+    const end = arg.indexOf("'", 1);
+    if (end === -1) return { innerCmd: null, opaque: true };
+    return { innerCmd: arg.slice(1, end), opaque: false };
+  }
+
+  if (arg.startsWith('"')) {
+    let i = 1;
+    while (i < arg.length) {
+      if (arg[i] === '\\') { i += 2; continue; }
+      if (arg[i] === '"') break;
+      i++;
+    }
+    if (i >= arg.length) return { innerCmd: null, opaque: true };
+    const inner = arg.slice(1, i);
+    if (/\$\(|`|\$\{|\$[A-Za-z_]/.test(inner)) {
+      return { innerCmd: null, opaque: true };
+    }
+    return { innerCmd: inner, opaque: false };
+  }
+
+  if (/^\$/.test(arg) || /\$\(|`/.test(arg)) {
+    return { innerCmd: null, opaque: true };
+  }
+  return { innerCmd: arg, opaque: false };
+}
+
+// Returns array of inner commands from each `-exec ... \;` / `+` clause.
+function parseFindExec(segment) {
+  if (!/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*find\b/.test(segment)) return null;
+  const results = [];
+  const re = /\s-(?:exec(?:dir)?|ok(?:dir)?)\s+(.+?)\s+(?:\\;|\+)(?=\s|$)/g;
+  let m;
+  while ((m = re.exec(segment)) !== null) {
+    results.push(m[1].trim());
+  }
+  return results.length ? results : null;
+}
+
+// Returns the inner command string from `xargs [opts] CMD ARGS`.
+function parseXargs(segment) {
+  const stripped = segment.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, '');
+  if (!/^xargs\b/.test(stripped)) return null;
+  const tokens = stripped.split(/\s+/);
+  if (tokens[0] !== 'xargs') return null;
+  const valueFlags = new Set(['-I', '-n', '-P', '-d', '-E', '-s', '-L']);
+  let i = 1;
+  while (i < tokens.length) {
+    const tok = tokens[i];
+    if (!tok.startsWith('-')) break;
+    if (tok.startsWith('--') && tok.includes('=')) { i++; continue; }
+    if (tok.startsWith('--')) { i++; continue; }
+    if (tok.length > 2 && valueFlags.has(tok.slice(0, 2))) { i++; continue; }
+    if (tok.length === 2 && valueFlags.has(tok) && i + 1 < tokens.length) { i += 2; continue; }
+    i++;
+  }
+  if (i >= tokens.length) return null;
+  return tokens.slice(i).join(' ');
+}
+
+function extractProcessSubstitutions(segment) {
+  const results = [];
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+  while (i < segment.length) {
+    const ch = segment[i];
+    const next = segment[i + 1] || '';
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) { inSingle = true; i++; continue; }
+    if (ch === '\\' && inDouble) { i += 2; continue; }
+    if (ch === '"') { inDouble = !inDouble; i++; continue; }
+    if (inDouble) { i++; continue; }
+    if ((ch === '<' || ch === '>') && next === '(') {
+      const r = extractParenContent(segment, i + 1);
+      if (r) {
+        results.push(r.inner);
+        i = r.end;
+        continue;
+      }
+    }
+    i++;
+  }
+  return results;
+}
+
+function deny(reason, snippet) {
+  audit('deny', reason, snippet);
   const output = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -180,7 +293,8 @@ function deny(reason) {
   process.exit(0);
 }
 
-function approve() {
+function approve(snippet) {
+  audit('allow', 'Auto-approved by hook', snippet);
   const output = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -192,239 +306,320 @@ function approve() {
   process.exit(0);
 }
 
-// --- DENY PATTERNS ---
-// Each entry: [regex, reason]
-// Tested against each chain segment independently.
-
 const DENY_PATTERNS = [
   // Encoded payload execution
-  [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(bash|sh|zsh|eval|python|perl|ruby|node)/i,
+  [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
     'Encoded payload piped to shell blocked'],
-  [/\becho\s+.*\|\s*(base64|xxd)\s.*\|\s*(bash|sh)/i,
+  [/\becho\s+.*\|\s*(base64|xxd)\s.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh)\b/i,
     'Encoded execution chain blocked'],
 
-  // eval (targeted, not blanket)
-  [/^\s*eval\s/,
-    'eval as command blocked -- use explicit commands instead'],
-  [/\beval\s+.*(\$[({]|`)/,
-    'eval with dynamic content blocked -- possible injection'],
-  [/\beval\s+.*\b(base64|decode|atob)\b/i,
-    'eval with encoded payload blocked'],
+  // eval (targeted)
+  [/^\s*eval\s/, 'eval as command blocked -- use explicit commands instead'],
+  [/\beval\s+.*(\$[({]|`)/, 'eval with dynamic content blocked -- possible injection'],
+  [/\beval\s+.*\b(base64|decode|atob)\b/i, 'eval with encoded payload blocked'],
 
   // Reverse shells
-  [/bash\s+-i\s+.*>\/dev\/tcp\//,
-    'Reverse shell pattern blocked'],
-  [/\/dev\/(tcp|udp)\//,
-    'Direct /dev/tcp or /dev/udp access blocked'],
-  [/\b(nc|ncat|netcat|socat)\s+.*-[a-zA-Z]*e\s/i,
-    'Netcat with -e blocked -- possible reverse shell'],
-  [/python[23]?\s+-c\s+.*\b(socket|pty\.spawn|subprocess)\b/i,
-    'Python one-liner with socket/pty/subprocess blocked'],
-  [/perl\s+-e\s+.*\bsocket\b/i,
-    'Perl socket one-liner blocked'],
-  [/ruby\s+-e\s+.*\bTCPSocket\b/i,
-    'Ruby TCPSocket one-liner blocked'],
+  [/bash\s+-i\s+.*>\/dev\/tcp\//, 'Reverse shell pattern blocked'],
+  [/\/dev\/(tcp|udp)\//, 'Direct /dev/tcp or /dev/udp access blocked'],
+  [/\b(nc|ncat|netcat|socat)\s+.*-[a-zA-Z]*e\s/i, 'Netcat with -e blocked -- possible reverse shell'],
+  [/python[23]?\s+-c\s+.*\b(socket|pty\.spawn|subprocess)\b/i, 'Python one-liner with socket/pty/subprocess blocked'],
+  [/perl\s+-e\s+.*\bsocket\b/i, 'Perl socket one-liner blocked'],
+  [/ruby\s+-e\s+.*\bTCPSocket\b/i, 'Ruby TCPSocket one-liner blocked'],
 
   // Data exfiltration
   [/\bcurl\s+.*(-d|--data|--data-binary|--data-raw|-F|--form|-T|--upload-file)[\s='"]/i,
     'curl with data upload blocked -- review manually'],
-  [/\bwget\s+.*--post-(data|file)/i,
-    'wget POST blocked -- review manually'],
+  [/\bwget\s+.*--post-(data|file)/i, 'wget POST blocked -- review manually'],
 
-  // Download-and-execute
-  [/\b(curl|wget)\s+.*\|\s*(bash|sh|zsh|python|perl|ruby|node)/i,
+  // Download-and-execute / pipe-to-interpreter (incl. absolute paths)
+  [/\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b/i,
     'Download-and-execute pipe blocked -- inspect script first'],
+  // Generic pipe-to-interpreter: end-of-segment or -c/-i/-s flag (no script arg).
+  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i,
+    'Pipe to bare shell/interpreter blocked'],
+  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i,
+    'Pipe to interpreter with -c/-i/-s blocked'],
+  // Process substitution as input to source/. or a shell.
+  [/\b(source|\.)\s+<\(/, 'source/. of process substitution blocked'],
+  [/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh)\s+<\(/i,
+    'Shell with process-substitution input blocked'],
 
-  // Persistence mechanisms
+  // Persistence
   [/(crontab|\/etc\/cron|\/etc\/systemd|\/etc\/init\.d|\/etc\/rc\.local)/i,
     'Modifying cron/systemd/init blocked -- possible persistence'],
-  [/(>|>>|tee)\s+\/etc\//i,
-    'Writing to /etc blocked'],
+  [/(>|>>|tee\s+(-a)?)\s*\/etc\//i, 'Writing to /etc blocked'],
+  [/(>|>>|tee\s+(-a)?)\s*[^\s|;&]*\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc|config\.fish)\b/i,
+    'Writing to shell rc file blocked -- possible persistence'],
+  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]*\.git\/hooks\//i,
+    'Writing to .git/hooks blocked -- possible persistence'],
+  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]*(\.github\/workflows\/|\.gitlab-ci\.yml|\.circleci\/config|Jenkinsfile|\.drone\.yml|\.azure-pipelines\.yml|\.woodpecker\.yml|buildkite\.yml)\b/i,
+    'Writing to CI config blocked -- possible supply-chain attack'],
 
-  // Privilege escalation
-  [/^\s*sudo\s/,
-    'sudo blocked -- run privileged commands manually'],
-  [/\bchmod\s+[0-7]*[4-7][0-7]*[0-7]*\s+.*\.(sh|py|rb|js|pl)\b/,
-    'Setting setuid/setgid on scripts blocked'],
-  [/\bchmod\s+[u+]*s\b/,
-    'chmod setuid/setgid blocked'],
+  // Privilege escalation / identity tampering
+  [/^\s*sudo\s/, 'sudo blocked -- run privileged commands manually'],
+  [/\bchmod\s+[0-7]*[4-7][0-7]*[0-7]*\s+.*\.(sh|py|rb|js|pl)\b/, 'Setting setuid/setgid on scripts blocked'],
+  [/\bchmod\s+[u+]*s\b/, 'chmod setuid/setgid blocked'],
+  [/^\s*(chsh|usermod|useradd|userdel|groupadd|groupdel|passwd|visudo|gpasswd|adduser|deluser)\b/,
+    'User/group modification blocked'],
+  [/^\s*(insmod|rmmod|modprobe|kexec)\b/, 'Kernel module / kexec blocked'],
+  [/\b(LD_PRELOAD|LD_LIBRARY_PATH|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH)\s*=\S/i,
+    'Loader-injection environment variable blocked'],
+  [/^\s*(at|batch|systemd-run)\s/, 'Alternative scheduling (at/batch/systemd-run) blocked'],
+  [/\b(strace|ltrace|gdb)\s+.*-p\s+\d/i, 'Attaching debugger/tracer to running process blocked'],
 
-  // Environment variable exfiltration
-  [/\b(env|printenv|set)\b.*\|\s*(curl|wget|nc|netcat|ncat)/i,
+  // Identity / git backdoor
+  [/git\s+config\s+(--global\s+|--system\s+)?(user\.(email|name|signingkey)|gpg\.program|core\.hooksPath|core\.editor|core\.sshcommand|credential\.helper|alias\.\S+\s+!)/i,
+    'git config of identity / hook / credential helper blocked -- possible backdoor'],
+
+  // Environment exfiltration
+  [/\b(env|printenv|set)\b.*\|\s*(curl|wget|nc|netcat|ncat|socat)/i,
     'Piping environment to network tool blocked'],
 
-  // SSH/SCP (lateral movement)
-  [/^\s*(ssh|scp|sftp)\s/,
-    'SSH/SCP blocked -- run manually'],
+  // SSH / lateral movement
+  [/^\s*(ssh|scp|sftp)\s/, 'SSH/SCP blocked -- run manually'],
 
   // Supply chain
-  [/\b(pip|npm|yarn)\s+install\s+.*https?:\/\//i,
+  [/\b(pip|pip3|npm|yarn|pnpm|bun)\s+install\s+.*https?:\/\//i,
     'Installing packages from raw URLs blocked'],
+  [/\b(curl|wget)\s+.*\.(sh|py|rb|pl)\b.*-o\s/i, 'Downloading executable script for later run -- review manually'],
 
   // Container escape
-  [/docker\s+run\s+.*--privileged/i,
-    'Privileged docker run blocked'],
-  [/docker\s+run\s+.*-v\s+\/:\//i,
-    'Docker host root mount blocked'],
+  [/docker\s+run\s+.*--privileged/i, 'Privileged docker run blocked'],
+  [/docker\s+run\s+.*-v\s+\/:\//i, 'Docker host root mount blocked'],
 
   // Process injection
-  [/\/proc\/[0-9]+\/mem|\/proc\/[0-9]+\/maps|ptrace/,
-    'Process memory access blocked'],
+  [/\/proc\/[0-9]+\/(mem|maps|cwd|root|exe)|ptrace/, 'Process memory access blocked'],
 
   // Disk operations
-  [/\b(mkfs|fdisk|parted)\b/i,
-    'Disk/partition operations blocked'],
-  [/\bdd\s+if=/i,
-    'dd disk operation blocked'],
+  [/\b(mkfs|fdisk|parted|wipefs|shred)\b/i, 'Disk/partition/wipe operations blocked'],
+  [/\bdd\s+if=/i, 'dd disk operation blocked'],
 
   // Firewall
-  [/\b(iptables|nftables|ufw|firewall-cmd)\b/i,
-    'Firewall modification blocked'],
+  [/\b(iptables|nftables|ufw|firewall-cmd|pfctl)\b/i, 'Firewall modification blocked'],
 
   // Git destructive
-  [/git\s+push\s+.*\b(main|master)\b/,
-    'git push to main/master blocked -- push to a feature branch'],
-  [/git\s+push\s+origin\s*$/,
-    'git push to default branch blocked'],
-  [/git\s+push\s+.*--force/,
-    'git push --force blocked'],
-  [/git\s+push\s+-f\b/,
-    'git push -f blocked'],
-  [/git\s+reset\s+--hard/,
-    'git reset --hard blocked -- can destroy uncommitted work'],
-  [/git\s+clean\s+-[a-zA-Z]*f/,
-    'git clean -f blocked -- deletes untracked files'],
-  [/git\s+checkout\s+--\s/,
-    'git checkout -- blocked -- discards uncommitted changes'],
+  [/git\s+push\s+.*\b(main|master)\b/, 'git push to main/master blocked -- push to a feature branch'],
+  [/git\s+push\s+origin\s*$/, 'git push to default branch blocked'],
+  [/git\s+push\s+.*--force(?!-with-lease)/, 'git push --force blocked'],
+  [/git\s+push\s+-f\b/, 'git push -f blocked'],
+  [/git\s+reset\s+--hard/, 'git reset --hard blocked -- can destroy uncommitted work'],
+  [/git\s+clean\s+-[a-zA-Z]*f/, 'git clean -f blocked -- deletes untracked files'],
+  [/git\s+checkout\s+--\s/, 'git checkout -- blocked -- discards uncommitted changes'],
+  [/git\s+update-ref\s+-d\b/, 'git update-ref -d blocked -- destroys refs'],
+  [/git\s+filter-(branch|repo)\b/, 'git filter-branch / filter-repo blocked -- rewrites history'],
 
   // Sensitive file reads via shell
-  [/(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep)\s+.*\.(env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc)\b/i,
+  [/(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg)\s+.*\.(env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)\b/i,
     'Reading sensitive file via shell blocked'],
-  [/(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep)\s+.*(\.env|\.secret|credentials|id_rsa|id_ed25519|\.ssh\/|\.gnupg\/|\.aws\/|\.gcloud\/)/i,
+  [/(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg)\s+.*(\.env|\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\/|\.gnupg\/|\.aws\/|\.gcloud\/|\.azure\/|\.docker\/config|\.gitconfig|\.git-credentials)/i,
     'Reading sensitive file/directory via shell blocked'],
 
-  // rm on system directories (handles both rm -rf and rm -fr)
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\/|\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev)\b/,
+  // Destructive rm
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\/|\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin)\b/,
     'Destructive rm on system directory blocked'],
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+~\b/,
-    'Destructive rm on home directory blocked'],
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+~\b/, 'Destructive rm on home directory blocked'],
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\{\}|\$\{?[A-Za-z_])/,
+    'rm -rf with placeholder/variable target blocked'],
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+\/\*/, 'rm -rf /* blocked'],
 
   // SQL destructive
-  [/\b(drop|truncate)\s+(database|table|schema)\b/i,
-    'DROP/TRUNCATE blocked'],
+  [/\b(drop|truncate)\s+(database|table|schema)\b/i, 'DROP/TRUNCATE blocked'],
+
+  // Cryptocurrency miners
+  [/\b(xmrig|minerd|cgminer|bfgminer|ethminer|t-rex|nbminer|lolminer|phoenixminer|gminer|teamredminer)\b/i,
+    'Cryptocurrency miner binary blocked'],
+  [/\bstratum\+(tcp|ssl|tls):\/\//i, 'stratum mining pool URL blocked'],
+
+  // Suspicious ssh-keygen targets
+  [/ssh-keygen\s+.*-f\s+\/(tmp|var|opt|dev)\//i, 'ssh-keygen writing to system temp blocked'],
 ];
 
-// --- APPROVE PATTERNS ---
-// Each segment must match one of these for auto-approval.
-
 const APPROVE_PATTERNS = [
-  // Read-only git (with optional -C <path> prefix)
-  /^\s*git\s+(-C\s+\S+\s+)?(status|log|diff|show|branch|tag|remote|describe|rev-parse|ls-files|shortlog|stash\s+list)\b/,
-  // Safe git writes (with optional -C <path> prefix)
-  /^\s*git\s+(-C\s+\S+\s+)?(add|commit|fetch|checkout\s+-b|stash\s+(save|push|pop|apply))\b/,
+  // Read-only git
+  /^\s*git\s+(-C\s+\S+\s+)?(status|log|diff|show|branch|tag|remote|describe|rev-parse|ls-files|shortlog|stash\s+list|blame|reflog|bisect|show-ref|cat-file|ls-tree|range-diff|whatchanged|notes\s+(list|show))\b/,
+  // Safe git writes
+  /^\s*git\s+(-C\s+\S+\s+)?(add|commit|fetch|checkout\s+-b|stash\s+(save|push|pop|apply|drop)|switch|pull|merge|cherry-pick|worktree\s+(list|add|remove)|restore\s+--staged)\b/,
+  // Git resume operations
+  /^\s*git\s+(-C\s+\S+\s+)?(rebase|cherry-pick|merge|am|revert)\s+(--continue|--abort|--skip|--quit|--edit-todo)\b/,
+  // Git rebase non-interactive
+  /^\s*git\s+(-C\s+\S+\s+)?rebase\s+(?!-i\b)(?!--interactive\b)/,
+
   // Safe system commands
-  /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|find|sort|uniq|tr|cut|paste|tee|xargs|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq)\b/,
+  /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|find|sort|uniq|tr|cut|paste|tee|xargs|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq|fd|bat|delta|hexdump|xxd|md5sum|sha1sum|sha256sum|sha512sum|cksum|crc32)\b/,
   // Read-only system inspection
-  /^\s*(ss|ps|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link)|ping|dig|nslookup|traceroute|env|printenv|locale|timedatectl|journalctl|systemctl\s+status|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt)\b/,
-  // HTTP requests (deny patterns already block data uploads and pipe-to-shell)
+  /^\s*(ss|ps|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|env|printenv|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
+  // HTTP requests (deny rules cover dangerous flags)
   /^\s*(curl|wget)\b/,
   // Version checks
-  /^\s*(cargo|npm|yarn|pnpm|uv|pip|go|rustc|gcc|node|python3?|ruby|java|dotnet|mvn|docker|kubectl)\s+(--version|-v(ersion)?)\b/,
-  // Build/test
-  /^\s*cargo\s+(build|test|check|clippy|fmt|doc)\b/,
+  /^\s*(cargo|npm|yarn|pnpm|uv|pip|pip3|go|rustc|gcc|node|python[23]?|ruby|java|dotnet|mvn|docker|kubectl|terraform|helm|gh|bun|deno|tsc|eslint|prettier)\s+(--version|-v(ersion)?|version)\b/,
+
+  // Build / test
+  /^\s*cargo\s+(build|test|check|clippy|fmt|doc|run|tree|metadata)\b/,
   /^\s*npm\s+(run|test|ci)\b/,
-  /^\s*make(\s+(all|build|test|check|lint|fmt|debug|release))?\s*$/,
-  /^\s*uv\s+run\b/,
-  // Java/Maven
+  /^\s*make(\s+(all|build|test|check|lint|fmt|debug|release|help|tidy|format))?\s*$/,
+  /^\s*uv\s+(run|sync|lock|tree|pip\s+(list|show|tree))\b/,
+
+  // Java / Maven
   /^\s*mvn\s+(clean|compile|test|install|package|verify|dependency:tree|dependency:resolve|help:effective-pom)\b/,
   /^\s*(java|javac)\s/,
+
   // Docker (read-only)
-  /^\s*docker\s+(ps|images|logs|inspect|stats|top|port|network\s+(ls|inspect)|volume\s+(ls|inspect)|compose\s+(ps|logs|config))\b/,
+  /^\s*docker\s+(ps|images|logs|inspect|stats|top|port|version|info|context\s+(ls|show|inspect)|system\s+(info|df|events)|network\s+(ls|inspect)|volume\s+(ls|inspect)|compose\s+(ps|logs|config|top|images|version|events))\b/,
+
   // Python
-  /^\s*python3?\s/,
+  /^\s*python[23]?\s/,
   /^\s*pytest\b/,
-  // Shell control flow (deny checks still run on each segment inside)
+  /^\s*python[23]?\s+-m\s+(pytest|unittest|black|ruff|mypy|pylint|isort|flake8|coverage|tox|build|venv|pip\s+(list|show|freeze))\b/,
+  /^\s*(ruff|black|mypy|pylint|pyright|isort|flake8|bandit|pyflakes|autopep8|yapf|pycodestyle|pydocstyle|pyupgrade)\b/,
+
+  // Go
+  /^\s*go\s+(version|env|run|test|build|vet|fmt|generate|list|doc|mod\s+(tidy|download|verify|graph|why|init))\b/,
+
+  // JavaScript / TypeScript tooling
+  /^\s*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc)\b/,
+  /^\s*(npx|pnpm|yarn|bun)\s+(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)\b/,
+  /^\s*pnpm\s+(run|test|build|dev|lint|format|exec|start)\b/,
+  /^\s*bun\s+(run|test|build|dev|x\s+\S+|start)\b/,
+  /^\s*yarn\s+(run|test|build|dev|lint|format|start)\b/,
+
+  // GitHub CLI (read-only)
+  /^\s*gh\s+(auth\s+status|repo\s+(view|list)|pr\s+(view|list|status|checks|diff)|issue\s+(view|list|status)|run\s+(view|list|watch)|workflow\s+(view|list)|release\s+(view|list)|api\s+-X\s+GET\b|api\s+\/?[A-Za-z0-9_\/-]+\s*$|search\s+(repos|issues|prs|code|commits|users))\b/,
+
+  // Kubernetes (read-only)
+  /^\s*kubectl\s+(get|describe|logs|explain|top|version|api-resources|api-versions|cluster-info|config\s+(view|current-context|get-contexts|get-clusters|get-users)|auth\s+can-i)\b/,
+
+  // Terraform / Helm (read-only)
+  /^\s*terraform\s+(plan|validate|fmt|version|providers|output|state\s+(list|show)|workspace\s+(list|show)|graph)\b/,
+  /^\s*helm\s+(lint|template|version|list|status|history|show\s+\w+|repo\s+(list|update)|search\s+\w+)\b/,
+
+  // Pre-commit / linters
+  /^\s*pre-commit\s+(run|install|autoupdate|validate-config|migrate-config|sample-config)\b/,
+  /^\s*(tflint|shellcheck|hadolint|yamllint|markdownlint)\b/,
+
+  // Shell control flow / builtins
   /^\s*(for|while|until|do|done|if|then|else|elif|fi|case|esac|select)\b/,
   /^\s*do\s/,
   /^\s*done\s*$/,
   /^\s*then\s*$/,
   /^\s*fi\s*$/,
-  // Shell builtins and common dev tools
-  /^\s*(source|export|set|type|command|hash|builtin|timeout|time)\s/,
+  /^\s*(source|export|set|type|command|hash|builtin|timeout|time|trap|read|local|declare|readonly|unset)\s/,
+  /^\s*command\s+-v\s/,
+  /^\s*type\s+-[apt]/,
+
+  // Multiplexers / archives / perms
   /^\s*(tmux|screen)\s/,
-  /^\s*(tar|zip|unzip|gzip|gunzip|bzip2|xz)\s/,
+  /^\s*(tar|zip|unzip|gzip|gunzip|bzip2|xz|zstd|7z)\s/,
   /^\s*(chmod|chown)\s/,
 ];
 
-function checkDeny(segment) {
+function checkSegmentDeny(seg, depth) {
+  if (depth === undefined) depth = 0;
+  if (depth > 6) return;
+
+  const stripped = seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+
   for (const [pattern, reason] of DENY_PATTERNS) {
-    if (pattern.test(segment)) {
-      deny(reason);
+    if (pattern.test(seg) || pattern.test(stripped)) {
+      deny(reason, seg);
+    }
+  }
+
+  const shellC = parseShellCInvocation(seg);
+  if (shellC) {
+    if (shellC.opaque) {
+      deny('Opaque shell -c argument blocked -- contains $(...), backticks, or $VAR', seg);
+    }
+    const innerSegs = splitChainSegments(shellC.innerCmd);
+    for (const inner of innerSegs) {
+      checkSegmentDeny(inner, depth + 1);
+    }
+  }
+
+  const findCmds = parseFindExec(seg);
+  if (findCmds) {
+    for (const cmd of findCmds) {
+      const innerSegs = splitChainSegments(cmd);
+      for (const inner of innerSegs) {
+        checkSegmentDeny(inner, depth + 1);
+      }
+    }
+  }
+
+  const xargsCmd = parseXargs(seg);
+  if (xargsCmd) {
+    const innerSegs = splitChainSegments(xargsCmd);
+    for (const inner of innerSegs) {
+      checkSegmentDeny(inner, depth + 1);
+    }
+  }
+
+  const psubs = extractProcessSubstitutions(seg);
+  for (const inner of psubs) {
+    const innerSegs = splitChainSegments(inner);
+    for (const innerSeg of innerSegs) {
+      checkSegmentDeny(innerSeg, depth + 1);
     }
   }
 }
 
-function checkApprove(segment) {
-  // Handle variable assignments: VAR=value or VAR=$(cmd)
-  const assignMatch = segment.match(/^\s*[A-Za-z_][A-Za-z0-9_]*=(.*)$/);
+function checkSegmentApprove(seg, depth) {
+  if (depth === undefined) depth = 0;
+  if (depth > 6) return false;
+
+  const shellC = parseShellCInvocation(seg);
+  if (shellC) {
+    if (shellC.opaque) return false;
+    const innerSegs = splitChainSegments(shellC.innerCmd);
+    if (innerSegs.length === 0) return false;
+    for (const inner of innerSegs) {
+      if (!checkSegmentApprove(inner, depth + 1)) return false;
+    }
+    return true;
+  }
+
+  const assignMatch = seg.match(/^\s*[A-Za-z_][A-Za-z0-9_]*=(.*)$/);
   if (assignMatch) {
     const value = assignMatch[1].trim();
-
-    // Empty value - safe
     if (value === '') return true;
+    if (!value.includes('$(') && !value.includes('`')) return true;
 
-    // Simple literal value (no command substitution or backticks)
-    if (!value.includes('$(') && !value.includes('`')) {
-      return true;
-    }
-
-    // Command substitution: $(...)
     if (value.startsWith('$(')) {
-      const extracted = extractSubshellContent(value);
-      if (extracted && extracted.rest === '') {
-        const innerSegments = splitChainSegments(extracted.inner);
-        for (const seg of innerSegments) {
-          if (!checkApprove(seg)) return false;
+      const r = extractParenContent(value, 1);
+      if (r && r.end === value.length) {
+        const innerSegs = splitChainSegments(r.inner);
+        for (const s of innerSegs) {
+          if (!checkSegmentApprove(s, depth + 1)) return false;
         }
         return true;
       }
     }
-
-    // Quoted command substitution: "$(...)""
     if (value.startsWith('"$(') && value.endsWith(')"')) {
-      const innerValue = value.slice(1, -1); // Remove outer quotes
-      const extracted = extractSubshellContent(innerValue);
-      if (extracted && extracted.rest === '') {
-        const innerSegments = splitChainSegments(extracted.inner);
-        for (const seg of innerSegments) {
-          if (!checkApprove(seg)) return false;
+      const r = extractParenContent(value, 2);
+      if (r && r.end === value.length - 1) {
+        const innerSegs = splitChainSegments(r.inner);
+        for (const s of innerSegs) {
+          if (!checkSegmentApprove(s, depth + 1)) return false;
         }
         return true;
       }
     }
-
-    // Backtick substitution: `...`
     if (value.startsWith('`') && value.endsWith('`') && value.length > 2) {
-      const inner = value.slice(1, -1);
-      const innerSegments = splitChainSegments(inner);
-      for (const seg of innerSegments) {
-        if (!checkApprove(seg)) return false;
+      const innerSegs = splitChainSegments(value.slice(1, -1));
+      for (const s of innerSegs) {
+        if (!checkSegmentApprove(s, depth + 1)) return false;
       }
       return true;
     }
   }
 
-  // Strip leading VAR=value pairs (e.g., JAVA_HOME=/path mvn test)
-  const stripped = segment.replace(/^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+  const stripped = seg.replace(/^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   for (const pattern of APPROVE_PATTERNS) {
-    if (pattern.test(segment) || pattern.test(stripped)) {
+    if (pattern.test(seg) || pattern.test(stripped)) {
       return true;
     }
   }
   return false;
 }
-
-// --- MAIN ---
 
 let data = '';
 process.stdin.setEncoding('utf8');
@@ -437,32 +632,31 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
 
-  const cmd = input?.tool_input?.command;
-  if (!cmd) process.exit(0);
+  const rawCmd = input?.tool_input?.command;
+  if (!rawCmd) process.exit(0);
 
+  const cmd = normalizeUnicode(rawCmd);
   const flat = cmd.replace(/\n/g, ' ; ');
   const segments = splitChainSegments(flat);
 
   if (segments.length === 0) process.exit(0);
 
-  // Deny phase: any segment triggers deny for the whole command
   for (const seg of segments) {
-    checkDeny(seg);
+    checkSegmentDeny(seg);
   }
 
-  // Approve phase: all segments must match for auto-approval
   let allApproved = true;
   for (const seg of segments) {
-    if (!checkApprove(seg)) {
+    if (!checkSegmentApprove(seg)) {
       allApproved = false;
       break;
     }
   }
 
   if (allApproved) {
-    approve();
+    approve(rawCmd);
   }
 
-  // Fallthrough: normal permission prompt
+  audit('fallthrough', '', rawCmd);
   process.exit(0);
 });
