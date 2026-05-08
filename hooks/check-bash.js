@@ -191,9 +191,22 @@ function parseShellCInvocation(segment) {
   const arg = m[2].trim();
 
   if (arg.startsWith("'")) {
-    const end = arg.indexOf("'", 1);
-    if (end === -1) return { innerCmd: null, opaque: true };
-    return { innerCmd: arg.slice(1, end), opaque: false };
+    // Walk through, supporting POSIX `'\''` apostrophe escape (close, escape, reopen).
+    let i = 1;
+    let inner = '';
+    while (i < arg.length) {
+      if (arg[i] === "'") {
+        if (arg.slice(i, i + 4) === "'\\''") {
+          inner += "'";
+          i += 4;
+          continue;
+        }
+        return { innerCmd: inner, opaque: false };
+      }
+      inner += arg[i];
+      i++;
+    }
+    return { innerCmd: null, opaque: true };
   }
 
   if (arg.startsWith('"')) {
@@ -357,8 +370,9 @@ const DENY_PATTERNS = [
 
   // Privilege escalation / identity tampering
   [/^\s*sudo\s/, 'sudo blocked -- run privileged commands manually'],
-  [/\bchmod\s+[0-7]*[4-7][0-7]*[0-7]*\s+.*\.(sh|py|rb|js|pl)\b/, 'Setting setuid/setgid on scripts blocked'],
-  [/\bchmod\s+[u+]*s\b/, 'chmod setuid/setgid blocked'],
+  // 4-digit numeric mode whose leading bit is 2/4/6/7 sets setuid/setgid/sticky.
+  [/\bchmod\s+0?[2467][0-7]{3}\b/, 'chmod with setuid/setgid bit blocked'],
+  [/\bchmod\s+[ugoa]*[+=]\S*s\b/, 'chmod setuid/setgid (symbolic) blocked'],
   [/^\s*(chsh|usermod|useradd|userdel|groupadd|groupdel|passwd|visudo|gpasswd|adduser|deluser)\b/,
     'User/group modification blocked'],
   [/^\s*(insmod|rmmod|modprobe|kexec)\b/, 'Kernel module / kexec blocked'],

@@ -60,17 +60,23 @@ function safeRealpath(p) {
   return abs;
 }
 
-// Strip invisible/steganographic characters from a string. Returns
-// {clean, removed} so callers can detect deliberate hiding.
+// Strip invisible/steganographic characters. Returns separate counts so callers
+// can apply different policies: tag chars and bidi overrides have no legitimate
+// use anywhere; zero-widths are legit in emoji ZWJ sequences but suspicious in
+// source code.
 function stripInvisibles(s) {
-  if (typeof s !== 'string') return { clean: s, removed: 0 };
-  const before = s.length;
+  if (typeof s !== 'string') return { clean: s, danger: 0, zwCount: 0 };
+  const tagCount = (s.match(/[\u{E0000}-\u{E007F}]/gu) || []).length;
+  const bidiCount = (s.match(/[‪-‮⁦-⁩]/g) || []).length;
+  const zwCount = (s.match(/[​-‍⁠﻿]/g) || []).length;
   const clean = s
     .replace(/[\u{E0000}-\u{E007F}]/gu, '')
     .replace(/[‪-‮⁦-⁩]/g, '')
     .replace(/[​-‍⁠﻿]/g, '');
-  return { clean, removed: before - clean.length };
+  return { clean, danger: tagCount + bidiCount, zwCount };
 }
+
+const SOURCE_LIKE_EXT = /\.(js|ts|jsx|tsx|mjs|cjs|py|rs|go|rb|java|c|cc|cpp|h|hpp|kt|swift|sh|bash|zsh|json|yaml|yml|toml|ini|html|svelte|vue|css|scss|less|sql|php|pl|lua|nim|zig)$/i;
 
 // Prompt-injection: instruction override / role hijack phrasing.
 const INJECTION_PATTERNS = [
@@ -123,7 +129,8 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(curl|wget|bash|sh|nc|python|perl|ruby)\b/i
 // Backup suffixes (.bak, .old, .backup, .orig, .swp, .save) are matched too.
 const SENSITIVE_EXTENSIONS = /\.(env|pem|key|crt|p12|pfx|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
-const SENSITIVE_FILES = /(^|\/)(\.gitconfig|\.git-credentials|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
+// .gitconfig deliberately excluded: tokens normally live in .git-credentials.
+const SENSITIVE_FILES = /(^|\/)(\.git-credentials|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
 const ENV_FILE = /(^|\/)\.env(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
 const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
@@ -175,11 +182,17 @@ process.stdin.on('end', () => {
     const filePath = input?.tool_input?.file_path || '';
 
     if (content) {
-      const { clean, removed } = stripInvisibles(content);
+      const { clean, danger, zwCount } = stripInvisibles(content);
       const flat = clean.replace(/\n/g, ' ');
 
-      if (removed > 0 && !/\.(woff2?|ttf|otf|eot|png|jpe?g|gif|webp|ico|pdf|zip|gz|bz2|xz|7z|tar|wasm|exe|dll|so|dylib|bin|node)$/i.test(filePath)) {
-        deny('Invisible Unicode characters detected -- possible steganographic prompt injection', filePath);
+      const isBinary = /\.(woff2?|ttf|otf|eot|png|jpe?g|gif|webp|ico|pdf|zip|gz|bz2|xz|7z|tar|wasm|exe|dll|so|dylib|bin|node)$/i.test(filePath);
+      if (!isBinary) {
+        if (danger > 0) {
+          deny('Tag-character / bidi-override Unicode detected -- steganographic prompt injection', filePath);
+        }
+        if (zwCount > 0 && SOURCE_LIKE_EXT.test(filePath)) {
+          deny('Zero-width characters in source file -- possible steganographic injection', filePath);
+        }
       }
 
       for (const [pattern, label] of INJECTION_PATTERNS) {

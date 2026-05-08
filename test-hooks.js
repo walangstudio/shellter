@@ -231,6 +231,19 @@ testBash('Deny: zero-width-disguised bash -i',
 testBash('Deny: rm -rf $VAR',
   'rm -rf $TARGET', 'deny');
 
+// chmod precision (numeric setuid only fires on leading [2467])
+testBash('Deny: chmod 4755 (setuid)', 'chmod 4755 /usr/local/bin/foo', 'deny');
+testBash('Deny: chmod 6755 (setuid+setgid)', 'chmod 6755 /usr/local/bin/foo', 'deny');
+testBash('Deny: chmod u+s symbolic', 'chmod u+s /usr/local/bin/foo', 'deny');
+testBash('Approve: chmod 755 script.sh (no special bit; chmod is on approve list)',
+  'chmod 755 script.sh', 'allow');
+testBash('Approve: chmod 644 file.py (no special bit)',
+  'chmod 644 file.py', 'allow');
+
+// POSIX apostrophe escape inside bash -c '...'\''...'
+testBash('Approve: bash -c with embedded apostrophe escape',
+  "bash -c 'echo '\\''hi'\\'' world'", 'allow');
+
 // ----- New auto-approves (each must allow) -----
 console.log('\n--- new auto-approves ---');
 testBash('Approve: git pull', 'git pull', 'allow');
@@ -306,8 +319,9 @@ testFile('Deny: read .pem.backup', 'Read', { file_path: '/home/user/cert.pem.bac
 testFile('Deny: read .npmrc', 'Read', { file_path: '/home/user/.npmrc' }, 'deny');
 testFile('Deny: read .docker/config.json', 'Read', { file_path: '/home/user/.docker/config.json' }, 'deny');
 testFile('Deny: read .config/gh/hosts.yml', 'Read', { file_path: '/home/user/.config/gh/hosts.yml' }, 'deny');
-testFile('Deny: read .gitconfig', 'Read', { file_path: '/home/user/.gitconfig' }, 'deny');
 testFile('Deny: read .git-credentials', 'Read', { file_path: '/home/user/.git-credentials' }, 'deny');
+testFile('Pass: read .gitconfig (tokens live in .git-credentials, not here)',
+  'Read', { file_path: '/home/user/.gitconfig' }, 'fallthrough');
 testFile('Deny: read .cargo/credentials', 'Read', { file_path: '/home/user/.cargo/credentials' }, 'deny');
 testFile('Deny: read .pypirc', 'Read', { file_path: '/home/user/.pypirc' }, 'deny');
 testFile('Deny: read .ssh/config', 'Read', { file_path: '/home/user/.ssh/config' }, 'deny');
@@ -381,11 +395,21 @@ testFile('Deny: ANSI escape in .py',
     content: 'print("hi")\n\x1b[2J' }, 'deny');
 
 // ----- Invisible Unicode in written content -----
-testFile('Deny: zero-width chars in source',
+testFile('Deny: zero-width chars in source (.js)',
   'Write', { file_path: '/tmp/test.js',
     content: 'const x = 1;​‌‍ something hidden' }, 'deny');
-testFile('Pass: emoji ZWJ in markdown is allowed for binary-ish (font allowed)',
-  'Write', { file_path: '/tmp/font.woff2', content: 'binary‍payload' }, 'fallthrough');
+testFile('Pass: emoji ZWJ in markdown',
+  'Write', { file_path: '/tmp/family.md',
+    content: 'family: 👨‍👩‍👧 here' }, 'fallthrough');
+testFile('Pass: emoji ZWJ in plain text',
+  'Write', { file_path: '/tmp/note.txt',
+    content: 'family: 👨‍👩‍👧 here' }, 'fallthrough');
+testFile('Deny: tag-char steganography in markdown',
+  'Write', { file_path: '/tmp/stegano.md',
+    content: 'normal text\u{E0041}\u{E0042}\u{E0043}' }, 'deny');
+testFile('Deny: bidi-override in source',
+  'Write', { file_path: '/tmp/trojan.js',
+    content: 'const x = 1; /*‮ evil*/' }, 'deny');
 
 // ----- Symlink fixture -----
 console.log('\n--- symlink resolution ---');
