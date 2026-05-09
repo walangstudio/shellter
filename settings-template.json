@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /home/nino/.claude/hooks/check-bash.js"
+            "command": "node __HOME__/.claude/hooks/check-bash.js"
           }
         ]
       },
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /home/nino/.claude/hooks/check-sensitive-files.js"
+            "command": "node __HOME__/.claude/hooks/check-sensitive-files.js"
           }
         ]
       },
@@ -33,7 +33,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /home/nino/.claude/hooks/check-sensitive-files.js"
+            "command": "node __HOME__/.claude/hooks/check-sensitive-files.js"
           }
         ]
       },
@@ -42,7 +42,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /home/nino/.claude/hooks/check-sensitive-files.js"
+            "command": "node __HOME__/.claude/hooks/check-sensitive-files.js"
           }
         ]
       },
@@ -51,7 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /home/nino/.claude/hooks/check-sensitive-files.js"
+            "command": "node __HOME__/.claude/hooks/check-sensitive-files.js"
           }
         ]
       },
@@ -60,7 +60,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /home/nino/.claude/hooks/check-sensitive-files.js"
+            "command": "node __HOME__/.claude/hooks/check-sensitive-files.js"
           }
         ]
       }
