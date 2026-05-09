@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Merges hook configuration into an existing ~/.claude/settings.json.
-// Safe to run multiple times -- overwrites only "permissions" and "hooks" keys.
+// Merges hook configuration into ~/.claude/settings.json. Idempotent --
+// overwrites only "permissions" and "hooks" keys.
 //
 // Usage: node merge-settings.js [path-to-settings.json]
 // Default: ~/.claude/settings.json
@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 const targetPath = process.argv[2]
   || path.join(os.homedir(), '.claude', 'settings.json');
@@ -22,10 +23,9 @@ if (!fs.existsSync(templatePath)) {
 
 const template = JSON.parse(fs.readFileSync(templatePath, 'utf8'));
 
-// Fix paths in template to match current user's home directory
-// Normalize to forward slashes for Windows compatibility in JSON
+// __HOME__ -> homedir (forward-slashed for cross-platform JSON safety)
 const homeDir = os.homedir().replace(/\\/g, '/');
-const templateStr = JSON.stringify(template).replace(/\/home\/nino/g, homeDir);
+const templateStr = JSON.stringify(template).replace(/__HOME__/g, homeDir);
 const fixedTemplate = JSON.parse(templateStr);
 
 let existing = {};
@@ -34,18 +34,16 @@ if (fs.existsSync(targetPath)) {
     existing = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
     console.log('Found existing settings at', targetPath);
   } catch (e) {
-    console.error('Failed to parse existing settings, backing up and starting fresh');
+    console.error('Failed to parse existing settings, backing up to', targetPath + '.bak');
     fs.copyFileSync(targetPath, targetPath + '.bak');
     existing = {};
   }
 } else {
-  // Ensure directory exists
   const dir = path.dirname(targetPath);
   fs.mkdirSync(dir, { recursive: true });
   console.log('No existing settings found, creating new file');
 }
 
-// Merge: template keys overwrite existing for permissions and hooks only
 existing.permissions = fixedTemplate.permissions;
 existing.hooks = fixedTemplate.hooks;
 
@@ -53,16 +51,24 @@ fs.writeFileSync(targetPath, JSON.stringify(existing, null, 2) + '\n');
 console.log('Merged permissions and hooks into', targetPath);
 console.log('Hook paths set to:', homeDir + '/.claude/hooks/');
 
-// Verify hooks exist
 const hooksDir = path.join(homeDir, '.claude', 'hooks');
 const bashHook = path.join(hooksDir, 'check-bash.js');
 const filesHook = path.join(hooksDir, 'check-sensitive-files.js');
 
-if (!fs.existsSync(bashHook)) {
-  console.warn('WARNING: Hook not found:', bashHook);
-  console.warn('  Copy it: cp hooks/check-bash.js ~/.claude/hooks/');
+function sha256(p) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex').slice(0, 16);
+  } catch {
+    return null;
+  }
 }
-if (!fs.existsSync(filesHook)) {
-  console.warn('WARNING: Hook not found:', filesHook);
-  console.warn('  Copy it: cp hooks/check-sensitive-files.js ~/.claude/hooks/');
+
+for (const p of [bashHook, filesHook]) {
+  if (!fs.existsSync(p)) {
+    console.warn('WARNING: Hook not found:', p);
+    console.warn('  Copy it: cp ' + path.basename(p) + ' ' + hooksDir + '/');
+    continue;
+  }
+  const h = sha256(p);
+  if (h) console.log('  ' + path.basename(p) + '  sha256=' + h);
 }
