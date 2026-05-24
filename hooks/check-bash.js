@@ -190,7 +190,7 @@ function extractParenContent(value, openIdx) {
 // Returns {innerCmd, opaque} for `bash -c '...'` style invocations, or null.
 function parseShellCInvocation(segment) {
   const m = segment.match(
-    /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh)\s+(?:-[a-zA-Z]*c|--command)\s+(.+)$/
+    /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\s+(?:-[a-zA-Z]*c|--command)\s+(.+)$/
   );
   if (!m) return null;
   const arg = m[2].trim();
@@ -433,9 +433,9 @@ function approve(snippet) {
 
 const DENY_PATTERNS = [
   // Encoded payload execution
-  [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
+  [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
     'Encoded payload piped to shell blocked'],
-  [/\becho\s+.*\|\s*(base64|xxd)\s.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh)\b/i,
+  [/\becho\s+.*\|\s*(base64|xxd)\s.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\b/i,
     'Encoded execution chain blocked'],
 
   // eval (targeted)
@@ -457,16 +457,16 @@ const DENY_PATTERNS = [
   [/\bwget\s+.*--post-(data|file)/i, 'wget POST blocked -- review manually'],
 
   // Download-and-execute / pipe-to-interpreter (incl. absolute paths)
-  [/\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b/i,
+  [/\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b/i,
     'Download-and-execute pipe blocked -- inspect script first'],
   // Generic pipe-to-interpreter: end-of-segment or -c/-i/-s flag (no script arg).
-  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i,
+  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i,
     'Pipe to bare shell/interpreter blocked'],
-  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i,
+  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i,
     'Pipe to interpreter with -c/-i/-s blocked'],
   // Process substitution as input to source/. or a shell.
   [/\b(source|\.)\s+<\(/, 'source/. of process substitution blocked'],
-  [/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh)\s+<\(/i,
+  [/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\s+<\(/i,
     'Shell with process-substitution input blocked'],
 
   // Persistence
