@@ -1,6 +1,11 @@
 #!/usr/bin/env node
-// PreToolUse hook for Bash. Splits chains and checks each segment, recursively
-// into `bash -c`, `find -exec`, `xargs`, and `<(...) / >(...)`.
+// PreToolUse hook for Bash and PowerShell (matcher "Bash|PowerShell").
+// For the Bash tool: Unix/macOS semantics -- splits chains and recurses into
+// `bash -c`, `find -exec`, `xargs`, `<(...) / >(...)`, and any `powershell -c`
+// / `cmd /c` it shells out to. For the PowerShell tool: PowerShell semantics
+// (backtick escape, no POSIX quoting), the PowerShell/cmd deny+approve sets, and
+// the cross-platform deny rules (git guards, miners, etc.) apply too.
+// The bash path is unchanged from before tool_name branching was added.
 // CLAUDE_HOOK_LOG=/path or CLAUDE_HOOK_DEBUG=1 to record decisions.
 
 'use strict';
@@ -293,6 +298,113 @@ function extractProcessSubstitutions(segment) {
   return results;
 }
 
+// PowerShell statement splitter. PS quoting differs from POSIX: backtick is the
+// escape char (not command substitution), single quotes are fully literal (no
+// `'\''`), double quotes honor backtick escapes and `$(...)` subexpressions.
+// Splits on `;`, and on PS7 `&&` / `||`, at subexpression depth 0.
+function splitPoshSegments(cmd) {
+  const len = cmd.length;
+  let i = 0;
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let segmentStart = 0;
+  const segments = [];
+
+  while (i < len) {
+    const ch = cmd[i];
+    const next = i + 1 < len ? cmd[i + 1] : '';
+
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      i++;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = true;
+      i++;
+      continue;
+    }
+    if (ch === '`') {
+      // Backtick escapes the next char (inside or outside double quotes).
+      i += 2;
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = !inDouble;
+      i++;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '$' && next === '(') { depth++; i += 2; continue; }
+      if (ch === ')' && depth > 0) { depth--; }
+      i++;
+      continue;
+    }
+    if (ch === '$' && next === '(') { depth++; i += 2; continue; }
+    if (ch === '(') { depth++; i++; continue; }
+    if (ch === ')' && depth > 0) { depth--; i++; continue; }
+
+    if (depth === 0) {
+      if ((ch === '&' && next === '&') || (ch === '|' && next === '|')) {
+        segments.push(cmd.slice(segmentStart, i));
+        i += 2;
+        segmentStart = i;
+        continue;
+      }
+      if (ch === ';') {
+        segments.push(cmd.slice(segmentStart, i));
+        i++;
+        segmentStart = i;
+        continue;
+      }
+    }
+    i++;
+  }
+
+  segments.push(cmd.slice(segmentStart));
+  return segments.map(s => s.trim()).filter(s => s.length > 0);
+}
+
+// Returns {innerCmd, opaque} for `powershell -Command '...'` / `pwsh -c "..."`,
+// or null. Mirrors parseShellCInvocation but for PS-style invocations reached
+// from inside another shell command.
+function parsePoshInvocation(segment) {
+  const m = segment.match(
+    /^\s*(?:[^\s]*[\\/])?(?:powershell(?:\.exe)?|pwsh(?:\.exe)?)\s+(?:-[A-Za-z]+\s+(?!-)\S+\s+)*-(?:c|command)\b\s+(.+)$/i
+  );
+  if (!m) return null;
+  const arg = m[1].trim();
+  // -EncodedCommand / opaque expansion is handled by deny patterns; here we just
+  // surface the inner string when it is a plain quoted literal.
+  if (arg.startsWith("'")) {
+    const end = arg.indexOf("'", 1);
+    if (end === -1) return { innerCmd: null, opaque: true };
+    return { innerCmd: arg.slice(1, end), opaque: false };
+  }
+  if (arg.startsWith('"')) {
+    const end = arg.indexOf('"', 1);
+    if (end === -1) return { innerCmd: null, opaque: true };
+    const inner = arg.slice(1, end);
+    if (/\$\(|`/.test(inner)) return { innerCmd: null, opaque: true };
+    return { innerCmd: inner, opaque: false };
+  }
+  return { innerCmd: arg, opaque: false };
+}
+
+// Returns the inner command string from `cmd /c "..."` / `cmd.exe /k ...`, or null.
+function parseCmdInvocation(segment) {
+  const m = segment.match(
+    /^\s*(?:[^\s]*[\\/])?cmd(?:\.exe)?\s+(?:\/[a-zA-Z]\s+)*\/[ckCK]\b\s+(.+)$/
+  );
+  if (!m) return null;
+  let arg = m[1].trim();
+  if (arg.startsWith('"') && arg.endsWith('"') && arg.length > 1) {
+    arg = arg.slice(1, -1);
+  }
+  return { innerCmd: arg, opaque: false };
+}
+
 function deny(reason, snippet) {
   audit('deny', reason, snippet);
   const output = JSON.stringify({
@@ -411,16 +523,19 @@ const DENY_PATTERNS = [
   // Firewall
   [/\b(iptables|nftables|ufw|firewall-cmd|pfctl)\b/i, 'Firewall modification blocked'],
 
-  // Git destructive
-  [/git\s+push\s+.*\b(main|master)\b/, 'git push to main/master blocked -- push to a feature branch'],
-  [/git\s+push\s+origin\s*$/, 'git push to default branch blocked'],
-  [/git\s+push\s+.*--force(?!-with-lease)/, 'git push --force blocked'],
-  [/git\s+push\s+-f\b/, 'git push -f blocked'],
-  [/git\s+reset\s+--hard/, 'git reset --hard blocked -- can destroy uncommitted work'],
-  [/git\s+clean\s+-[a-zA-Z]*f/, 'git clean -f blocked -- deletes untracked files'],
-  [/git\s+checkout\s+--\s/, 'git checkout -- blocked -- discards uncommitted changes'],
-  [/git\s+update-ref\s+-d\b/, 'git update-ref -d blocked -- destroys refs'],
-  [/git\s+filter-(branch|repo)\b/, 'git filter-branch / filter-repo blocked -- rewrites history'],
+  // Git destructive. The prefix group eats global options that can sit between
+  // `git` and the subcommand -- `-C <path>`, `-c <cfg>`, `-p/-P`, and long flags
+  // like `--no-pager` / `--git-dir=...` -- so e.g. `git --no-pager push -f` and
+  // `git -C /repo push -f` are both still caught.
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*\b(main|master)\b/, 'git push to main/master blocked -- push to a feature branch'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+origin\s*$/, 'git push to default branch blocked'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*--force(?!-with-lease)/, 'git push --force blocked'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+(?:\S+\s+)*-f\b/, 'git push -f blocked'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*reset\s+--hard/, 'git reset --hard blocked -- can destroy uncommitted work'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*clean\s+-[a-zA-Z]*f/, 'git clean -f blocked -- deletes untracked files'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*checkout\s+--\s/, 'git checkout -- blocked -- discards uncommitted changes'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*update-ref\s+-d\b/, 'git update-ref -d blocked -- destroys refs'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*filter-(branch|repo)\b/, 'git filter-branch / filter-repo blocked -- rewrites history'],
 
   // Sensitive file reads via shell
   [/(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg)\s+.*\.(env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)\b/i,
@@ -429,7 +544,7 @@ const DENY_PATTERNS = [
     'Reading sensitive file/directory via shell blocked'],
 
   // Destructive rm
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\/|\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin)\b/,
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\/|\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b/,
     'Destructive rm on system directory blocked'],
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+~\b/, 'Destructive rm on home directory blocked'],
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\{\}|\$\{?[A-Za-z_])/,
@@ -446,6 +561,88 @@ const DENY_PATTERNS = [
 
   // Suspicious ssh-keygen targets
   [/ssh-keygen\s+.*-f\s+\/(tmp|var|opt|dev)\//i, 'ssh-keygen writing to system temp blocked'],
+
+  // macOS: security posture tampering
+  [/\bcsrutil\s+disable\b/i, 'csrutil disable blocked -- disables System Integrity Protection'],
+  [/\bspctl\s+--master-disable\b/i, 'spctl --master-disable blocked -- disables Gatekeeper'],
+  [/\btccutil\s+reset\b/i, 'tccutil reset blocked -- clears privacy/TCC grants'],
+  [/\bnvram\s+.*boot-args/i, 'nvram boot-args modification blocked'],
+  [/\bxattr\s+.*-d\s+com\.apple\.quarantine/i, 'Stripping com.apple.quarantine blocked'],
+  // macOS: persistence
+  [/\blaunchctl\s+(load|bootstrap|enable|submit)\b/i, 'launchctl load/bootstrap blocked -- possible persistence'],
+  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]*\/Library\/Launch(Agents|Daemons)\//i,
+    'Writing to LaunchAgents/LaunchDaemons blocked -- possible persistence'],
+  // macOS: kexts / disks / accounts
+  [/\b(kextload|kmutil\s+load)\b/i, 'Kernel extension load blocked'],
+  [/\bdiskutil\s+(eraseDisk|eraseVolume|partitionDisk|reformat)\b/i, 'diskutil erase/partition blocked'],
+  [/\bdscl\s+\.\s+-create\s+\/Users\//i, 'dscl user creation blocked'],
+  // macOS: Keychain secret extraction
+  [/\bsecurity\s+(dump-keychain|export\b|find-(generic|internet)-password\s+.*-w\b)/i,
+    'Keychain secret extraction via security blocked'],
+];
+
+// PowerShell-specific deny patterns. Anchored to PS syntax (verb-noun cmdlets,
+// PS flags) so they do not match ordinary bash commands and are safe to run on
+// both tools.
+const POSH_DENY_PATTERNS = [
+  // Destructive recursive/forced removal of home / drive root / wildcard.
+  [/\b(Remove-Item|ri|rmdir|rd|del|erase)\b[^;|]*-(?:Recurse|rec)\b[^;|]*-(?:Force|for)\b[^;|]*(\$HOME|\$env:USERPROFILE|\$env:SystemRoot|[A-Za-z]:\\?(\s|$|\*)|\*)/i,
+    'Destructive PowerShell removal of home/root/wildcard blocked'],
+  [/\b(Remove-Item|ri)\b[^;|]*-(?:Force|for)\b[^;|]*-(?:Recurse|rec)\b[^;|]*(\$HOME|\$env:USERPROFILE|[A-Za-z]:\\?(\s|$|\*)|\*)/i,
+    'Destructive PowerShell removal of home/root/wildcard blocked'],
+  // Invoke-Expression of dynamic/downloaded content.
+  [/\bInvoke-Expression\b|\biex\s*[\(\$"']|\|\s*iex\b/i,
+    'Invoke-Expression / iex blocked -- possible dynamic code execution'],
+  // Download-and-execute and web data upload.
+  [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|curl|wget)\b[^;|]*\|\s*iex\b/i,
+    'Download piped to Invoke-Expression blocked'],
+  [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|curl|wget)\b[^;|]*-OutFile\b/i,
+    'PowerShell web download (-OutFile) blocked -- inspect first'],
+  [/\.(DownloadString|DownloadFile|DownloadData)\s*\(/i, 'Net.WebClient download blocked'],
+  [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^;|]*-(Method\s+(POST|PUT)|Body|InFile)\b/i,
+    'PowerShell web upload blocked -- review manually'],
+  // Encoded command execution.
+  [/\b(powershell|pwsh)(\.exe)?\b[^;|]*-(?:e|ec|enc|encodedcommand)\b/i,
+    'powershell -EncodedCommand blocked'],
+  [/-(?:w(?:indowstyle)?)\s+hidden\b/i, 'powershell -WindowStyle hidden blocked'],
+  // Execution policy / security tooling tampering.
+  [/\bSet-ExecutionPolicy\b/i, 'Set-ExecutionPolicy blocked'],
+  [/\b(Add|Set)-MpPreference\b/i, 'Defender (Add/Set-MpPreference) tampering blocked'],
+  // Persistence: services, scheduled tasks, registry Run keys, $PROFILE.
+  [/\b(New|Set)-Service\b/i, 'Service creation/modification blocked -- possible persistence'],
+  [/\bRegister-ScheduledTask\b/i, 'Register-ScheduledTask blocked -- possible persistence'],
+  [/\b(Set|New)-ItemProperty\b[^;|]*\\(Run|RunOnce)\b/i, 'Registry Run-key write blocked -- possible persistence'],
+  [/\b(Add-Content|Set-Content|Out-File|Tee-Object)\b[^;|]*\$PROFILE\b/i, 'Writing to $PROFILE blocked -- possible persistence'],
+  // Elevation / credential theft.
+  [/\bStart-Process\b[^;|]*-Verb\s+RunAs\b/i, 'Start-Process -Verb RunAs (elevation) blocked'],
+  [/\bConvertFrom-SecureString\b/i, 'ConvertFrom-SecureString blocked -- possible credential export'],
+  [/comsvcs\.dll\b[^;|]*MiniDump/i, 'lsass MiniDump blocked -- credential theft'],
+];
+
+// cmd.exe-specific deny patterns. Anchored to cmd syntax (slash-flags, drive
+// letters, Windows tool names) so they do not match ordinary bash commands.
+const CMD_DENY_PATTERNS = [
+  [/\b(del|erase)\b[^;&|]*\/[sS]\b/i, 'cmd del /s blocked -- recursive delete'],
+  [/\b(rd|rmdir)\b[^;&|]*\/[sS]\b/i, 'cmd rmdir /s blocked -- recursive directory delete'],
+  [/^\s*format\s+[A-Za-z]:/i, 'cmd format blocked'],
+  [/\bvssadmin\b[^;&|]*delete\s+shadows/i, 'vssadmin delete shadows blocked -- ransomware behavior'],
+  [/\bwbadmin\b[^;&|]*delete\b/i, 'wbadmin delete blocked'],
+  [/\bbcdedit\b/i, 'bcdedit blocked -- boot configuration tampering'],
+  [/\breg\s+(add|delete)\b[^;&|]*\\(Run|RunOnce)\b/i, 'reg add to Run key blocked -- possible persistence'],
+  [/\breg\s+(add|delete)\b[^;&|]*HKLM\b/i, 'reg add/delete on HKLM blocked'],
+  [/\bschtasks\b[^;&|]*\/create\b/i, 'schtasks /create blocked -- possible persistence'],
+  [/^\s*sc(\.exe)?\s+(create|config)\b/i, 'sc create/config blocked -- service persistence'],
+  [/\bnet\s+user\b[^;&|]*\/add\b/i, 'net user /add blocked -- account creation'],
+  [/\bnet\s+localgroup\s+administrators\b[^;&|]*\/add\b/i, 'Adding to administrators group blocked'],
+  [/\bnetsh\s+advfirewall\b/i, 'netsh advfirewall blocked -- firewall tampering'],
+  [/\btakeown\b/i, 'takeown blocked -- ownership tampering'],
+  [/\bicacls\b[^;&|]*\/grant\b/i, 'icacls /grant blocked -- ACL tampering'],
+  [/\bcertutil\b[^;&|]*-(urlcache|decode|decodehex)\b/i, 'certutil download/decode (LOLBin) blocked'],
+  [/\bbitsadmin\b[^;&|]*\/transfer\b/i, 'bitsadmin /transfer blocked -- download'],
+  [/\bmshta\b/i, 'mshta blocked -- LOLBin script execution'],
+  [/\bregsvr32\b[^;&|]*\/i\b/i, 'regsvr32 /i blocked -- LOLBin'],
+  [/\brundll32\b/i, 'rundll32 blocked -- LOLBin'],
+  [/\bwmic\b[^;&|]*process\s+call\s+create\b/i, 'wmic process call create blocked'],
 ];
 
 const APPROVE_PATTERNS = [
@@ -526,6 +723,25 @@ const APPROVE_PATTERNS = [
   /^\s*(chmod|chown)\s/,
 ];
 
+// PowerShell read-only auto-approves. Conservative: only inspection cmdlets and
+// their canonical aliases. Deny patterns (incl. cross-platform + PS/cmd) run
+// first, so an approve here can never override a deny. Note: the bash-only
+// `curl|wget` approve is intentionally NOT here -- on PowerShell those are
+// aliases for Invoke-WebRequest and are gated by POSH_DENY instead.
+const POSH_APPROVE_PATTERNS = [
+  // Read-only verb-noun cmdlets.
+  /^\s*(Get|Select|Where|ForEach|Sort|Measure|Format|Compare|Group|Out|Write|Resolve|Split|Join|Test|ConvertTo|ConvertFrom)-[A-Za-z]+\b/i,
+  // Canonical read-only aliases.
+  /^\s*(gci|gc|gci|ls|dir|cat|type|pwd|gl|gi|gm|gps|gsv|select|where|sort|measure|echo|cls|clear|fl|ft|fw|sls)\b/i,
+  // Navigation / harmless builtins.
+  /^\s*(cd|Set-Location|Push-Location|Pop-Location)\b/i,
+  // Version / environment introspection.
+  /^\s*\$PSVersionTable\b/i,
+  /^\s*(Get-Command|gcm|Get-Help|help|Get-Member)\b/i,
+  // Read-only git / tool version checks reuse the same shapes as bash.
+  /^\s*git\s+(status|log|diff|show|branch|tag|remote|describe|rev-parse|ls-files|blame|reflog)\b/,
+];
+
 function checkSegmentDeny(seg, depth) {
   if (depth === undefined) depth = 0;
   if (depth > 6) return;
@@ -535,6 +751,34 @@ function checkSegmentDeny(seg, depth) {
   for (const [pattern, reason] of DENY_PATTERNS) {
     if (pattern.test(seg) || pattern.test(stripped)) {
       deny(reason, seg);
+    }
+  }
+  // PowerShell + cmd deny patterns are anchored to their own syntax, so they are
+  // safe to evaluate on both tools (and catch Windows tools shelled out from bash).
+  for (const [pattern, reason] of POSH_DENY_PATTERNS) {
+    if (pattern.test(seg) || pattern.test(stripped)) {
+      deny(reason, seg);
+    }
+  }
+  for (const [pattern, reason] of CMD_DENY_PATTERNS) {
+    if (pattern.test(seg) || pattern.test(stripped)) {
+      deny(reason, seg);
+    }
+  }
+
+  const poshC = parsePoshInvocation(seg);
+  if (poshC && poshC.innerCmd) {
+    const innerSegs = splitPoshSegments(poshC.innerCmd);
+    for (const inner of innerSegs) {
+      checkSegmentDeny(inner, depth + 1);
+    }
+  }
+
+  const cmdC = parseCmdInvocation(seg);
+  if (cmdC && cmdC.innerCmd) {
+    const innerSegs = splitChainSegments(cmdC.innerCmd);
+    for (const inner of innerSegs) {
+      checkSegmentDeny(inner, depth + 1);
     }
   }
 
@@ -576,9 +820,18 @@ function checkSegmentDeny(seg, depth) {
   }
 }
 
-function checkSegmentApprove(seg, depth) {
+function checkSegmentApprove(seg, depth, isPosh) {
   if (depth === undefined) depth = 0;
   if (depth > 6) return false;
+
+  // PowerShell tool: only the conservative PS read-only set auto-approves.
+  // The Unix approve set (incl. the bash `curl|wget` rule) never runs here.
+  if (isPosh) {
+    for (const pattern of POSH_APPROVE_PATTERNS) {
+      if (pattern.test(seg)) return true;
+    }
+    return false;
+  }
 
   const shellC = parseShellCInvocation(seg);
   if (shellC) {
@@ -649,9 +902,11 @@ process.stdin.on('end', () => {
   const rawCmd = input?.tool_input?.command;
   if (!rawCmd) process.exit(0);
 
+  const isPosh = input?.tool_name === 'PowerShell';
+
   const cmd = normalizeUnicode(rawCmd);
   const flat = cmd.replace(/\n/g, ' ; ');
-  const segments = splitChainSegments(flat);
+  const segments = isPosh ? splitPoshSegments(flat) : splitChainSegments(flat);
 
   if (segments.length === 0) process.exit(0);
 
@@ -661,7 +916,7 @@ process.stdin.on('end', () => {
 
   let allApproved = true;
   for (const seg of segments) {
-    if (!checkSegmentApprove(seg)) {
+    if (!checkSegmentApprove(seg, 0, isPosh)) {
       allApproved = false;
       break;
     }
