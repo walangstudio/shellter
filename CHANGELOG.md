@@ -1,13 +1,13 @@
 # Changelog
 
-What changed, and when. Versions follow [semver](https://semver.org): a major
-bump means a deny rule got stricter or an approve rule got narrower, so something
-that used to slide through now stops at the door.
+What changed, and when. Versions follow [semver](https://semver.org). While we
+are pre-1.0, a minor bump (0.x.0) is where the interesting changes land: new deny
+rules, new approves, new platforms.
 
-The first three releases below were reconstructed from git history. We started
-counting properly at 2.0.0.
+Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
+when we started counting. Everything in this session is 0.2.0.
 
-## [2.0.0] - 2026-05-24
+## [0.2.0] - 2026-05-24
 
 The cross-platform release. Until now the hooks only really understood Unix
 bash. PowerShell commands were waved through with bash-shaped rules, which is
@@ -36,6 +36,8 @@ about as useful as a screen door on a submarine.
   canonical aliases.
 - File hook now blocks macOS Keychain databases, Windows registry hives
   (`NTUSER.DAT`, `SAM`, `SYSTEM`), Windows credential vaults, and `.ppk` keys.
+- `fish` joins the recognized POSIX-family shells (`sh`, `zsh`, `dash`, `ash`,
+  `ksh`), so `fish -c '...'` is unwrapped and `... | fish` is denied like the rest.
 - `package.json` and this changelog, so there is finally a version to point at.
 
 ### Changed
@@ -54,44 +56,33 @@ about as useful as a screen door on a submarine.
 
 ### Notes
 - Project renamed from `claude-settings` to `shellter`.
-- Test suite grew from 173 to 212 cases. The bash path is byte-identical to 1.1.0,
+- Test suite grew from 173 to 212 cases. The bash path is byte-identical to 0.1.0,
   proven by the original cases still passing untouched.
 
-## [1.1.0] - 2026-05-09
+## [0.1.0] - 2026-05-09
 
-Hardening pass. Closed a batch of known bypasses and cut down on needless prompts.
+The starting point: everything the hooks did before we began versioning. Two
+PreToolUse hooks, `check-bash.js` for commands and `check-sensitive-files.js` for
+file access, auto-allowing the safe, blocking the obviously dangerous, and
+prompting for everything in between.
 
-### Added
+This bundles the original hooks and a later hardening pass, since no versions
+were cut in between:
 - Recursive checking inside `bash -c`, `sh -c`, `find -exec`, `xargs`, and
   `<(...)` / `>(...)` process substitution, so a wrapper cannot hide a payload.
 - Symlink resolution in the file hook (`safeRealpath`), defeating the
   `ln -s ~/.env /tmp/x; Read /tmp/x` trick.
 - Unicode normalization on command input and steganography detection in written
-  content (zero-widths, bidi overrides, tag chars).
-- Deny categories: git identity/hook/credential backdoors, shell-rc and CI-config
-  writes, kernel module load, loader injection, crypto miners, alternative
-  scheduling, debugger attach.
-- Approve categories: more read-only git, `gh`, `go`, `kubectl`, `terraform`,
-  `helm`, the common Python/JS/TS linters and formatters, `pnpm`/`bun` build and
-  test, `pre-commit`.
-- Sensitive-file coverage for `.git-credentials`, `.npmrc`, `.pypirc`,
-  `.cargo/credentials`, `.docker/config.json`, wallets, and browser cookie
-  databases, plus their backup forms.
-- Prompt-injection coverage: jailbreak phrases, role-tag injection, fake tool-call
-  tags, markdown `javascript:` URLs, ANSI escapes. Token-shape grep blocking for
-  AWS, GitHub, Slack, JWT, and Bearer tokens.
+  content.
+- Deny rules for reverse shells, exfiltration, encoded payloads, privilege
+  escalation, git identity/hook/credential backdoors, shell-rc and CI-config
+  persistence, kernel module load, loader injection, crypto miners, and the
+  destructive `rm`/`git push --force`/`reset --hard` family.
+- Approves for read-only git, `gh`, `go`, `kubectl`, `terraform`, `helm`, the
+  common Python/JS/TS linters and formatters, and standard read-only Unix tools.
+- Sensitive-file coverage for keys, credential files, wallets, and browser cookie
+  databases, plus prompt-injection and token-shape detection in written content.
 - Opt-in audit log via `CLAUDE_HOOK_LOG` and `CLAUDE_HOOK_DEBUG`.
 
-### Changed
-- Settings template uses a `__HOME__` placeholder instead of a hardcoded path.
-- Test suite grew from 57 to 164 cases.
-
-## [1.0.0] - 2026-04-03
-
-First version. Two PreToolUse hooks: `check-bash.js` for commands and
-`check-sensitive-files.js` for file access. Auto-allow the safe, block the
-obviously dangerous, prompt for everything in between.
-
-[2.0.0]: https://github.com/walangstudio/shellter/releases/tag/v2.0.0
-[1.1.0]: https://github.com/walangstudio/shellter/releases/tag/v1.1.0
-[1.0.0]: https://github.com/walangstudio/shellter/releases/tag/v1.0.0
+[0.2.0]: https://github.com/walangstudio/shellter/releases/tag/v0.2.0
+[0.1.0]: https://github.com/walangstudio/shellter/releases/tag/v0.1.0

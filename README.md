@@ -1,17 +1,15 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-2.0.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-212%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-217%20passing-brightgreen)](test-hooks.js)
 
 Shelters you from dangerous shell commands. Global PreToolUse hooks that
 auto-allow safe operations and block dangerous ones across every Claude Code
 session, on the `Bash` tool (Linux, macOS, Git-Bash, WSL) and the `PowerShell`
 tool (Windows). Claude Code ships no default dangerous-command blocking, so
 these hooks are the safety layer.
-
-The name is the joke and the spec: it gives your shell some shelter.
 
 ## What It Does
 
@@ -21,7 +19,7 @@ Two Node.js hooks run before every tool call:
 `tool_name`: Bash commands keep full Unix/macOS parsing; PowerShell commands get
 PowerShell parsing (backtick escape, PS quoting) and the PowerShell/cmd rule sets.
 - Splits chained commands (`&&`, `||`, `;`) and checks each segment
-- Recursively descends into `bash -c '...'`, `sh -c '...'`, `find -exec`, `xargs`, `<(...)` / `>(...)`, and any `powershell -Command` / `pwsh -c` / `cmd /c` shelled out from a command, so wrappers can't hide a payload
+- Recursively descends into `bash`/`sh`/`zsh`/`dash`/`ash`/`ksh`/`fish -c '...'`, `find -exec`, `xargs`, `<(...)` / `>(...)`, and any `powershell -Command` / `pwsh -c` / `cmd /c` shelled out from a command, so wrappers can't hide a payload
 - Strips invisible/steganographic Unicode (zero-widths, bidi overrides, tag chars) before matching
 - DENY (cross-platform): reverse shells, exfiltration, encoded payloads, privilege escalation, identity backdoors via `git config`, persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_*`), crypto miners, container escape, force-push to main (incl. `git --no-pager`/`-C` prefixes), `rm -rf` of system dirs, and more
 - DENY (macOS): `csrutil disable`, `spctl --master-disable`, `launchctl`/LaunchAgents persistence, `security` Keychain extraction, `dscl` user creation, `kextload`, `tccutil reset`, `diskutil erase`, quarantine stripping, `rm -rf /System|/Library|/Applications|/Users|/Volumes`
@@ -242,5 +240,5 @@ node test-hooks.js
 
 ## Changelog
 
-Current version is 2.0.0 (PowerShell, cmd, and macOS support). The full history
+Current version is 0.2.0 (PowerShell, cmd, and macOS support). The full history
 lives in [CHANGELOG.md](CHANGELOG.md).
