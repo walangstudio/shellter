@@ -1,24 +1,34 @@
-# Claude Code Security Hooks
+# shellter
 
-Global PreToolUse hooks that auto-allow safe operations and block dangerous ones across all Claude Code sessions.
+Shelters you from dangerous shell commands. Global PreToolUse hooks that
+auto-allow safe operations and block dangerous ones across all Claude Code
+sessions — on the `Bash` tool (Linux/macOS/Git-Bash/WSL) and the `PowerShell`
+tool (Windows). Claude Code ships no default dangerous-command blocking, so
+these hooks are the safety layer.
 
 ## What It Does
 
 Two Node.js hooks run before every tool call:
 
-**check-bash.js** gates all Bash commands:
+**check-bash.js** gates the `Bash` and `PowerShell` tools. It branches on
+`tool_name`: Bash commands keep full Unix/macOS parsing; PowerShell commands get
+PowerShell parsing (backtick escape, PS quoting) and the PowerShell/cmd rule sets.
 - Splits chained commands (`&&`, `||`, `;`) and checks each segment
-- Recursively descends into `bash -c '...'`, `sh -c '...'`, `find -exec`, `xargs`, and `<(...)` / `>(...)` process substitutions, so wrappers can't hide a payload
+- Recursively descends into `bash -c '...'`, `sh -c '...'`, `find -exec`, `xargs`, `<(...)` / `>(...)`, and any `powershell -Command` / `pwsh -c` / `cmd /c` shelled out from a command, so wrappers can't hide a payload
 - Strips invisible/steganographic Unicode (zero-widths, bidi overrides, tag chars) before matching
-- DENY: reverse shells, exfiltration, encoded payloads, privilege escalation, identity backdoors via `git config`, persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`), crypto miners, container escape, force-push to main, `rm -rf` of system dirs, and more
-- APPROVE: read-only git plus `pull` / `merge` / `rebase` / `switch` / `blame` / `reflog`; `gh` read-only; `go` / `kubectl get|describe|logs` / `terraform plan|validate` / `helm lint|template`; `ruff` / `black` / `mypy` / `tsc` / `eslint` / `prettier` / `vitest` / `jest`; `pnpm` / `bun` build/test; `pre-commit` / `shellcheck` / `hadolint` / `yamllint`; standard read-only Unix tools
+- DENY (cross-platform): reverse shells, exfiltration, encoded payloads, privilege escalation, identity backdoors via `git config`, persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_*`), crypto miners, container escape, force-push to main (incl. `git --no-pager`/`-C` prefixes), `rm -rf` of system dirs, and more
+- DENY (macOS): `csrutil disable`, `spctl --master-disable`, `launchctl`/LaunchAgents persistence, `security` Keychain extraction, `dscl` user creation, `kextload`, `tccutil reset`, `diskutil erase`, quarantine stripping, `rm -rf /System|/Library|/Applications|/Users|/Volumes`
+- DENY (PowerShell): `Remove-Item -Recurse -Force` of home/root/wildcard, `Invoke-Expression`/`iex`, `iwr|iex` and `-OutFile`/`DownloadString` download-exec, `-EncodedCommand`, `Set-ExecutionPolicy`, Defender tamper (`Set-MpPreference`), service/scheduled-task/Run-key/`$PROFILE` persistence, `Start-Process -Verb RunAs`, lsass MiniDump
+- DENY (cmd.exe): `del`/`rmdir /s`, `format`, `vssadmin delete shadows`, `bcdedit`, `reg add …\Run`, `schtasks /create`, `sc create`, `net user … /add`, `netsh advfirewall`, `takeown`, `icacls /grant`, `certutil -urlcache`, `bitsadmin /transfer`, `mshta`/`regsvr32`/`rundll32` LOLBins
+- APPROVE (Bash): read-only git plus `pull` / `merge` / `rebase` / `switch` / `blame` / `reflog`; `gh` read-only; `go` / `kubectl get|describe|logs` / `terraform plan|validate` / `helm lint|template`; `ruff` / `black` / `mypy` / `tsc` / `eslint` / `prettier` / `vitest` / `jest`; `pnpm` / `bun` build/test; `pre-commit` / `shellcheck` / `hadolint` / `yamllint`; standard read-only Unix tools
+- APPROVE (PowerShell): read-only verb-noun cmdlets (`Get-*`/`Select-*`/`Test-Path`/`Resolve-Path`/`ConvertTo-Json` …) and their canonical aliases (`gci`/`gc`/`ls`/`cat`/`select`/`where` …). The bash `curl`/`wget` auto-approve is deliberately excluded here — on PowerShell those alias `Invoke-WebRequest`
 - Mixed/unknown: falls through to the normal Claude Code permission prompt
 
 **check-sensitive-files.js** gates Read, Write, Edit, Glob, Grep:
 - Resolves symlinks before checking — `ln -s ~/.env /tmp/x; Read /tmp/x` is blocked
 - Blocks access to `.env*`, `.pem`, `.key`, `.crt`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, plus their `.bak` / `.old` / `.backup` variants
 - Blocks read of credential files: `.gitconfig`, `.git-credentials`, `.npmrc`, `.pypirc`, `.cargo/credentials`, `.docker/config.json`, `.config/gh/hosts.yml`, `.ssh/config`
-- Blocks wallet / keystore / browser-cookie databases
+- Blocks wallet / keystore / browser-cookie databases, macOS Keychain (`Library/Keychains/`, `login.keychain-db`, `System.keychain`), and Windows secrets (`*.ppk`, `NTUSER.DAT`, `SAM`/`SYSTEM` hives, `AppData\…\Microsoft\Credentials`)
 - Detects prompt-injection in written content: instruction-override phrases, role hijacking ("pretend you are", "assume the role of", "from now on you are"), jailbreak ("DAN mode", "developer mode"), role-tag injection (`<|im_start|>system`, `[SYSTEM]`, `[INST]`)
 - Detects fake tool-call tags (`<function_calls>`, `<invoke>`) in written content
 - Detects steganographic injection: invisible Unicode characters in source files
