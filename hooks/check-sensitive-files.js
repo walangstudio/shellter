@@ -127,7 +127,7 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(curl|wget|bash|sh|nc|python|perl|ruby)\b/i
 
 // Sensitive paths (extension-based, dir-based, env-style, secrets dirs).
 // Backup suffixes (.bak, .old, .backup, .orig, .swp, .save) are matched too.
-const SENSITIVE_EXTENSIONS = /\.(env|pem|key|crt|p12|pfx|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
+const SENSITIVE_EXTENSIONS = /\.(env|pem|key|crt|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
 // .gitconfig deliberately excluded: tokens normally live in .git-credentials.
 const SENSITIVE_FILES = /(^|\/)(\.git-credentials|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
@@ -138,6 +138,10 @@ const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
 // Wallet / crypto / browser cookie files.
 const WALLET_PATTERN = /\b(wallet\.dat|keystore\.json|UTC--\d{4}-\d{2}-\d{2}T)\b|(^|\/)\.electrum\/wallets\/|(^|\/)\.bitcoin\/wallet\.dat$/i;
 const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|google-chrome|mozilla)[^\/]*\/.*\/(Cookies|Cookies-journal|Login Data|Web Data)$/;
+// macOS Keychain databases.
+const MACOS_KEYCHAIN = /(^|\/)(Library\/Keychains\/|login\.keychain(-db)?$|System\.keychain$)/i;
+// Windows credential / hive files (paths use forward or back slashes here).
+const WINDOWS_SECRETS = /(^|[\/\\])(NTUSER\.DAT|SAM|SYSTEM|SECURITY)$|AppData[\/\\]Roaming[\/\\]Microsoft[\/\\](Credentials|Vault|Protect)([\/\\]|$)/i;
 
 // Grep patterns that try to extract secret values rather than do structural search.
 const GREP_SECRET_EXTRACTION = [
@@ -158,6 +162,8 @@ function pathMatchesAnySensitive(p) {
   if (SECRETS_DIR.test(p)) return 'secrets/credentials directory';
   if (WALLET_PATTERN.test(p)) return 'wallet / crypto key file';
   if (BROWSER_DATA_PATTERN.test(p)) return 'browser cookie/login database';
+  if (MACOS_KEYCHAIN.test(p)) return 'macOS Keychain database';
+  if (WINDOWS_SECRETS.test(p)) return 'Windows credential / registry hive';
   return null;
 }
 
