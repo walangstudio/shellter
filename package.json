@@ -1,0 +1,34 @@
+{
+  "name": "shellter",
+  "version": "0.2.0",
+  "description": "Claude Code security hooks that shelter you from dangerous shell commands. Bash, PowerShell, and cmd, on Linux, macOS, and Windows.",
+  "license": "MIT",
+  "author": "scr1p7k177y <scriptkitty@walang.studio>",
+  "homepage": "https://github.com/walangstudio/shellter",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/walangstudio/shellter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/walangstudio/shellter/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "security",
+    "hooks",
+    "pretooluse",
+    "powershell"
+  ],
+  "scripts": {
+    "test": "node test-hooks.js",
+    "install-hooks": "node merge-settings.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "hooks/",
+    "settings-template.json",
+    "merge-settings.js"
+  ]
+}
