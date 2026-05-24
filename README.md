@@ -1,24 +1,39 @@
-# Claude Code Security Hooks
+# shellter
 
-Global PreToolUse hooks that auto-allow safe operations and block dangerous ones across all Claude Code sessions.
+[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
+[![tests](https://img.shields.io/badge/tests-217%20passing-brightgreen)](test-hooks.js)
+
+Shelters you from dangerous shell commands. Global PreToolUse hooks that
+auto-allow safe operations and block dangerous ones across every Claude Code
+session, on the `Bash` tool (Linux, macOS, Git-Bash, WSL) and the `PowerShell`
+tool (Windows). Claude Code ships no default dangerous-command blocking, so
+these hooks are the safety layer.
 
 ## What It Does
 
 Two Node.js hooks run before every tool call:
 
-**check-bash.js** gates all Bash commands:
+**check-bash.js** gates the `Bash` and `PowerShell` tools. It branches on
+`tool_name`: Bash commands keep full Unix/macOS parsing; PowerShell commands get
+PowerShell parsing (backtick escape, PS quoting) and the PowerShell/cmd rule sets.
 - Splits chained commands (`&&`, `||`, `;`) and checks each segment
-- Recursively descends into `bash -c '...'`, `sh -c '...'`, `find -exec`, `xargs`, and `<(...)` / `>(...)` process substitutions, so wrappers can't hide a payload
+- Recursively descends into `bash`/`sh`/`zsh`/`dash`/`ash`/`ksh`/`fish -c '...'`, `find -exec`, `xargs`, `<(...)` / `>(...)`, and any `powershell -Command` / `pwsh -c` / `cmd /c` shelled out from a command, so wrappers can't hide a payload
 - Strips invisible/steganographic Unicode (zero-widths, bidi overrides, tag chars) before matching
-- DENY: reverse shells, exfiltration, encoded payloads, privilege escalation, identity backdoors via `git config`, persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`), crypto miners, container escape, force-push to main, `rm -rf` of system dirs, and more
-- APPROVE: read-only git plus `pull` / `merge` / `rebase` / `switch` / `blame` / `reflog`; `gh` read-only; `go` / `kubectl get|describe|logs` / `terraform plan|validate` / `helm lint|template`; `ruff` / `black` / `mypy` / `tsc` / `eslint` / `prettier` / `vitest` / `jest`; `pnpm` / `bun` build/test; `pre-commit` / `shellcheck` / `hadolint` / `yamllint`; standard read-only Unix tools
+- DENY (cross-platform): reverse shells, exfiltration, encoded payloads, privilege escalation, identity backdoors via `git config`, persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_*`), crypto miners, container escape, force-push to main (incl. `git --no-pager`/`-C` prefixes), `rm -rf` of system dirs, and more
+- DENY (macOS): `csrutil disable`, `spctl --master-disable`, `launchctl`/LaunchAgents persistence, `security` Keychain extraction, `dscl` user creation, `kextload`, `tccutil reset`, `diskutil erase`, quarantine stripping, `rm -rf /System|/Library|/Applications|/Users|/Volumes`
+- DENY (PowerShell): `Remove-Item -Recurse -Force` of home/root/wildcard, `Invoke-Expression`/`iex`, `iwr|iex` and `-OutFile`/`DownloadString` download-exec, `-EncodedCommand`, `Set-ExecutionPolicy`, Defender tamper (`Set-MpPreference`), service/scheduled-task/Run-key/`$PROFILE` persistence, `Start-Process -Verb RunAs`, lsass MiniDump
+- DENY (cmd.exe): `del`/`rmdir /s`, `format`, `vssadmin delete shadows`, `bcdedit`, `reg add …\Run`, `schtasks /create`, `sc create`, `net user … /add`, `netsh advfirewall`, `takeown`, `icacls /grant`, `certutil -urlcache`, `bitsadmin /transfer`, `mshta`/`regsvr32`/`rundll32` LOLBins
+- APPROVE (Bash): read-only git plus `pull` / `merge` / `rebase` / `switch` / `blame` / `reflog`; `gh` read-only; `go` / `kubectl get|describe|logs` / `terraform plan|validate` / `helm lint|template`; `ruff` / `black` / `mypy` / `tsc` / `eslint` / `prettier` / `vitest` / `jest`; `pnpm` / `bun` build/test; `pre-commit` / `shellcheck` / `hadolint` / `yamllint`; standard read-only Unix tools
+- APPROVE (PowerShell): read-only verb-noun cmdlets (`Get-*`/`Select-*`/`Test-Path`/`Resolve-Path`/`ConvertTo-Json` …) and their canonical aliases (`gci`/`gc`/`ls`/`cat`/`select`/`where` ...). The bash `curl`/`wget` auto-approve is deliberately excluded here, because on PowerShell those alias `Invoke-WebRequest`
 - Mixed/unknown: falls through to the normal Claude Code permission prompt
 
 **check-sensitive-files.js** gates Read, Write, Edit, Glob, Grep:
-- Resolves symlinks before checking — `ln -s ~/.env /tmp/x; Read /tmp/x` is blocked
+- Resolves symlinks before checking, so `ln -s ~/.env /tmp/x; Read /tmp/x` is blocked
 - Blocks access to `.env*`, `.pem`, `.key`, `.crt`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, plus their `.bak` / `.old` / `.backup` variants
 - Blocks read of credential files: `.gitconfig`, `.git-credentials`, `.npmrc`, `.pypirc`, `.cargo/credentials`, `.docker/config.json`, `.config/gh/hosts.yml`, `.ssh/config`
-- Blocks wallet / keystore / browser-cookie databases
+- Blocks wallet / keystore / browser-cookie databases, macOS Keychain (`Library/Keychains/`, `login.keychain-db`, `System.keychain`), and Windows secrets (`*.ppk`, `NTUSER.DAT`, `SAM`/`SYSTEM` hives, `AppData\…\Microsoft\Credentials`)
 - Detects prompt-injection in written content: instruction-override phrases, role hijacking ("pretend you are", "assume the role of", "from now on you are"), jailbreak ("DAN mode", "developer mode"), role-tag injection (`<|im_start|>system`, `[SYSTEM]`, `[INST]`)
 - Detects fake tool-call tags (`<function_calls>`, `<invoke>`) in written content
 - Detects steganographic injection: invisible Unicode characters in source files
@@ -43,7 +58,7 @@ Project-specific overrides go in `<project>/.claude/settings.local.json`.
 
 Node.js >= 18 (Claude Code requires Node.js 18+, so it's already installed if you have Claude Code).
 
-No other dependencies — hooks use only Node.js built-ins.
+No other dependencies. Hooks use only Node.js built-ins.
 
 ### Linux / macOS
 
@@ -97,13 +112,13 @@ Hooks receive JSON on stdin and output JSON on stdout.
 ```
 
 `permissionDecision` values:
-- `"allow"` — auto-approve, no prompt shown
-- `"deny"` — block the operation, reason shown to Claude
-- `"ask"` — force the interactive prompt even if otherwise auto-allowed
+- `"allow"`: auto-approve, no prompt shown
+- `"deny"`: block the operation, reason shown to Claude
+- `"ask"`: force the interactive prompt even if otherwise auto-allowed
 
 Exit codes:
-- `0` — structured decision (or fallthrough if no output)
-- `2` — hard block (stderr shown to user)
+- `0`: structured decision (or fallthrough if no output)
+- `2`: hard block (stderr shown to user)
 
 ## Recursive Wrapper Checking
 
@@ -112,14 +127,14 @@ These wrappers used to be common bypass vectors. Both hooks now look inside them
 | Wrapper                      | Behaviour                                                  |
 | ---------------------------- | ---------------------------------------------------------- |
 | `bash -c '...'` / `sh -c`    | Inner command parsed; deny/approve recurses on each segment |
-| `bash -c "$(curl …)"`        | **Denied** — opaque payload (contains `$(`/backtick/`$VAR`) |
+| `bash -c "$(curl ...)"`        | **Denied**, opaque payload (contains `$(`/backtick/`$VAR`) |
 | `find … -exec CMD … \;`      | `CMD` is parsed and recursively checked                     |
 | `xargs … CMD`                | `CMD` is parsed and recursively checked                     |
 | `<(…)` / `>(…)`              | Inner command is recursively checked; `bash <(curl …)` and `source <(curl …)` are denied wholesale |
 
 ## Audit Log
 
-Set `CLAUDE_HOOK_LOG=/path/to/log.jsonl` to record one JSON line per decision (timestamp, hook, tool, decision, reason, snippet). **Disabled by default** — if `CLAUDE_HOOK_LOG` is unset *or empty* (e.g. `CLAUDE_HOOK_LOG=`), no log file is written. There is no OS-specific default path; you must opt in by setting the variable to a non-empty path. Fail-silent on write errors. (Note: a value that's only whitespace, like `" "`, is truthy and *will* try to write to a file with that literal name — avoid.)
+Set `CLAUDE_HOOK_LOG=/path/to/log.jsonl` to record one JSON line per decision (timestamp, hook, tool, decision, reason, snippet). **Disabled by default**. If `CLAUDE_HOOK_LOG` is unset *or empty* (e.g. `CLAUDE_HOOK_LOG=`), no log file is written. There is no OS-specific default path; you must opt in by setting the variable to a non-empty path. Fail-silent on write errors. (Note: a value that's only whitespace, like `" "`, is truthy and *will* try to write to a file with that literal name, so avoid that.)
 
 Set `CLAUDE_HOOK_DEBUG=1` to mirror the same lines to stderr so they show up in Claude Code's hook output panel.
 
@@ -129,9 +144,9 @@ CLAUDE_HOOK_LOG=/tmp/hook.log claude  # or run the hooks manually
 tail -f /tmp/hook.log                 # to see every decision live
 ```
 
-Windows (PowerShell) — use a native path with backslashes, or forward slashes work too. Avoid `/tmp/...` (it's not a real path on Windows). The directory must already exist; the hook fails silently if it can't write.
+Windows (PowerShell): use a native path with backslashes, or forward slashes work too. Avoid `/tmp/...` (it's not a real path on Windows). The directory must already exist; the hook fails silently if it can't write.
 ```powershell
-$env:CLAUDE_HOOK_LOG = "$env:TEMP\hook.log"   # safest — %TEMP% always exists per-user
+$env:CLAUDE_HOOK_LOG = "$env:TEMP\hook.log"   # safest, %TEMP% always exists per-user
 # or a fixed path you control (must mkdir first):
 $env:CLAUDE_HOOK_LOG = 'c:\temp\hook.log'     # single quotes keep \ literal
 $env:CLAUDE_HOOK_LOG = "c:\temp\hook.log"     # double quotes also fine in PS (\ is not an escape)
@@ -147,7 +162,7 @@ set CLAUDE_HOOK_LOG=c:\temp\hook.log
 claude
 ```
 
-Forward slashes (`c:/temp/hook.log`) also work everywhere on Windows — Node normalizes them. Useful inside `settings.json` to avoid escaping `\\`.
+Forward slashes (`c:/temp/hook.log`) also work everywhere on Windows; Node normalizes them. Useful inside `settings.json` to avoid escaping `\\`.
 
 ## Adding Custom Patterns
 
@@ -202,7 +217,7 @@ They do **not** protect against:
 - Time-of-check / time-of-use races (an attacker can swap a symlink between the realpath check and the actual read)
 - Kernel-level attacks or processes already running as you
 - Anything Claude can do via tools other than Bash/Read/Write/Edit/Glob/Grep
-- Brand-new attack patterns not yet in the deny list — keep the list updated
+- Brand-new attack patterns not yet in the deny list, so keep the list updated
 
 ## Troubleshooting
 
@@ -225,15 +240,5 @@ node test-hooks.js
 
 ## Changelog
 
-### v2 — security hardening + reduced prompts
-- Recursive checking of `bash -c`, `sh -c`, `find -exec`, `xargs`, and `<(…) / >(…)` process substitution
-- Symlink resolution in file checks (`safeRealpath`)
-- Unicode invisible-character normalization in command input + steganography detection in written content
-- New deny categories: identity/git backdoor (`git config core.hooksPath` etc.), shell-rc and CI-config writes, kernel module load, loader injection, crypto miners, alternative scheduling (`at`/`batch`/`systemd-run`), debugger attach
-- New approve categories: `git pull|merge|rebase|switch|blame|reflog`, `gh` read-only, `go`, `kubectl get|describe|logs`, `terraform plan|validate`, `helm lint|template`, Python/JS/TS linters and formatters, `pnpm`/`bun` build/test, `pre-commit`
-- New sensitive-file coverage: `.gitconfig`, `.git-credentials`, `.npmrc`, `.pypirc`, `.cargo/credentials`, `.docker/config.json`, `.config/gh/hosts.yml`, `.ssh/config`, wallets, browser cookie DBs; backup forms (`.env.bak`, `.key.old`, `.json.bak`)
-- New prompt-injection coverage: jailbreak phrases, role-tag injection (`<|im_start|>`, `[SYSTEM]`), fake tool-call tags (`<function_calls>`, `<invoke>`), markdown `javascript:` URLs, ANSI escape sequences
-- Token-shape grep blocking (AWS, GitHub, Slack, JWT, Bearer)
-- Opt-in audit log via `CLAUDE_HOOK_LOG` and `CLAUDE_HOOK_DEBUG`
-- Settings template uses `__HOME__` placeholder (no more user-specific path)
-- Test suite expanded from 57 to 164+ cases including bypass regressions and a real symlink fixture
+Current version is 0.2.0 (PowerShell, cmd, and macOS support). The full history
+lives in [CHANGELOG.md](CHANGELOG.md).
