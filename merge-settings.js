@@ -14,6 +14,12 @@ const crypto = require('crypto');
 const targetPath = process.argv[2]
   || path.join(os.homedir(), '.claude', 'settings.json');
 
+let version = 'unknown';
+try {
+  version = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
+} catch {}
+console.log('shellter v' + version);
+
 const templatePath = path.join(__dirname, 'settings-template.json');
 
 if (!fs.existsSync(templatePath)) {
