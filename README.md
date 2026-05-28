@@ -219,6 +219,14 @@ They do **not** protect against:
 - Anything Claude can do via tools other than Bash/Read/Write/Edit/Glob/Grep
 - Brand-new attack patterns not yet in the deny list, so keep the list updated
 
+### Compound shapes that auto-approve
+
+A compound command (e.g. `cmd1 && cmd2`, `cmd1 ; cmd2 | cmd3`) auto-approves only when **every** subcommand independently matches an APPROVE pattern. Env-var prefixes (`FOO=bar cmd`, `export FOO=bar && cmd`) are stripped before matching, so `pnpm -w test` and `export NODE_OPTIONS=--use-system-ca && pnpm -w test` both go through.
+
+Heredoc / here-string invocations (`python|python2|python3 << ['"]?MARKER['"]?` and `cat|tee REDIR << MARKER`) are scanned separately. A Python heredoc auto-approves only when the body has no `import` of `subprocess` / `socket` / `urllib` / `requests` / `shutil` / `ctypes` / `paramiko` / `importlib`, no `os.system|popen|exec*|fork|kill|remove|unlink|chmod|chown|setuid`, no `eval|exec|__import__|compile|getattr`, and every `open()` call uses a literal relative path that is not absolute / not `..`-traversing / not a sensitive file. `cat`/`tee` heredocs auto-approve when the redirect target is a safe relative path; the body itself is treated as opaque data.
+
+If a shape isn't covered here, you'll get the standard Claude Code prompt. Pick **"Yes, don't ask again"** to persist that allow rule to the current project's `.claude/settings.local.json`, or **"Allow this time"** to allow only for the current session.
+
 ## Troubleshooting
 
 **Hook not firing**: Check that `~/.claude/settings.json` has the `hooks` key and paths are absolute and correct for your OS.
