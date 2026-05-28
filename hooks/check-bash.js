@@ -688,13 +688,17 @@ const APPROVE_PATTERNS = [
 
   // JavaScript / TypeScript tooling
   /^\s*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc)\b/,
-  /^\s*(npx|pnpm|yarn|bun)\s+(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)\b/,
-  /^\s*pnpm\s+(run|test|build|dev|lint|format|exec|start)\b/,
-  /^\s*bun\s+(run|test|build|dev|x\s+\S+|start)\b/,
-  /^\s*yarn\s+(run|test|build|dev|lint|format|start)\b/,
+  /^\s*(npx|pnpm|yarn|bun)\s+(?:-[A-Za-z]+\s+)*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)\b/,
+  /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/,
+  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/,
+  /^\s*yarn\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|start)\b/,
+  /^\s*npm\s+(?:-[A-Za-z]+\s+)*(run|test|ci)\b/,
 
   // GitHub CLI (read-only)
   /^\s*gh\s+(auth\s+status|repo\s+(view|list)|pr\s+(view|list|status|checks|diff)|issue\s+(view|list|status)|run\s+(view|list|watch)|workflow\s+(view|list)|release\s+(view|list)|api\s+-X\s+GET\b|api\s+\/?[A-Za-z0-9_\/-]+\s*$|search\s+(repos|issues|prs|code|commits|users))\b/,
+  // GitHub CLI (writes) -- common workflow ops. Deny rules still catch the
+  // truly dangerous shapes (push to main, git config identity tamper, etc.).
+  /^\s*gh\s+(pr\s+(create|edit|merge|close|reopen|ready|review|comment|checkout)|issue\s+(create|edit|close|reopen|comment)|release\s+create|workflow\s+run)\b/,
 
   // Kubernetes (read-only)
   /^\s*kubectl\s+(get|describe|logs|explain|top|version|api-resources|api-versions|cluster-info|config\s+(view|current-context|get-contexts|get-clusters|get-users)|auth\s+can-i)\b/,
@@ -740,7 +744,135 @@ const POSH_APPROVE_PATTERNS = [
   /^\s*(Get-Command|gcm|Get-Help|help|Get-Member)\b/i,
   // Read-only git / tool version checks reuse the same shapes as bash.
   /^\s*git\s+(status|log|diff|show|branch|tag|remote|describe|rev-parse|ls-files|blame|reflog)\b/,
+  // Read/write git that POSIX-side already permits -- mirror the bash safe-write list.
+  /^\s*git\s+(-C\s+\S+\s+)?(add|commit|fetch|checkout\s+-b|stash\s+(save|push|pop|apply|drop)|switch|pull|merge|cherry-pick|worktree\s+(list|add|remove)|restore\s+--staged)\b/i,
+  // GitHub CLI -- mirror bash gh read+write rules.
+  /^\s*gh\s+(auth\s+status|repo\s+(view|list)|pr\s+(view|list|status|checks|diff|create|edit|merge|close|reopen|ready|review|comment|checkout)|issue\s+(view|list|status|create|edit|close|reopen|comment)|run\s+(view|list|watch)|workflow\s+(view|list|run)|release\s+(view|list|create)|api\s+-X\s+GET\b|api\s+\/?[A-Za-z0-9_\/-]+\s*$|search\s+(repos|issues|prs|code|commits|users))\b/i,
+  // Narrow Remove-Item: filename-only target (no path separators, no .., no
+  // wildcard), no -Recurse, no -Force. Leading dot is allowed (e.g. dotfiles
+  // like `.pr-body-bump.md`) as long as the second char is alphanumeric -- this
+  // rejects literal `.` and `..`. POSH deny rules already block the dangerous
+  // shapes (recurse+force on home/root/wildcard).
+  /^\s*(?:Remove-Item|ri|rm|del|erase)\s+(?:-LiteralPath\s+|-Path\s+)?(['"]?)\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*\1\s*$/i,
+  // Call operator + project-local venv python + read-only Python tool. Path
+  // must be relative and rooted at `.venv` (no traversal, no absolute path).
+  /^\s*&\s+['"]?\.[\\\/]\.venv[\\\/]Scripts[\\\/]python(?:\.exe)?['"]?\s+-m\s+(ruff|black|mypy|pytest|pylint|pyright|isort|flake8|bandit|coverage|build|pip\s+(?:list|show|freeze|tree))\b/i,
+  // pnpm/yarn/bun/npm under PowerShell (mirror bash JS-tooling rules with flag tolerance).
+  /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/i,
+  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/i,
+  /^\s*yarn\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|start)\b/i,
+  /^\s*npm\s+(?:-[A-Za-z]+\s+)*(run|test|ci)\b/i,
 ];
+
+// Path safety guard reused by heredoc validators. A "safe relative path" is
+// project-local: not absolute, no `..` traversal, no glob, and not a known
+// sensitive file/dir.
+function isSafeRelativePath(p) {
+  if (typeof p !== 'string' || p.length === 0) return false;
+  if (/^[\/\\]/.test(p)) return false;
+  if (/^[A-Za-z]:[\\\/]/.test(p)) return false;
+  if (/(^|[\\\/])\.\.([\\\/]|$)/.test(p)) return false;
+  if (/[*?]/.test(p)) return false;
+  if (/\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc|config\.fish|env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)$/i.test(p)) return false;
+  if (/(^|[\\\/])\.ssh([\\\/]|$)|(^|[\\\/])\.gnupg([\\\/]|$)|(^|[\\\/])\.aws([\\\/]|$)|(^|[\\\/])\.gcloud([\\\/]|$)|(^|[\\\/])\.azure([\\\/]|$)|(^|[\\\/])\.docker[\\\/]config|(^|[\\\/])\.gitconfig$|(^|[\\\/])\.git-credentials$|(^|[\\\/])\.git[\\\/]hooks([\\\/]|$)/i.test(p)) return false;
+  if (/(^|[\\\/])\.github[\\\/]workflows[\\\/]|\.gitlab-ci\.yml$|(^|[\\\/])\.circleci[\\\/]config|(^|[\\\/])Jenkinsfile$|\.drone\.yml$|\.azure-pipelines\.yml$|\.woodpecker\.yml$|buildkite\.yml$/i.test(p)) return false;
+  return true;
+}
+
+// Conservative Python heredoc body validator. Returns true iff the body is
+// purely data-and-file-write with safe-relative-path targets. Rejects any
+// import or call into subprocess / socket / urllib / requests / shutil /
+// ctypes / paramiko, all os.* mutating methods, and all eval-family builtins.
+// Any open() with a non-literal first arg also rejects (we can't statically
+// prove the path is safe). Comments and string literals can contain arbitrary
+// text -- the patterns require a real Python token boundary.
+function isSafePythonHeredocBody(body) {
+  const unsafe = [
+    /\bimport\s+(?:subprocess|socket|urllib|requests|httpx|aiohttp|websockets|paramiko|fabric|shutil|ctypes|importlib|ftplib|smtplib|telnetlib|xmlrpc|pickle|marshal)\b/,
+    /\bfrom\s+(?:subprocess|socket|urllib|requests|httpx|aiohttp|websockets|paramiko|fabric|shutil|ctypes|importlib|ftplib|smtplib|telnetlib|xmlrpc|pickle|marshal|http|os|sys)\s+import\b/,
+    /\bos\.(?:system|popen|exec[lv]?[ep]?e?|spawn[lv]?[ep]?e?|fork|kill|remove|unlink|rmdir|removedirs|chmod|chown|setuid|setgid|putenv|posix_spawn|forkpty)\b/,
+    /\b(?:subprocess|socket|urllib|requests|httpx|aiohttp|paramiko|shutil)\.[A-Za-z_]/,
+    /\b(?:eval|exec|__import__|compile|getattr|setattr|delattr|globals|locals|input|breakpoint|memoryview)\s*\(/,
+  ];
+  for (const re of unsafe) {
+    if (re.test(body)) return false;
+  }
+  const openLiteral = /\bopen\s*\(\s*[rRbBuU]*(['"])([^'"]+)\1/g;
+  let m;
+  while ((m = openLiteral.exec(body)) !== null) {
+    if (!isSafeRelativePath(m[2])) return false;
+  }
+  // Any open() whose first arg is NOT a literal quoted string is opaque -- reject.
+  if (/\bopen\s*\(\s*(?![rRbBuU]*['"])/.test(body)) return false;
+  return true;
+}
+
+// Detects a single heredoc invocation (`python3 << 'MARKER' ... MARKER` or
+// `cat|tee REDIRECT << ['"]?MARKER['"]?`) optionally followed by trailing
+// commands that themselves auto-approve. Returns true iff the whole rawCmd is
+// safe to approve as a single decision.
+function isSafeHeredocInvocation(rawCmd) {
+  if (!rawCmd || !rawCmd.includes('<<')) return false;
+  // postMarker (between marker and body's first newline) may carry a single
+  // safe redirection like `> file`, which is the common `cat <<EOF > file` form.
+  const head = rawCmd.match(
+    /^([\s\S]*?)<<(-?)\s*(['"]?)([A-Za-z_]\w*)\3([^\n]*)\n([\s\S]*?)\n([\t]*)\4(?:\r?\n|$)([\s\S]*)$/
+  );
+  if (!head) return false;
+  const preface   = head[1].trim();
+  const dash      = head[2];
+  const quoted    = head[3] === "'" || head[3] === '"';
+  const postMark  = head[5];
+  const body      = head[6];
+  const endPad    = head[7];
+  const trailing  = head[8];
+
+  if (dash === '' && endPad !== '') return false;
+  if (/<<-?\s*['"]?[A-Za-z_]\w*['"]?/.test(trailing)) return false;
+  if (!quoted && /\$\(|`|\$\{|\$[A-Za-z_]/.test(body)) return false;
+
+  let postMarkerTarget = null;
+  if (postMark.trim() !== '') {
+    const redirM = postMark.match(/^\s*>>?\s+(['"]?)([^\s'"<>|;&]+)\1\s*$/);
+    if (!redirM) return false;
+    postMarkerTarget = redirM[2];
+  }
+
+  const tokens = preface.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  const interp = tokens[0].toLowerCase();
+  const restTokens = tokens.slice(1);
+
+  if (interp === 'python' || interp === 'python2' || interp === 'python3') {
+    if (restTokens.length !== 0) return false;
+    if (postMarkerTarget !== null) return false;
+    if (!isSafePythonHeredocBody(body)) return false;
+  } else if (interp === 'cat') {
+    let target = null;
+    const prefRedir = preface.match(/(?:^|\s)>>?\s+(['"]?)([^\s'"<>|;&]+)\1\s*$/);
+    if (prefRedir) target = prefRedir[2];
+    else if (postMarkerTarget !== null) target = postMarkerTarget;
+    else return false;
+    if (!isSafeRelativePath(target)) return false;
+  } else if (interp === 'tee') {
+    if (postMarkerTarget !== null) return false;
+    let i = 0;
+    if (restTokens[i] === '-a' || restTokens[i] === '--append') i++;
+    if (restTokens.length - i !== 1) return false;
+    const target = restTokens[i].replace(/^['"]|['"]$/g, '');
+    if (!isSafeRelativePath(target)) return false;
+  } else {
+    return false;
+  }
+
+  if (trailing.trim()) {
+    const trailingSegs = splitChainSegments(trailing.replace(/\n/g, ' ; '));
+    for (const seg of trailingSegs) {
+      if (!checkSegmentApprove(seg, 0, false)) return false;
+    }
+  }
+  return true;
+}
 
 function checkSegmentDeny(seg, depth) {
   if (depth === undefined) depth = 0;
@@ -905,6 +1037,16 @@ process.stdin.on('end', () => {
   const isPosh = input?.tool_name === 'PowerShell';
 
   const cmd = normalizeUnicode(rawCmd);
+
+  // Heredoc invocations (bash-only): a single safe `python|cat|tee << MARKER`
+  // followed by auto-approved trailing commands is approved as a whole. This
+  // bypasses the flat chain-split (which mangles heredoc bodies into bogus
+  // segments) and the body validators ensure no exec/network primitives slip
+  // through.
+  if (!isPosh && isSafeHeredocInvocation(cmd)) {
+    approve(rawCmd);
+  }
+
   const flat = cmd.replace(/\n/g, ' ; ');
   const segments = isPosh ? splitPoshSegments(flat) : splitChainSegments(flat);
 
