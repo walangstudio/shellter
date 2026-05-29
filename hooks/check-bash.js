@@ -757,9 +757,20 @@ const POSH_APPROVE_PATTERNS = [
   // deny rules already block the dangerous shapes (recurse+force on
   // home/root/wildcard).
   /^\s*(?:Remove-Item|ri|rm|del|erase)\s+(?:-LiteralPath\s+|-Path\s+)?(['"]?)(?!\.?\w*\.?(?:env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks|bashrc|zshrc|profile|gitconfig)\1\s*$)(?!(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|known_hosts|authorized_keys)(?:\.pub)?\1\s*$)\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*\1\s*$/i,
-  // Call operator + project-local venv python + read-only Python tool. Path
-  // must be relative and rooted at `.venv` (no traversal, no absolute path).
-  /^\s*&\s+['"]?\.[\\\/]\.venv[\\\/]Scripts[\\\/]python(?:\.exe)?['"]?\s+-m\s+(ruff|black|mypy|pytest|pylint|pyright|isort|flake8|bandit|coverage|build|pip\s+(?:list|show|freeze|tree))\b/i,
+  // Python / uv tooling on PowerShell -- mirror the bash approve set, since
+  // python may be on PATH (not only inside a venv) and uv is a common runner.
+  // Deny patterns run first on every segment, so the broad `python`/`uv run`
+  // shapes are still backstopped against dangerous substrings.
+  /^\s*python[23]?\s+-m\s+(pytest|unittest|black|ruff|mypy|pylint|isort|flake8|coverage|tox|build|venv|pip\s+(?:list|show|freeze))\b/i,
+  /^\s*pytest\b/i,
+  /^\s*(ruff|black|mypy|pylint|pyright|isort|flake8|bandit|pyflakes|autopep8|yapf|pycodestyle|pydocstyle|pyupgrade)\b/i,
+  /^\s*uv\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
+  // Call operator (&) running python or uv from an explicit path -- a project
+  // venv (Scripts\ on Windows, bin/ on POSIX) or anywhere on PATH. The basename
+  // must be exactly python/uv (boundary-anchored so `notpython.exe` won't
+  // match); arguments are constrained to read-only module / test / lint verbs.
+  /^\s*&\s+['"]?(?:[^'"]*[\\\/])?python(?:[23])?(?:\.exe)?['"]?\s+-m\s+(ruff|black|mypy|pytest|pylint|pyright|isort|flake8|bandit|coverage|build|pip\s+(?:list|show|freeze|tree))\b/i,
+  /^\s*&\s+['"]?(?:[^'"]*[\\\/])?uv(?:\.exe)?['"]?\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
   // pnpm/yarn/bun/npm under PowerShell (mirror bash JS-tooling rules with flag tolerance).
   /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/i,
   /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/i,

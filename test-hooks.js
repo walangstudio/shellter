@@ -565,6 +565,26 @@ testPosh('PowerShell call-op venv python -m black approves',
   '& ".\\.venv\\Scripts\\python.exe" -m black --check .', 'allow');
 testPosh('PowerShell call-op venv python -m pytest approves',
   '& ".\\.venv\\Scripts\\python.exe" -m pytest -q', 'allow');
+testPosh('PowerShell call-op POSIX venv python -m ruff approves (Mac/Linux layout)',
+  '& "./.venv/bin/python" -m ruff check .', 'allow');
+testPosh('PowerShell plain python -m ruff approves (no venv)',
+  'python -m ruff check .', 'allow');
+testPosh('PowerShell plain pytest approves',
+  'pytest -q', 'allow');
+testPosh('PowerShell plain ruff approves',
+  'ruff check .', 'allow');
+testPosh('PowerShell uv run pytest approves',
+  'uv run pytest', 'allow');
+testPosh('PowerShell uv sync approves',
+  'uv sync', 'allow');
+testPosh('PowerShell call-op absolute-path python -m black approves',
+  '& "C:\\Python311\\python.exe" -m black --check .', 'allow');
+testPosh('PowerShell call-op uv run approves',
+  '& ".\\.venv\\Scripts\\uv.exe" run pytest', 'allow');
+testPosh('PowerShell call-op notpython.exe does NOT approve (boundary)',
+  '& "C:\\evil\\notpython.exe" -m ruff', 'fallthrough');
+testPosh('PowerShell uv run with dangerous rm still denies (deny runs before approve)',
+  join('uv run rm -rf', ' /etc'), 'deny');
 testPosh('PowerShell Remove-Item filename approves (no path sep, no flags)',
   'Remove-Item .pr-body-bump.md', 'allow');
 testPosh('PowerShell Remove-Item with path separator does NOT approve',
