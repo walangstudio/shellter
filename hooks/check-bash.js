@@ -447,7 +447,7 @@ const DENY_PATTERNS = [
   [/bash\s+-i\s+.*>\/dev\/tcp\//, 'Reverse shell pattern blocked'],
   [/\/dev\/(tcp|udp)\//, 'Direct /dev/tcp or /dev/udp access blocked'],
   [/\b(nc|ncat|netcat|socat)\s+.*-[a-zA-Z]*e\s/i, 'Netcat with -e blocked -- possible reverse shell'],
-  [/python[23]?\s+-c\s+.*\b(socket|pty\.spawn|subprocess)\b/i, 'Python one-liner with socket/pty/subprocess blocked'],
+  [/python[23]?\s+-c\s+.*(\bsocket\b|\bpty\.spawn\b|\bsubprocess\b|\bos\.system\b|\bos\.popen\b|\bos\.exec|\bos\.spawn|\b__import__\b|\bimportlib\b|\beval\s*\(|\bexec\s*\()/i, 'Python one-liner with socket/subprocess/os-exec/eval blocked'],
   [/perl\s+-e\s+.*\bsocket\b/i, 'Perl socket one-liner blocked'],
   [/ruby\s+-e\s+.*\bTCPSocket\b/i, 'Ruby TCPSocket one-liner blocked'],
 
@@ -757,20 +757,24 @@ const POSH_APPROVE_PATTERNS = [
   // deny rules already block the dangerous shapes (recurse+force on
   // home/root/wildcard).
   /^\s*(?:Remove-Item|ri|rm|del|erase)\s+(?:-LiteralPath\s+|-Path\s+)?(['"]?)(?!\.?\w*\.?(?:env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks|bashrc|zshrc|profile|gitconfig)\1\s*$)(?!(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|known_hosts|authorized_keys)(?:\.pub)?\1\s*$)\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*\1\s*$/i,
-  // Python / uv tooling on PowerShell -- mirror the bash approve set, since
-  // python may be on PATH (not only inside a venv) and uv is a common runner.
-  // Deny patterns run first on every segment, so the broad `python`/`uv run`
-  // shapes are still backstopped against dangerous substrings.
+  // Python / uv tooling on PowerShell -- a SUBSET of the bash approve set. The
+  // broad bash `python <script>` and `python -c <code>` forms are intentionally
+  // NOT mirrored here; only `-m <linter>`, the linters directly, and `uv` verbs.
+  // Deny patterns run first on every segment, so `uv run <x>` is still
+  // backstopped against dangerous substrings.
   /^\s*python[23]?\s+-m\s+(pytest|unittest|black|ruff|mypy|pylint|isort|flake8|coverage|tox|build|venv|pip\s+(?:list|show|freeze))\b/i,
   /^\s*pytest\b/i,
   /^\s*(ruff|black|mypy|pylint|pyright|isort|flake8|bandit|pyflakes|autopep8|yapf|pycodestyle|pydocstyle|pyupgrade)\b/i,
   /^\s*uv\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
-  // Call operator (&) running python or uv from an explicit path -- a project
-  // venv (Scripts\ on Windows, bin/ on POSIX) or anywhere on PATH. The basename
-  // must be exactly python/uv (boundary-anchored so `notpython.exe` won't
-  // match); arguments are constrained to read-only module / test / lint verbs.
-  /^\s*&\s+['"]?(?:[^'"]*[\\\/])?python(?:[23])?(?:\.exe)?['"]?\s+-m\s+(ruff|black|mypy|pytest|pylint|pyright|isort|flake8|bandit|coverage|build|pip\s+(?:list|show|freeze|tree))\b/i,
-  /^\s*&\s+['"]?(?:[^'"]*[\\\/])?uv(?:\.exe)?['"]?\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
+  // Call operator (&) running python or uv. The path must be either a
+  // project-local venv (.venv\Scripts on Windows, .venv/bin on POSIX) or a
+  // bare name resolved via PATH. An arbitrary absolute or traversed path
+  // (e.g. a planted `C:\tmp\python.exe` or `..\..\python.exe`) is NOT accepted
+  // -- those would run an explicitly-named binary that bypasses PATH trust.
+  // The `(['"]?)...\1` pairs the optional surrounding quote. Arguments are
+  // constrained to read-only module / test / lint verbs.
+  /^\s*&\s+(['"]?)(?:\.[\\\/]\.venv[\\\/](?:Scripts|bin)[\\\/])?python(?:[23])?(?:\.exe)?\1\s+-m\s+(ruff|black|mypy|pytest|pylint|pyright|isort|flake8|bandit|coverage|build|pip\s+(?:list|show|freeze))\b/i,
+  /^\s*&\s+(['"]?)(?:\.[\\\/]\.venv[\\\/](?:Scripts|bin)[\\\/])?uv(?:\.exe)?\1\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
   // pnpm/yarn/bun/npm under PowerShell (mirror bash JS-tooling rules with flag tolerance).
   /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/i,
   /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/i,
