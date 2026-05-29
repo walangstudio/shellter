@@ -577,14 +577,24 @@ testPosh('PowerShell uv run pytest approves',
   'uv run pytest', 'allow');
 testPosh('PowerShell uv sync approves',
   'uv sync', 'allow');
-testPosh('PowerShell call-op absolute-path python -m black approves',
-  '& "C:\\Python311\\python.exe" -m black --check .', 'allow');
-testPosh('PowerShell call-op uv run approves',
+testPosh('PowerShell call-op absolute-path python does NOT approve (planted-binary guard)',
+  '& "C:\\Python311\\python.exe" -m black --check .', 'fallthrough');
+testPosh('PowerShell call-op traversal-path python does NOT approve',
+  '& "..\\..\\..\\tmp\\python.exe" -m ruff', 'fallthrough');
+testPosh('PowerShell call-op bare-name python approves (PATH trust, same as plain)',
+  '& "python.exe" -m ruff check .', 'allow');
+testPosh('PowerShell call-op uv run from venv approves',
   '& ".\\.venv\\Scripts\\uv.exe" run pytest', 'allow');
 testPosh('PowerShell call-op notpython.exe does NOT approve (boundary)',
   '& "C:\\evil\\notpython.exe" -m ruff', 'fallthrough');
 testPosh('PowerShell uv run with dangerous rm still denies (deny runs before approve)',
   join('uv run rm -rf', ' /etc'), 'deny');
+testPosh('PowerShell uv run python -c os.system denies',
+  join('uv run python -c "import os; os.sy', 'stem(\'id\')"'), 'deny');
+testBash('Bash python -c os.system denies',
+  join('python -c "import os; os.sy', 'stem(\'id\')"'), 'deny');
+testBash('Bash python -c eval denies',
+  join('python -c "ev', 'al(input())"'), 'deny');
 testPosh('PowerShell Remove-Item filename approves (no path sep, no flags)',
   'Remove-Item .pr-body-bump.md', 'allow');
 testPosh('PowerShell Remove-Item with path separator does NOT approve',
