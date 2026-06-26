@@ -1,7 +1,7 @@
 {
   "name": "shellter",
   "description": "PreToolUse security hooks: dangerous-command gating, executed-script content scanning, sensitive-file and prompt-injection protection. Bash, PowerShell, cmd; Linux, macOS, Windows.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": {
     "name": "scr1p7k177y",
     "email": "scriptkitty@walang.studio"
@@ -9,6 +9,5 @@
   "homepage": "https://github.com/walangstudio/shellter",
   "repository": "https://github.com/walangstudio/shellter",
   "license": "MIT",
-  "keywords": ["security", "hooks", "pretooluse", "bash", "powershell"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["security", "hooks", "pretooluse", "bash", "powershell"]
 }
