@@ -7,6 +7,32 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.4.0] - 2026-06-26
+
+Distribution. shellter is now a Claude Code plugin with its own marketplace, so
+installing it is two commands instead of copy-the-scripts-and-merge-settings.
+
+### Added
+- **Claude Code plugin + marketplace.** The repo is both a marketplace
+  (`.claude-plugin/marketplace.json`) and the plugin (`.claude-plugin/plugin.json`
+  + `hooks/hooks.json`). Install with:
+  ```
+  /plugin marketplace add walangstudio/shellter
+  /plugin install shellter@shellter
+  ```
+  The PreToolUse hooks (Bash/PowerShell gating + Read/Write/Edit/Glob/Grep
+  protection) register automatically via `${CLAUDE_PLUGIN_ROOT}`, with a
+  `commandWindows` variant so it works on Windows too. No `merge-settings.js`,
+  no hand-editing `settings.json`.
+
+### Notes
+- The manual install (`merge-settings.js` + copying hooks) still works and is the
+  path for non-plugin clients. If you switch to the plugin, remove the manual
+  hooks from `~/.claude/settings.json` so they don't double-fire.
+- Plugin hooks are additive with your own settings hooks and use the same
+  `permissionDecision` protocol; the most restrictive decision wins.
+- No hook-logic changes from 0.3.0 — this release is packaging only.
+
 ## [0.3.0] - 2026-06-26
 
 Until now the hooks judged a command by its text alone. `bash install.sh` told
@@ -134,6 +160,7 @@ were cut in between:
   databases, plus prompt-injection and token-shape detection in written content.
 - Opt-in audit log via `CLAUDE_HOOK_LOG` and `CLAUDE_HOOK_DEBUG`.
 
+[0.4.0]: https://github.com/walangstudio/shellter/releases/tag/v0.4.0
 [0.3.0]: https://github.com/walangstudio/shellter/releases/tag/v0.3.0
 [0.2.0]: https://github.com/walangstudio/shellter/releases/tag/v0.2.0
 [0.1.0]: https://github.com/walangstudio/shellter/releases/tag/v0.1.0

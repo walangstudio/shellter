@@ -1,6 +1,6 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
 [![tests](https://img.shields.io/badge/tests-324%20passing-brightgreen)](test-hooks.js)
@@ -67,7 +67,23 @@ Node.js >= 18 (Claude Code requires Node.js 18+, so it's already installed if yo
 
 No other dependencies. Hooks use only Node.js built-ins.
 
-### Linux / macOS
+### As a Claude Code plugin (recommended)
+
+Two commands, no file copying or `settings.json` editing:
+
+```
+/plugin marketplace add walangstudio/shellter
+/plugin install shellter@shellter
+```
+
+The PreToolUse hooks register automatically (via `${CLAUDE_PLUGIN_ROOT}`) and
+work on Linux, macOS, and Windows. Update later with `/plugin update shellter`.
+
+If you previously installed shellter the manual way below, remove its hooks from
+`~/.claude/settings.json` first so they don't double-fire. The manual method
+remains for non-plugin clients.
+
+### Manual install (Linux / macOS)
 
 ```bash
 # 1. Copy hook scripts (all four -- the last two are runtime deps)
@@ -80,7 +96,7 @@ cp hooks/scan-content.js hooks/shellter-trust.js ~/.claude/hooks/
 node merge-settings.js
 ```
 
-### Windows
+### Manual install (Windows)
 
 ```powershell
 mkdir -Force "$env:USERPROFILE\.claude\hooks"
@@ -288,5 +304,6 @@ node test-hooks.js
 
 ## Changelog
 
-Current version is 0.3.0 (script-content scanning, trust store, hardened
-injection detection). The full history lives in [CHANGELOG.md](CHANGELOG.md).
+Current version is 0.4.0 (Claude Code plugin + marketplace packaging; script-
+content scanning and hardened injection detection from 0.3.0). The full history
+lives in [CHANGELOG.md](CHANGELOG.md).
