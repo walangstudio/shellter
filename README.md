@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.4.1-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-324%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-329%20passing-brightgreen)](test-hooks.js)
 
 Shelters you from dangerous shell commands. Global PreToolUse hooks that
 auto-allow safe operations and block dangerous ones across every Claude Code
@@ -72,16 +72,18 @@ No other dependencies. Hooks use only Node.js built-ins.
 Two commands, no file copying or `settings.json` editing:
 
 ```
-/plugin marketplace add walangstudio/shellter
-/plugin install shellter@shellter
+/plugin marketplace add walangstudio/marketplace
+/plugin install shellter@walangstudio
 ```
 
 The PreToolUse hooks register automatically (via `${CLAUDE_PLUGIN_ROOT}`) and
 work on Linux, macOS, and Windows. Update later with `/plugin update shellter`.
 
-If you previously installed shellter the manual way below, remove its hooks from
-`~/.claude/settings.json` first so they don't double-fire. The manual method
-remains for non-plugin clients.
+Migrating from an earlier shellter? If you added the old `walangstudio/shellter`
+marketplace (pre-0.4.1), remove it first with `/plugin marketplace remove shellter`,
+then add `walangstudio/marketplace`. If you installed the manual way below, remove
+its hooks from `~/.claude/settings.json` so they don't double-fire. The manual
+method remains for non-plugin clients.
 
 ### Manual install (Linux / macOS)
 
@@ -304,6 +306,7 @@ node test-hooks.js
 
 ## Changelog
 
-Current version is 0.4.0 (Claude Code plugin + marketplace packaging; script-
-content scanning and hardened injection detection from 0.3.0). The full history
+Current version is 0.4.1 (marketplace moved to `walangstudio/marketplace`; Claude
+Code plugin packaging from 0.4.0; script-content scanning and hardened injection
+detection from 0.3.0). The full history
 lives in [CHANGELOG.md](CHANGELOG.md).

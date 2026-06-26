@@ -243,6 +243,13 @@ testBash('Deny: zero-width-disguised bash -i',
 testBash('Deny: rm -rf $VAR',
   'rm -rf $TARGET', 'deny');
 
+// rm -rf bare root / home (regression: trailing \b never matched at end-of-string)
+testBash('Deny: rm -rf / (bare root)', join('rm -rf', ' /'), 'deny');
+testBash('Deny: rm -rf / --no-preserve-root', join('rm -rf', ' / --no-preserve-root'), 'deny');
+testBash('Deny: rm -rf ~ (bare home)', join('rm -rf', ' ~'), 'deny');
+testBash('Deny: rm -rf ~/Documents (home subpath)', join('rm -rf', ' ~/Documents'), 'deny');
+testBash('Pass: rm -rf node_modules (not root/home)', 'rm -rf node_modules', 'fallthrough');
+
 // chmod precision (numeric setuid only fires on leading [2467])
 testBash('Deny: chmod 4755 (setuid)', 'chmod 4755 /usr/local/bin/foo', 'deny');
 testBash('Deny: chmod 6755 (setuid+setgid)', 'chmod 6755 /usr/local/bin/foo', 'deny');
