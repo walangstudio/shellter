@@ -9,6 +9,5 @@
   "homepage": "https://github.com/walangstudio/shellter",
   "repository": "https://github.com/walangstudio/shellter",
   "license": "MIT",
-  "keywords": ["security", "hooks", "pretooluse", "bash", "powershell"],
-  "hooks": "./hooks/hooks.json"
+  "keywords": ["security", "hooks", "pretooluse", "bash", "powershell"]
 }

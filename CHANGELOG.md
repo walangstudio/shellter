@@ -9,9 +9,17 @@ when we started counting. Everything in this session is 0.2.0.
 
 ## [0.4.1] - 2026-06-26
 
-Distribution moved to a shared marketplace, plus a destructive-`rm` deny-rule fix.
+Distribution moved to a shared marketplace, plus plugin-load and destructive-`rm`
+fixes.
 
 ### Fixed
+- **Plugin hooks now actually load.** `plugin.json` referenced
+  `./hooks/hooks.json` in its `hooks` field, but Claude Code auto-loads the
+  standard `hooks/hooks.json` — the reference loaded it a second time, so the
+  plugin failed with "Duplicate hooks file detected: Hook load failed" and
+  shellter's hooks never registered (the plugin installed but did nothing).
+  Removed the redundant `hooks` field; the standard file auto-loads. `manifest.hooks`
+  is only for *additional* hook files beyond the standard one.
 - **`rm -rf /` and `rm -rf ~` are now blocked.** The system-directory and
   home-directory rm rules anchored the target with a trailing `\b`, which never
   matches at end of string after a non-word char (`/`, `~`). So bare
