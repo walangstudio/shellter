@@ -566,9 +566,9 @@ const DENY_PATTERNS = [
     'Reading sensitive file/directory via shell blocked'],
 
   // Destructive rm
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\/|\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b/,
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(?:\/(?![A-Za-z0-9])|(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b)/,
     'Destructive rm on system directory blocked'],
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+~\b/, 'Destructive rm on home directory blocked'],
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+~/, 'Destructive rm on home directory blocked'],
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\{\}|\$\{?[A-Za-z_])/,
     'rm -rf with placeholder/variable target blocked'],
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+\/\*/, 'rm -rf /* blocked'],
