@@ -409,13 +409,20 @@ function parseCmdInvocation(segment) {
   return { innerCmd: arg, opaque: false };
 }
 
+// Appended to every block. An LLM agent treats a bare "blocked" as an obstacle
+// to route around (it will try Copy-Item / re-encode / rename); telling it plainly
+// that this is a user-protection control it must not bypass makes it stop instead.
+const BYPASS_NOTICE =
+  ' | shellter blocked this to protect the user. Do NOT bypass, re-encode, copy, rename, or work ' +
+  'around it; stop and tell the user what was blocked and why so they can decide.';
+
 function deny(reason, snippet) {
   audit('deny', reason, snippet);
   const output = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: 'deny',
-      permissionDecisionReason: reason,
+      permissionDecisionReason: reason + BYPASS_NOTICE,
     },
   });
   process.stdout.write(output + '\n');
@@ -446,7 +453,7 @@ function flagRisk(reason, snippet) {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: SCRIPT_RISK_DECISION,
-      permissionDecisionReason: reason,
+      permissionDecisionReason: reason + BYPASS_NOTICE,
     },
   });
   process.stdout.write(output + '\n');
@@ -559,11 +566,16 @@ const DENY_PATTERNS = [
   [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*update-ref\s+-d\b/, 'git update-ref -d blocked -- destroys refs'],
   [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*filter-(branch|repo)\b/, 'git filter-branch / filter-repo blocked -- rewrites history'],
 
-  // Sensitive file reads via shell
-  [/(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg)\s+.*\.(env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)\b/i,
+  // Sensitive file reads via shell. Verb list covers the common readers/dumpers
+  // (cat/head/…, plus xxd/od/strings/base64/dd/openssl/gpg/jq) so a zsh/bash/fish
+  // user on Linux or macOS can't dump a secret around the `cat` rule.
+  [/\b(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg|xxd|od|strings|base64|base32|hexdump|nl|tac|rev|fold|cut|tr|paste|column|jq|yq|openssl|gpg|gpg2|dd)\b\s+.*\.(env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)\b/i,
     'Reading sensitive file via shell blocked'],
-  [/(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg)\s+.*(\.env|\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\/|\.gnupg\/|\.aws\/|\.gcloud\/|\.azure\/|\.docker\/config|\.gitconfig|\.git-credentials)/i,
+  [/\b(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg|xxd|od|strings|base64|base32|hexdump|nl|tac|rev|fold|cut|tr|paste|column|jq|yq|openssl|gpg|gpg2|dd)\b\s+.*(\.env|\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\/|\.gnupg\/|\.aws\/|\.gcloud\/|\.azure\/|\.docker\/config|\.gitconfig|\.git-credentials)/i,
     'Reading sensitive file/directory via shell blocked'],
+  // Reading a secret via the shell's file-read substitution ( $(<secret) ).
+  [/\$\(\s*<\s*['"]?[^)'"]*(\.env\b|\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\/|\.gnupg\/|\.aws\/|\.(pem|key|p12|pfx|jks|pgpass|netrc))/i,
+    'Reading sensitive file via $(<...) substitution blocked'],
 
   // Destructive rm
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(?:\/(?![A-Za-z0-9])|(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b)/,
@@ -623,6 +635,20 @@ const POSH_DENY_PATTERNS = [
   [/\.(DownloadString|DownloadFile|DownloadData)\s*\(/i, 'Net.WebClient download blocked'],
   [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^;|]*-(Method\s+(POST|PUT)|Body|InFile)\b/i,
     'PowerShell web upload blocked -- review manually'],
+  // Reading sensitive files via PowerShell/cmd (Get-Content/gc/type/Select-String/.NET).
+  // Mirrors the bash `cat .env` rule so a PowerShell-shaped read can't slip past it.
+  [/\b(Get-Content|gc|type|more|findstr|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)\b[^;|]*(\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh[\\\/]|\.gnupg[\\\/]|\.aws[\\\/]|\.gcloud[\\\/]|\.azure[\\\/]|\.docker[\\\/]config|\.gitconfig|\.git-credentials|\.(env|pem|key|crt|secret|pgpass|netrc|npmrc|p12|pfx|jks)\b)/i,
+    'Reading sensitive file via PowerShell/cmd blocked'],
+  [/\[(?:System\.)?IO\.File\]::Read\w*\s*\([^)]*(\.env|id_rsa|id_ed25519|\.ssh[\\\/]|credentials|\.(pem|key|pfx|p12))/i,
+    'Reading sensitive file via .NET IO.File blocked'],
+  // Copying/moving/renaming a sensitive file (exfil to a benign-named copy, then read it).
+  [/\b(Copy-Item|cpi|copy|Move-Item|mi|move|Rename-Item|rni|ren|rename|cp|mv|install|xcopy|robocopy)\b[^;|]*(\.env\b|\.secret\b|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\b|\.gnupg\b|\.aws\b|\.gcloud\b|\.azure\b|\.docker[\\\/]config|\.gitconfig|\.git-credentials|\.(pem|key|p12|pfx|jks|pgpass|netrc))/i,
+    'Copying/moving a sensitive file blocked -- possible exfiltration'],
+  [/\[(?:System\.)?IO\.File\]::(Copy|Move|Replace)\s*\([^)]*(\.env|id_rsa|id_ed25519|\.ssh[\\\/]|credentials|\.(pem|key|pfx|p12))/i,
+    'Copying a sensitive file via .NET IO.File blocked -- possible exfiltration'],
+  // Inline interpreter referencing a sensitive file (python -c / node -e / ruby -e ...).
+  [/\b(python[0-9.]*|node|deno|bun|ruby|perl|php)\b[^;|]*\s-[ce]\b[^;|]*(\.env\b|id_rsa|id_ed25519|id_ecdsa|\.ssh[\\\/]|\.gnupg[\\\/]|\.aws[\\\/]|credentials|\.(pem|key|p12|pfx))/i,
+    'Inline interpreter referencing a sensitive file blocked -- possible exfiltration'],
   // Encoded command execution.
   [/\b(powershell|pwsh)(\.exe)?\b[^;|]*-(?:e|ec|enc|encodedcommand)\b/i,
     'powershell -EncodedCommand blocked'],

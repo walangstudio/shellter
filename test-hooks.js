@@ -331,6 +331,35 @@ testPosh('PS deny: Start-Process RunAs',
   'Start-Process powershell -Verb RunAs', 'deny');
 testPosh('PS deny: backtick then destructive (split correctness)',
   join('Write-Host "a`nb"; Remove-Item -Recurse -For', 'ce C:\\'), 'deny');
+testPosh('PS deny: Get-Content .env (sensitive read)',
+  join('Get-Content -LiteralPath .', 'env'), 'deny');
+testPosh('PS deny: gc private key',
+  join('gc ~/.ssh/id_', 'rsa'), 'deny');
+testPosh('PS deny: type .env (cmd alias)', join('type .', 'env'), 'deny');
+testPosh('PS deny: Select-String aws credentials',
+  join('Select-String -Path ~/.aws/cred', 'entials -Pattern key'), 'deny');
+testPosh('PS deny: [IO.File]::ReadAllText secret',
+  join('[IO.File]::ReadAllText(".', 'env")'), 'deny');
+
+console.log('\n--- cross-shell sensitive reads (zsh/macOS/cmd dump tools) ---');
+testBash('bash deny: xxd ssh key', join('xxd ~/.ssh/id_', 'rsa'), 'deny');
+testBash('bash deny: base64 .env', join('base64 .', 'env'), 'deny');
+testBash('bash deny: strings aws creds', join('strings ~/.aws/cred', 'entials'), 'deny');
+testBash('bash deny: zsh -c cat .env (unwrap)', join("zsh -c 'cat .", "env'"), 'deny');
+testBash('bash deny: $(<key) substitution', join('echo $(< ~/.ssh/id_', 'rsa)'), 'deny');
+testBash('bash pass: base64 image (no FP)', 'base64 logo.png', 'fallthrough');
+testBash('bash pass: xxd firmware (no FP)', 'xxd firmware.bin', 'allow');
+
+console.log('\n--- secret exfil via copy/move/interpreter ---');
+testBash('deny: Copy-Item .env to benign name (the evasion)',
+  join('Copy-Item -LiteralPath .', 'env -Destination bak.txt -Force'), 'deny');
+testBash('deny: cp private key out', join('cp ~/.ssh/id_', 'rsa /tmp/x'), 'deny');
+testBash('deny: Move-Item secret', join('Move-Item .', 'env stash.txt'), 'deny');
+testBash('deny: robocopy .ssh dir', join('robocopy ~/.', 'ssh C:\\x'), 'deny');
+testBash('deny: python -c read secret', join("python -c \"open('.", "env').read()\""), 'deny');
+testBash('deny: node -e read secret', join("node -e \"require('fs').readFileSync('.", "env')\""), 'deny');
+testBash('pass: cp normal files (no FP)', 'cp dist/a.js dist/b.js', 'allow');
+testBash('pass: python -c arithmetic (no FP)', 'python -c "print(2+2)"', 'allow');
 
 console.log('\n--- PowerShell approve ---');
 testPosh('PS approve: Get-ChildItem', 'Get-ChildItem -Recurse', 'allow');
