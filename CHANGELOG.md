@@ -7,6 +7,49 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.5.0] - 2026-06-27
+
+Secret-exfiltration hardening across every shell, an anti-bypass notice that stops
+an AI agent from routing around a block, and an experimental opencode adapter.
+
+### Added
+- **Sensitive-file reads blocked in PowerShell and cmd, not just bash.** The bash
+  `cat .env` rule had no PowerShell/cmd equivalent, so `Get-Content .env`,
+  `gc ~/.ssh/id_rsa`, `type .env`, `findstr ... .env`, `Format-Hex key.pem`,
+  `Select-String`, and `[IO.File]::ReadAllText(...)` of a secret all walked through.
+  Now denied. (Found live: an opencode agent read `.env` via `Get-Content` after its
+  `read` tool was blocked.)
+- **Broadened the bash/zsh/fish/macOS reader list** beyond `cat`/`head` to the common
+  dumpers — `xxd`, `od`, `strings`, `base64`, `dd`, `openssl`, `gpg`, `jq`, `cut`,
+  `tr`, … — so a secret can't be dumped around the `cat` rule on any POSIX shell or
+  macOS Terminal.
+- **`$(<secret)` shell file-read substitution** is now caught.
+- **Copy/move/rename exfil blocked.** Copying a secret to a benign name and reading
+  the copy is the obvious next move; `Copy-Item`/`cp`/`mv`/`Rename-Item`/`robocopy`/
+  `[IO.File]::Copy` of a sensitive source (or the whole `.ssh`/`.aws`/`.gnupg` dir)
+  is denied.
+- **Inline-interpreter reads** (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php`)
+  that reference a sensitive path are denied.
+- **Anti-bypass notice on every block.** Each deny/ask reason now tells the agent the
+  block protects the user and not to bypass, re-encode, copy, or rename around it —
+  stop and tell the user. In practice this turns a task-focused model away from
+  probing workarounds (verified live: the agent stopped and explained instead of
+  copying `.env` to a non-dotfile name).
+- **Experimental opencode adapter** (`adapters/opencode/`). An opencode plugin that
+  routes `tool.execute.before` through shellter's existing hooks (one shared
+  detector), so dangerous Bash/PowerShell, sensitive-file access, and prompt
+  injection are gated in opencode too. Verified live (blocks `.env` reads + the
+  `Copy-Item` evasion). pi/codex adapters and an opt-in passthrough LLM judge are
+  planned.
+
+### Notes
+- Detection stays pattern + heuristic. A determined agent that runs arbitrary code (a
+  custom `python`/`node` script, an obfuscated path) can still read a file — no
+  command-pattern hook fully prevents that. The real boundary for "the agent must
+  never see this secret" is not exposing it to the agent (sandbox / secret manager);
+  shellter raises the bar against the casual and obvious paths.
+- Test suite grew 329 -> 349. The bash path stays byte-compatible for pre-existing cases.
+
 ## [0.4.1] - 2026-06-26
 
 Distribution moved to a shared marketplace, plus plugin-load and destructive-`rm`
@@ -197,6 +240,7 @@ were cut in between:
   databases, plus prompt-injection and token-shape detection in written content.
 - Opt-in audit log via `CLAUDE_HOOK_LOG` and `CLAUDE_HOOK_DEBUG`.
 
+[0.5.0]: https://github.com/walangstudio/shellter/releases/tag/v0.5.0
 [0.4.1]: https://github.com/walangstudio/shellter/releases/tag/v0.4.1
 [0.4.0]: https://github.com/walangstudio/shellter/releases/tag/v0.4.0
 [0.3.0]: https://github.com/walangstudio/shellter/releases/tag/v0.3.0
