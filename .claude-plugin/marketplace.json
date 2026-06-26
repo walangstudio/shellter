@@ -1,0 +1,17 @@
+{
+  "name": "shellter",
+  "description": "Security hooks for Claude Code that shelter you from dangerous shell commands and prompt injection.",
+  "owner": {
+    "name": "walangstudio",
+    "url": "https://github.com/walangstudio"
+  },
+  "plugins": [
+    {
+      "name": "shellter",
+      "source": ".",
+      "description": "PreToolUse hooks: gate dangerous Bash/PowerShell/cmd, scan executed-script contents for malicious code, and block sensitive-file access and prompt injection.",
+      "homepage": "https://github.com/walangstudio/shellter",
+      "license": "MIT"
+    }
+  ]
+}
