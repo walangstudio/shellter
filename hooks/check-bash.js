@@ -11,6 +11,10 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const scan = require('./scan-content.js');
+const trust = require('./shellter-trust.js');
 
 function audit(decision, reason, snippet) {
   const log = process.env.CLAUDE_HOOK_LOG;
@@ -431,6 +435,24 @@ function approve(snippet) {
   process.exit(0);
 }
 
+// Decision for a script whose CONTENTS scan as high-risk and that isn't trusted.
+// 'ask' lets the user proceed once after reading it, and re-flags every run until
+// trusted. Flip to 'deny' if a Claude Code build doesn't surface ask reasons.
+const SCRIPT_RISK_DECISION = 'ask';
+
+function flagRisk(reason, snippet) {
+  audit(SCRIPT_RISK_DECISION, reason, snippet);
+  const output = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: SCRIPT_RISK_DECISION,
+      permissionDecisionReason: reason,
+    },
+  });
+  process.stdout.write(output + '\n');
+  process.exit(0);
+}
+
 const DENY_PATTERNS = [
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
@@ -717,7 +739,9 @@ const APPROVE_PATTERNS = [
   /^\s*done\s*$/,
   /^\s*then\s*$/,
   /^\s*fi\s*$/,
-  /^\s*(source|export|set|type|command|hash|builtin|timeout|time|trap|read|local|declare|readonly|unset)\s/,
+  // `source` / `.` removed here: routed through the script-content scanner so a
+  // sourced local script is inspected, not blanket-approved.
+  /^\s*(export|set|type|command|hash|builtin|timeout|time|trap|read|local|declare|readonly|unset)\s/,
   /^\s*command\s+-v\s/,
   /^\s*type\s+-[apt]/,
 
@@ -1062,6 +1086,137 @@ function checkSegmentApprove(seg, depth, isPosh) {
   return false;
 }
 
+// ---- script-content scanning (PART 1) ---------------------------------------
+
+const ENV_PREFIX = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/;
+
+// Detect a segment that EXECUTES a local script file. Returns { kind, token }
+// where kind 'source' is `source X` / `. X` (clean -> approve, preserving the
+// old behavior) and kind 'exec' is everything else (clean -> fallthrough).
+const SH = '(?:[^\\s]*/)?(?:bash|sh|zsh|dash|ash|ksh|fish)';   // an interpreter, optional path
+const FLAGS = '(?:--\\s+|--[A-Za-z][\\w-]*\\s+|-[A-Za-z]+\\s+)*'; // leading flags incl. `--` and `--long`
+
+function stripExecWrappers(s) {
+  // env [-opts|VAR=val]... / command / exec / builtin / time / nohup / setsid /
+  // stdbuf prefixes don't change WHICH script runs -- strip so it is still scanned.
+  for (let k = 0; k < 4; k++) {
+    const before = s;
+    s = s.replace(/^(?:command|exec|builtin|time|nohup|setsid)\s+/, '');
+    s = s.replace(/^env(?:\s+-\S+|\s+[A-Za-z_]\w*=\S*)*\s+/, '');
+    if (s === before) break;
+  }
+  return s;
+}
+
+function detectScriptExec(seg, isPosh) {
+  const s = stripExecWrappers(seg.replace(ENV_PREFIX, ''));
+  let m;
+  if (isPosh) {
+    m = s.match(/^(?:[^\s]*[\\/])?(?:powershell|pwsh)(?:\.exe)?\s+(?:-\S+\s+)*-File\s+'([^']+)'/i) ||
+        s.match(/^(?:[^\s]*[\\/])?(?:powershell|pwsh)(?:\.exe)?\s+(?:-\S+\s+)*-File\s+"([^"]+)"/i) ||
+        s.match(/^(?:[^\s]*[\\/])?(?:powershell|pwsh)(?:\.exe)?\s+(?:-\S+\s+)*-File\s+(\S+)/i) ||
+        s.match(/^&\s+'([^']+\.ps1)'/i) ||
+        s.match(/^&\s+"([^"]+\.ps1)"/i) ||
+        s.match(/^&\s+(\S+\.ps1)/i);
+    if (m) return { kind: 'exec', token: m[1] };
+    m = s.match(/^(?:\.\s+)?(['"]?)((?:\.[\\/]|[A-Za-z]:[\\/])?[^\s'"]+\.ps1)\1/i);
+    return m ? { kind: 'exec', token: m[2] } : null;
+  }
+  // source / . X  (quoted-with-spaces first, then bare)
+  m = s.match(/^(?:source|\.)\s+'([^']+)'/) || s.match(/^(?:source|\.)\s+"([^"]+)"/);
+  if (m) return { kind: 'source', token: m[1] };
+  m = s.match(/^(?:source|\.)\s+(\S+)/);
+  if (m) return { kind: 'source', token: m[1] };
+  // interpreter + quoted script (allows spaces)
+  m = s.match(new RegExp('^' + SH + '\\s+' + FLAGS + "'([^']+)'")) ||
+      s.match(new RegExp('^' + SH + '\\s+' + FLAGS + '"([^"]+)"'));
+  if (m) return { kind: 'exec', token: m[1] };
+  // interpreter + bare script (not a flag, not a redirect/pipe operator)
+  m = s.match(new RegExp('^' + SH + '\\s+' + FLAGS + "([^\\s'\"<>|&-][^\\s'\"<>|&]*)"));
+  if (m) return { kind: 'exec', token: m[1] };
+  // ./script
+  m = s.match(/^(['"]?)(\.\/[^\s'"]+)\1/);
+  if (m) return { kind: 'exec', token: m[2] };
+  // stdin redirect: `bash < script` / `bash<script` (not process-sub `<(`)
+  m = s.match(new RegExp('^' + SH + '\\b[^\\n]*?<\\s*(?!\\()([^\\s\'"<>|&]+)'));
+  if (m) return { kind: 'exec', token: m[1] };
+  return null;
+}
+
+function resolveScriptPath(token, cwd) {
+  if (!token) return null;
+  let t = token.replace(/^['"]|['"]$/g, '');
+  if (/[*?]/.test(t)) return null;            // glob -> normal flow
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return null; // URL
+  if (t === '-') return null;                  // stdin
+  if (t[0] === '~') t = path.join(os.homedir(), t.slice(1));
+  try {
+    return path.isAbsolute(t) ? path.normalize(t) : path.resolve(cwd || process.cwd(), t);
+  } catch {
+    return null;
+  }
+}
+
+// Read the first TRUST_SCAN_BYTES of a file. Returns {buf, size, truncated} or
+// null on any error or binary content. Never throws -- inability to read must
+// not hard-block.
+function readBoundedForScan(absPath) {
+  let fd;
+  try {
+    fd = fs.openSync(absPath, 'r');
+    const buf = Buffer.alloc(trust.TRUST_SCAN_BYTES);
+    const n = fs.readSync(fd, buf, 0, trust.TRUST_SCAN_BYTES, 0);
+    const size = fs.fstatSync(fd).size;
+    const slice = buf.subarray(0, n);
+    for (let i = 0; i < slice.length; i++) if (slice[i] === 0) return null; // binary
+    return { buf: slice, size, truncated: size > n };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+}
+
+function buildRiskReason(absPath, token, findings, truncated, hooksDir) {
+  const high = findings.filter(f => f.severity === 'high').slice(0, 3);
+  let what = high.map(f => f.signal + (f.line ? ' (line ' + f.line + ')' : '')).join('; ');
+  if (truncated) {
+    what = (what ? what + '; ' : '') + 'exceeds the ' + trust.TRUST_SCAN_BYTES +
+      '-byte inspection limit (only the start was scanned)';
+  }
+  const trustCmd = 'node "' + path.join(hooksDir, 'shellter-trust.js') + '" add "' + absPath + '"';
+  return 'shellter: script "' + token + '" (' + absPath + ') has high-risk code: ' +
+    what + '. OPEN AND READ this file yourself before approving -- do not approve blindly. ' +
+    'This repeats every run until trusted. To stop the prompt: pick "Yes, don\'t ask again", OR run: ' + trustCmd;
+}
+
+// Inspect a script-executing segment. A script must pass cleanly AND be fully
+// inspected to be waved through; otherwise it needs trust (store or a specific
+// native allow-rule) or it is flagged. Clean 'exec' segments are left to the
+// normal flow; clean 'source' segments are approved (preserving old behavior).
+function checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs) {
+  const shape = detectScriptExec(seg, isPosh);
+  if (!shape) return;
+  if (!isPosh && parseShellCInvocation(seg)) return; // -c form already handled
+  const abs = resolveScriptPath(shape.token, cwd);
+  if (!abs) return;
+  const r = readBoundedForScan(abs);
+  if (!r) { audit('fallthrough', 'script-unreadable:' + abs, seg); return; }
+  const findings = scan.scanShell(r.buf.toString('utf8'), { decode: true });
+  if (!scan.hasHigh(findings) && !r.truncated) {
+    if (shape.kind === 'source') approvedScriptSegs.add(seg);
+    return;
+  }
+  const hash = trust.sha256OfScan(r.buf, r.size);
+  if (trust.isTrusted(hash)) { approvedScriptSegs.add(seg); return; }
+  const toolName = isPosh ? 'PowerShell' : 'Bash';
+  if (trust.commandAllowed(seg, cwd, toolName) || trust.commandAllowed(rawCmd, cwd, toolName)) {
+    approvedScriptSegs.add(seg);
+    return;
+  }
+  flagRisk(buildRiskReason(abs, shape.token, findings, r.truncated, __dirname), seg);
+}
+
 let data = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { data += chunk; });
@@ -1077,6 +1232,7 @@ process.stdin.on('end', () => {
   if (!rawCmd) process.exit(0);
 
   const isPosh = input?.tool_name === 'PowerShell';
+  const cwd = input?.cwd || process.cwd();
 
   const cmd = normalizeUnicode(rawCmd);
 
@@ -1105,9 +1261,21 @@ process.stdin.on('end', () => {
     checkSegmentDeny(seg);
   }
 
+  // Script-content pass: deny rules already ran on every segment, so a trusted
+  // script can't resurrect a denied sibling. Iterates all segments; flagRisk()
+  // exits on the first risky untrusted script it finds.
+  const approvedScriptSegs = new Set();
+  for (const seg of segments) {
+    try {
+      checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs);
+    } catch (err) {
+      audit('fallthrough', 'script-scan-threw: ' + (err && err.message), seg);
+    }
+  }
+
   let allApproved = true;
   for (const seg of segments) {
-    if (!checkSegmentApprove(seg, 0, isPosh)) {
+    if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh)) {
       allApproved = false;
       break;
     }
