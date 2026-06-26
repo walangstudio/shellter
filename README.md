@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.4.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-329%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-349%20passing-brightgreen)](test-hooks.js)
 
 Shelters you from dangerous shell commands. Global PreToolUse hooks that
 auto-allow safe operations and block dangerous ones across every Claude Code
@@ -306,7 +306,7 @@ node test-hooks.js
 
 ## Changelog
 
-Current version is 0.4.1 (marketplace moved to `walangstudio/marketplace`; Claude
-Code plugin packaging from 0.4.0; script-content scanning and hardened injection
-detection from 0.3.0). The full history
+Current version is 0.5.0 (sensitive-file read/exfil hardening across every shell +
+anti-bypass notice + an experimental opencode adapter; marketplace move from 0.4.1;
+script-content scanning from 0.3.0). The full history
 lives in [CHANGELOG.md](CHANGELOG.md).
