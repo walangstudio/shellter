@@ -7,6 +7,56 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.3.0] - 2026-06-26
+
+Until now the hooks judged a command by its text alone. `bash install.sh` told
+them nothing about what `install.sh` actually does, so a script whose body was
+`curl … | sh` walked straight through. This release reads the script.
+
+### Added
+- **Script-content scanning.** When a command executes a local script
+  (`bash`/`sh`/`zsh`/`dash`/`ash`/`ksh`/`fish X`, `./X`, `source X` / `. X`,
+  `powershell`/`pwsh -File X`, `& ./X.ps1`), `check-bash.js` resolves the path
+  against the call's `cwd`, reads the first 256 KB, and scans the contents for
+  download-pipe-to-shell, `/dev/tcp` reverse shells, base64/xxd decode-then-exec,
+  `-EncodedCommand` / `IEX` / `.DownloadString(`, AMSI bypass, and LOLBins
+  (`certutil`/`bitsadmin`/`mshta`/`regsvr32`). High-risk + untrusted returns
+  `ask` with a message naming the pattern, file, and line, and telling you to
+  open and read the script yourself. I/O happens only when a script-exec shape
+  matches, so the hot path is untouched.
+- **Content-hash trust store** (`~/.claude/shellter-trust.json`, override with
+  `SHELLTER_TRUST_FILE`) plus a `shellter-trust.js` CLI (`add` / `list` /
+  `remove`). Trust is keyed by the hash of the scanned window, so a trusted
+  script survives moves/renames but re-flags after an edit.
+- **Native allow-rule honoring.** A `Bash(...)` / `PowerShell(...)` allow-rule
+  from your project/user settings (e.g. from picking "Yes, don't ask again")
+  also silences a script flag. Match is conservative (exact or `:*` prefix).
+- **`scan-content.js`**, a shared zero-dependency scanner with a severity model
+  (only `high` drives a decision; `medium`/`low` are advisory).
+- **Hardened prompt-injection detection** in written content: variation-selector
+  smuggling (U+FE00–FE0F / U+E0100–E01EF), a recursive invisible-strip that
+  survives interleaved-surrogate re-forming, homoglyph / mixed-script tokens,
+  broadened role markers (ChatML / Llama / Mistral, line-start fake transcripts),
+  Policy-Puppetry config tags, MCP tool-poisoning `<IMPORTANT>` blocks,
+  override-phrase + exfil-target co-occurrence, and a bounded base64/hex
+  decode-one-layer-then-rescan.
+
+### Changed
+- `source X` / `. X` is no longer blanket auto-approved. It now routes through
+  the script scanner: clean is allowed (unchanged behavior), dangerous + untrusted
+  asks, trusted is allowed.
+
+### Notes
+- New decision: `check-bash.js` can now return `ask` (it previously only emitted
+  `allow`/`deny`). Selectable via the `SCRIPT_RISK_DECISION` constant — flip to
+  `'deny'` if a Claude Code build doesn't surface `ask` reasons.
+- Detection is pattern + heuristic, pure JS, zero new dependencies. No offline,
+  no-runtime ML detector is light enough to vendor into a sub-100ms hook;
+  heuristics raise attacker cost and catch the known shapes, they are not
+  complete (base32, novel framings, and multi-turn attacks can still evade).
+- Test suite grew from 282 to 324 cases. The bash path stays byte-compatible for
+  every pre-existing case.
+
 ## [0.2.0] - 2026-05-24
 
 The cross-platform release. Until now the hooks only really understood Unix
@@ -84,5 +134,6 @@ were cut in between:
   databases, plus prompt-injection and token-shape detection in written content.
 - Opt-in audit log via `CLAUDE_HOOK_LOG` and `CLAUDE_HOOK_DEBUG`.
 
+[0.3.0]: https://github.com/walangstudio/shellter/releases/tag/v0.3.0
 [0.2.0]: https://github.com/walangstudio/shellter/releases/tag/v0.2.0
 [0.1.0]: https://github.com/walangstudio/shellter/releases/tag/v0.1.0
