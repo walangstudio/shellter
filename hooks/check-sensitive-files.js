@@ -8,6 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const scan = require('./scan-content.js');
 
 function audit(decision, reason, snippet) {
   const log = process.env.CLAUDE_HOOK_LOG;
@@ -229,6 +230,17 @@ process.stdin.on('end', () => {
 
       if (POLYGLOT_EXTENSIONS.test(filePath) && POLYGLOT_PATTERN.test(flat)) {
         deny('Shell command substitution in data file blocked', filePath);
+      }
+
+      // 2025-2026 techniques the inline patterns above don't cover: variation-
+      // selector smuggling, homoglyph/mixed-script, broadened role markers,
+      // Policy-Puppetry, MCP tool-poisoning, override+exfil, decode-one-layer.
+      if (!isBinary) {
+        const inj = scan.scanInjection(content, { decode: true });
+        const hi = inj.find(f => f.severity === 'high');
+        if (hi) {
+          deny('Prompt injection detected: ' + hi.signal + (hi.line ? ' (line ' + hi.line + ')' : ''), filePath);
+        }
       }
     }
   }

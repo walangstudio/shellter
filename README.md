@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-217%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-324%20passing-brightgreen)](test-hooks.js)
 
 Shelters you from dangerous shell commands. Global PreToolUse hooks that
 auto-allow safe operations and block dangerous ones across every Claude Code
@@ -21,6 +21,7 @@ PowerShell parsing (backtick escape, PS quoting) and the PowerShell/cmd rule set
 - Splits chained commands (`&&`, `||`, `;`) and checks each segment
 - Recursively descends into `bash`/`sh`/`zsh`/`dash`/`ash`/`ksh`/`fish -c '...'`, `find -exec`, `xargs`, `<(...)` / `>(...)`, and any `powershell -Command` / `pwsh -c` / `cmd /c` shelled out from a command, so wrappers can't hide a payload
 - Strips invisible/steganographic Unicode (zero-widths, bidi overrides, tag chars) before matching
+- **Scans the CONTENTS of executed scripts** (`bash`/`sh`/`zsh`/… `X`, `./X`, `source X` / `. X`, `powershell`/`pwsh -File X`, `& ./X.ps1`): reads the resolved file (first 256 KB) and looks for download-pipe-to-shell, `/dev/tcp` reverse shells, base64/xxd decode-then-exec, `-EncodedCommand`/`IEX`/`DownloadString`, and LOLBins. High-risk + untrusted → `ask` ("read this script yourself"); trusted → silent allow. See [Script trust store](#script-trust-store)
 - DENY (cross-platform): reverse shells, exfiltration, encoded payloads, privilege escalation, identity backdoors via `git config`, persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_*`), crypto miners, container escape, force-push to main (incl. `git --no-pager`/`-C` prefixes), `rm -rf` of system dirs, and more
 - DENY (macOS): `csrutil disable`, `spctl --master-disable`, `launchctl`/LaunchAgents persistence, `security` Keychain extraction, `dscl` user creation, `kextload`, `tccutil reset`, `diskutil erase`, quarantine stripping, `rm -rf /System|/Library|/Applications|/Users|/Volumes`
 - DENY (PowerShell): `Remove-Item -Recurse -Force` of home/root/wildcard, `Invoke-Expression`/`iex`, `iwr|iex` and `-OutFile`/`DownloadString` download-exec, `-EncodedCommand`, `Set-ExecutionPolicy`, Defender tamper (`Set-MpPreference`), service/scheduled-task/Run-key/`$PROFILE` persistence, `Start-Process -Verb RunAs`, lsass MiniDump
@@ -36,7 +37,8 @@ PowerShell parsing (backtick escape, PS quoting) and the PowerShell/cmd rule set
 - Blocks wallet / keystore / browser-cookie databases, macOS Keychain (`Library/Keychains/`, `login.keychain-db`, `System.keychain`), and Windows secrets (`*.ppk`, `NTUSER.DAT`, `SAM`/`SYSTEM` hives, `AppData\…\Microsoft\Credentials`)
 - Detects prompt-injection in written content: instruction-override phrases, role hijacking ("pretend you are", "assume the role of", "from now on you are"), jailbreak ("DAN mode", "developer mode"), role-tag injection (`<|im_start|>system`, `[SYSTEM]`, `[INST]`)
 - Detects fake tool-call tags (`<function_calls>`, `<invoke>`) in written content
-- Detects steganographic injection: invisible Unicode characters in source files
+- Detects steganographic injection: invisible Unicode characters in source files, plus **variation-selector smuggling** (U+FE00–FE0F / U+E0100–E01EF — evades many commercial detectors) and a recursive strip that survives interleaved-surrogate re-forming
+- Detects 2025-2026 injection shapes: **homoglyph / mixed-script** tokens, broadened role markers (ChatML / Llama / Mistral / line-start `System:`+`Assistant:` fake transcripts), **Policy-Puppetry** config tags, **MCP tool-poisoning** `<IMPORTANT>` blocks, override-phrase + exfil-target co-occurrence, and a bounded **base64/hex decode-one-layer-then-rescan**
 - Detects encoded eval/exec, polyglot shell substitution in data files (incl. `.json.bak` / `.yaml.old`), markdown `javascript:` / `data:text/html` URLs, and ANSI-escape sequences in source files
 - Blocks grep patterns that extract literal secret values or known token shapes (AWS access keys, GitHub tokens, Slack tokens, JWTs, Bearer tokens)
 
@@ -45,12 +47,17 @@ PowerShell parsing (backtick escape, PS quoting) and the PowerShell/cmd rule set
 ```
 ~/.claude/
   settings.json           # hooks registration + global permissions
+  shellter-trust.json     # content-hash trust store for risky scripts (auto-created)
   hooks/
-    check-bash.js         # bash command gatekeeper
+    check-bash.js         # bash/powershell command gatekeeper
     check-sensitive-files.js  # file access gatekeeper
+    scan-content.js       # shared scanner (shell-malice + prompt-injection)
+    shellter-trust.js     # trust store + CLI (add/list/remove)
 ```
 
-Project-specific overrides go in `<project>/.claude/settings.local.json`.
+`scan-content.js` and `shellter-trust.js` are runtime dependencies of the two
+hooks; install all four together. Project-specific overrides go in
+`<project>/.claude/settings.local.json`.
 
 ## Installation
 
@@ -63,10 +70,10 @@ No other dependencies. Hooks use only Node.js built-ins.
 ### Linux / macOS
 
 ```bash
-# 1. Copy hook scripts
+# 1. Copy hook scripts (all four -- the last two are runtime deps)
 mkdir -p ~/.claude/hooks
-cp hooks/check-bash.js ~/.claude/hooks/
-cp hooks/check-sensitive-files.js ~/.claude/hooks/
+cp hooks/check-bash.js hooks/check-sensitive-files.js ~/.claude/hooks/
+cp hooks/scan-content.js hooks/shellter-trust.js ~/.claude/hooks/
 
 # 2. Merge into existing settings (safe to run multiple times).
 #    Substitutes __HOME__ -> $HOME, prints the sha256 of each installed hook.
@@ -77,8 +84,8 @@ node merge-settings.js
 
 ```powershell
 mkdir -Force "$env:USERPROFILE\.claude\hooks"
-Copy-Item hooks\check-bash.js "$env:USERPROFILE\.claude\hooks\"
-Copy-Item hooks\check-sensitive-files.js "$env:USERPROFILE\.claude\hooks\"
+Copy-Item hooks\check-bash.js,hooks\check-sensitive-files.js "$env:USERPROFILE\.claude\hooks\"
+Copy-Item hooks\scan-content.js,hooks\shellter-trust.js "$env:USERPROFILE\.claude\hooks\"
 node merge-settings.js "$env:USERPROFILE\.claude\settings.json"
 ```
 
@@ -114,7 +121,7 @@ Hooks receive JSON on stdin and output JSON on stdout.
 `permissionDecision` values:
 - `"allow"`: auto-approve, no prompt shown
 - `"deny"`: block the operation, reason shown to Claude
-- `"ask"`: force the interactive prompt even if otherwise auto-allowed
+- `"ask"`: force the interactive prompt even if otherwise auto-allowed (used for high-risk untrusted scripts)
 
 Exit codes:
 - `0`: structured decision (or fallthrough if no output)
@@ -131,6 +138,39 @@ These wrappers used to be common bypass vectors. Both hooks now look inside them
 | `find … -exec CMD … \;`      | `CMD` is parsed and recursively checked                     |
 | `xargs … CMD`                | `CMD` is parsed and recursively checked                     |
 | `<(…)` / `>(…)`              | Inner command is recursively checked; `bash <(curl …)` and `source <(curl …)` are denied wholesale |
+
+## Script trust store
+
+The command line `bash install.sh` tells you nothing about what `install.sh`
+*does*. shellter reads the file (first 256 KB) and scans its contents. If they
+look high-risk (download-piped-to-shell, reverse shell, encoded-then-executed,
+LOLBins) and the script isn't trusted, the hook returns **`ask`** with a message
+naming the matched pattern and line and telling you to **open and read the script
+yourself** before approving. It re-asks every run until you trust it.
+
+Two ways to make it stop asking for a script you've reviewed:
+
+1. **Native button** — pick **"Yes, don't ask again"** at the prompt. shellter
+   honors the resulting `Bash(...)` / `PowerShell(...)` allow-rule from your
+   project or user settings on subsequent runs.
+2. **Trust CLI** — record the script's content hash:
+
+   ```bash
+   node ~/.claude/hooks/shellter-trust.js add ./install.sh   # trust it
+   node ~/.claude/hooks/shellter-trust.js list               # show trusted
+   node ~/.claude/hooks/shellter-trust.js remove <hash|path> # revoke
+   ```
+
+Trust is keyed by content hash, so a trusted script stays trusted if moved or
+renamed, but **editing it invalidates trust and re-flags it**. The store lives at
+`~/.claude/shellter-trust.json` (override with `SHELLTER_TRUST_FILE`). Clean
+scripts are never flagged; only high-confidence malicious shapes trigger `ask`
+(lower-confidence signals are audit-only), so ordinary build/install scripts pass
+through untouched.
+
+`ask`-reason display for hook-forced prompts is undocumented in Claude Code; if a
+build doesn't surface it, flip `SCRIPT_RISK_DECISION` in `check-bash.js` from
+`'ask'` to `'deny'` (the message reads correctly either way).
 
 ## Audit Log
 
@@ -248,5 +288,5 @@ node test-hooks.js
 
 ## Changelog
 
-Current version is 0.2.0 (PowerShell, cmd, and macOS support). The full history
-lives in [CHANGELOG.md](CHANGELOG.md).
+Current version is 0.3.0 (script-content scanning, trust store, hardened
+injection detection). The full history lives in [CHANGELOG.md](CHANGELOG.md).

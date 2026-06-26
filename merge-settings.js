@@ -60,6 +60,9 @@ console.log('Hook paths set to:', homeDir + '/.claude/hooks/');
 const hooksDir = path.join(homeDir, '.claude', 'hooks');
 const bashHook = path.join(hooksDir, 'check-bash.js');
 const filesHook = path.join(hooksDir, 'check-sensitive-files.js');
+// Runtime deps of the two hooks above -- must be installed alongside them.
+const scanHook = path.join(hooksDir, 'scan-content.js');
+const trustHook = path.join(hooksDir, 'shellter-trust.js');
 
 function sha256(p) {
   try {
@@ -69,7 +72,7 @@ function sha256(p) {
   }
 }
 
-for (const p of [bashHook, filesHook]) {
+for (const p of [bashHook, filesHook, scanHook, trustHook]) {
   if (!fs.existsSync(p)) {
     console.warn('WARNING: Hook not found:', p);
     console.warn('  Copy it: cp ' + path.basename(p) + ' ' + hooksDir + '/');
