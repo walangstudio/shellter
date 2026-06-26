@@ -7,6 +7,35 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.4.1] - 2026-06-26
+
+Distribution moved to a shared marketplace, plus a destructive-`rm` deny-rule fix.
+
+### Fixed
+- **`rm -rf /` and `rm -rf ~` are now blocked.** The system-directory and
+  home-directory rm rules anchored the target with a trailing `\b`, which never
+  matches at end of string after a non-word char (`/`, `~`). So bare
+  `rm -rf /`, `rm -rf / --no-preserve-root`, and `rm -rf ~` slipped through to a
+  normal permission prompt instead of being denied (named targets like `/etc`,
+  `/usr`, `/home`, `/*` were always caught). Both anchors are corrected; the
+  PowerShell rules already anchored with `(\s|$|\*)` and were unaffected.
+
+### Changed
+- **Marketplace moved to `walangstudio/marketplace`.** shellter no longer
+  self-hosts a marketplace (`.claude-plugin/marketplace.json` is removed from this
+  repo). It's now one plugin in the Walang Studio catalog, alongside future
+  projects. The install path changes to:
+  ```
+  /plugin marketplace add walangstudio/marketplace
+  /plugin install shellter@walangstudio
+  ```
+  If you added the old `walangstudio/shellter` marketplace, remove it with
+  `/plugin marketplace remove shellter`, then add `walangstudio/marketplace`.
+
+### Notes
+- The plugin's distribution catalog moved to its own repo; the only hook-logic
+  change is the `rm` deny-rule fix above. Test suite grew 324 → 329.
+
 ## [0.4.0] - 2026-06-26
 
 Distribution. shellter is now a Claude Code plugin with its own marketplace, so
@@ -160,6 +189,7 @@ were cut in between:
   databases, plus prompt-injection and token-shape detection in written content.
 - Opt-in audit log via `CLAUDE_HOOK_LOG` and `CLAUDE_HOOK_DEBUG`.
 
+[0.4.1]: https://github.com/walangstudio/shellter/releases/tag/v0.4.1
 [0.4.0]: https://github.com/walangstudio/shellter/releases/tag/v0.4.0
 [0.3.0]: https://github.com/walangstudio/shellter/releases/tag/v0.3.0
 [0.2.0]: https://github.com/walangstudio/shellter/releases/tag/v0.2.0
