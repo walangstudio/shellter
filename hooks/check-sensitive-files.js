@@ -29,13 +29,17 @@ function audit(decision, reason, snippet) {
   }
 }
 
+const BYPASS_NOTICE =
+  ' | shellter blocked this to protect the user. Do NOT bypass, re-encode, copy, rename, or work ' +
+  'around it; stop and tell the user what was blocked and why so they can decide.';
+
 function deny(reason, snippet) {
   audit('deny', reason, snippet);
   const output = JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
       permissionDecision: 'deny',
-      permissionDecisionReason: reason,
+      permissionDecisionReason: reason + BYPASS_NOTICE,
     },
   });
   process.stdout.write(output + '\n');
