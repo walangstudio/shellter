@@ -20,25 +20,42 @@ normalizes agy's payload into shellter's stdin JSON, runs `check-bash.js` /
 > (`agy help`, the in-app `/hooks` command, and antigravity.google/docs/hooks)
 > before relying on it.
 
-Put shellter's `hooks/` somewhere stable, then register a `PreToolUse` hook —
-workspace `.agents/hooks.json`, a `hooks` block in the CLI settings
-(`~/.gemini/antigravity-cli/settings.json`), or a plugin (`agy plugin`):
+Put shellter's `hooks/` somewhere stable, then register a `PreToolUse` hook in a
+`hooks.json`. Verified locations for **agy 1.0.12** (the `hooks` key does **not**
+exist in `settings.json` on this build — don't use it):
+
+- **Per-directory:** `<workspace>/.agents/hooks.json`
+- **Global (all workspaces):** `~/.gemini/config/hooks.json`
+
+The top-level key is a user-chosen hook name. Use matcher `"*"` so every tool
+(shell, file read, and write) is routed — a narrow matcher silently skips tools
+it doesn't list, which is how a native `view_file` read of `.env` slips through:
 
 ```json
 {
-  "PreToolUse": [
-    {
-      "matcher": "run_command|run_shell_command|write_to_file|replace_file_content|multi_replace_file_content",
-      "hooks": [
-        { "type": "command", "command": "node \"F:/opt/projs/ai/claude/shellter/adapters/shared/shellter-host-hook.js\" --host=agy", "timeout": 30 }
-      ]
-    }
-  ]
+  "shellter": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "node \"F:/opt/projs/ai/claude/shellter/adapters/shared/shellter-host-hook.js\" --host=agy", "timeout": 30 }
+        ]
+      }
+    ]
+  }
 }
 ```
 
 Set `SHELLTER_HOOKS_DIR` in the hook's environment if `hooks/` isn't at the
 `../../hooks` dev location relative to the shim.
+
+> **Hooks load lazily.** agy loads `hooks.json` when you send your **first
+> message** in a session, not at startup — so `/hooks` looks empty until you've
+> prompted once. This is not a gap: a tool only runs after a message, so the hook
+> is always armed before any command executes. Verify by behavior (try to read
+> `.env`), not by `/hooks`. On Windows, `/hooks`'s own editor writes to the wrong
+> path ([issue #49](https://github.com/google-antigravity/antigravity-cli/issues/49)) —
+> edit the `hooks.json` file directly instead.
 
 The shim is host-agnostic and field-defensive (reads tool name/args from several
 plausible paths), so minor key drift in agy's payload is absorbed.

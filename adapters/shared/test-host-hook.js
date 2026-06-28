@@ -55,6 +55,10 @@ check('run_command CommandLine rm -rf -> deny', 'agy', { toolCall: { name: 'run_
 check('run_command CommandLine git -> allow',   'agy', { toolCall: { name: 'run_command', args: { CommandLine: 'git status' } } }, 'allow');
 // real agy write shape: TargetFile + CodeContent.
 check('write_to_file CodeContent injection -> deny', 'agy', { toolCall: { name: 'write_to_file', args: { TargetFile: 'n.md', CodeContent: INJECTION } } }, 'deny');
+// native file-read tool: agy reads .env via view_file (not a shell cmd) -> must be gated.
+check('view_file .env -> deny',     'agy', { toolCall: { name: 'view_file', args: { AbsolutePath: 'cfg/.env' } } }, 'deny');
+check('view_file id_rsa -> deny',   'agy', { toolCall: { name: 'view_file', args: { AbsolutePath: 'C:/Users/x/.ssh/id_rsa' } } }, 'deny');
+check('view_file README -> allow',  'agy', { toolCall: { name: 'view_file', args: { AbsolutePath: 'README.md' } } }, 'allow');
 
 console.log(`\n${pass}/${total} shared host-hook checks passed`);
 process.exit(pass === total ? 0 : 1);

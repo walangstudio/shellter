@@ -51,6 +51,31 @@ function mapTool(ev) {
     return { hook: BASH_HOOK, name: process.platform === 'win32' ? 'PowerShell' : 'Bash', input: { command } };
   }
 
+  // Native file-READ tools (agy/Cascade view_file uses PascalCase AbsolutePath).
+  // Without this, an agent reads .env via its own read tool, bypassing the shell rules.
+  const isRead = /(^|[_-])(view_file|read_file|cat_file|open_file|view|read|view_code_item|view_line_range|view_content_chunk)([_-]|$)/.test(lname);
+  if (isRead) {
+    const file_path = String(first(args.path, args.file_path, args.AbsolutePath, args.absolute_path, args.filePath, args.target_file, args.TargetFile, '') || '');
+    if (!file_path) return null;
+    return { hook: FILE_HOOK, name: 'Read', input: { file_path } };
+  }
+
+  const isSearch = /(^|[_-])(grep|grep_search|search|ripgrep|rg)([_-]|$)/.test(lname);
+  if (isSearch) {
+    const pattern = String(first(args.pattern, args.query, args.Query, args.q, '') || '');
+    const p = String(first(args.path, args.SearchDirectory, args.search_path, args.SearchPath, args.directory, '') || '');
+    if (!pattern && !p) return null;
+    return { hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p } };
+  }
+
+  const isFind = /(^|[_-])(find|find_by_name|glob)([_-]|$)/.test(lname);
+  if (isFind) {
+    const pattern = String(first(args.pattern, args.Pattern, args.glob, args.query, '') || '');
+    if (!pattern) return null;
+    const p = String(first(args.path, args.SearchDirectory, args.directory, '') || '');
+    return { hook: FILE_HOOK, name: 'Glob', input: { pattern, path: p } };
+  }
+
   const isWrite = /(write_to_file|write_file|file_write|str_replace|replace_file_content|multi_replace|create_file|update_file|apply_patch|save_file|^patch$|^write$|^edit$)/.test(lname);
   if (isWrite) {
     const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.filePath, args.TargetFile, '') || '');
