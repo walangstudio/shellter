@@ -21,6 +21,7 @@ const cases: [string, string, any, boolean][] = [
   ["bash Get-Content readme",  "bash",  { command: "Get-Content README.md" },             false],
   ["read ssh private key",    "read",  { filePath: "C:/Users/niny0/.ssh/id_rsa_kitty" }, true],
   ["write prompt-injection",  "write", { filePath: "n.md", content: INJECTION },         true],
+  ["edit prompt-injection",   "edit",  { filePath: "n.md", newString: INJECTION },       true],
   ["read normal file",        "read",  { filePath: "README.md" },                        false],
   ["unknown tool ignored",    "todowrite", { todos: [] },                                false],
 ];
@@ -29,7 +30,8 @@ let pass = 0;
 for (const [name, tool, args, expectBlock] of cases) {
   let blocked = false, msg = "";
   try { await before({ tool }, { args }); } catch (e: any) { blocked = true; msg = String(e?.message || e); }
-  const ok = blocked === expectBlock;
+  // A block must throw the shellter error (not some unrelated failure).
+  const ok = blocked === expectBlock && (!expectBlock || /shellter/i.test(msg));
   if (ok) pass++;
   console.log(`${ok ? "PASS" : "FAIL"}  ${expectBlock ? "block" : "allow "}  ${name}` +
     (blocked ? `  :: ${msg.split("\n")[0].slice(0, 55)}` : ""));
