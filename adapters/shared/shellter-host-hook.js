@@ -43,18 +43,45 @@ function mapTool(ev) {
   const lname = toolName.toLowerCase();
 
   const isShell = /(^|[_-])(bash|sh|shell|exec|run_command|run_shell_command|run_terminal|terminal|run_code|execute)([_-]|$)/.test(lname) ||
-    (args && (args.command !== undefined || args.cmd !== undefined || args.script !== undefined));
+    (args && (args.command !== undefined || args.cmd !== undefined || args.script !== undefined || args.CommandLine !== undefined));
   if (isShell) {
-    const command = asCommand(first(args.command, args.cmd, args.script, ''));
+    // agy/Cascade run_command carries the command in PascalCase `CommandLine`.
+    const command = asCommand(first(args.command, args.cmd, args.script, args.CommandLine, args.command_line, ''));
     if (!command) return null;
     return { hook: BASH_HOOK, name: process.platform === 'win32' ? 'PowerShell' : 'Bash', input: { command } };
   }
 
+  // Native file-READ tools (agy/Cascade view_file uses PascalCase AbsolutePath).
+  // Without this, an agent reads .env via its own read tool, bypassing the shell rules.
+  const isRead = /(^|[_-])(view_file|read_file|cat_file|open_file|view|read|view_code_item|view_line_range|view_content_chunk)([_-]|$)/.test(lname);
+  if (isRead) {
+    const file_path = String(first(args.path, args.file_path, args.AbsolutePath, args.absolute_path, args.filePath, args.target_file, args.TargetFile, '') || '');
+    if (!file_path) return null;
+    return { hook: FILE_HOOK, name: 'Read', input: { file_path } };
+  }
+
+  const isSearch = /(^|[_-])(grep|grep_search|search|ripgrep|rg)([_-]|$)/.test(lname);
+  if (isSearch) {
+    const pattern = String(first(args.pattern, args.query, args.Query, args.q, '') || '');
+    const p = String(first(args.path, args.SearchDirectory, args.search_path, args.SearchPath, args.directory, '') || '');
+    if (!pattern && !p) return null;
+    return { hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p } };
+  }
+
+  const isFind = /(^|[_-])(find|find_by_name|glob)([_-]|$)/.test(lname);
+  if (isFind) {
+    const pattern = String(first(args.pattern, args.Pattern, args.glob, args.query, '') || '');
+    if (!pattern) return null;
+    const p = String(first(args.path, args.SearchDirectory, args.directory, '') || '');
+    return { hook: FILE_HOOK, name: 'Glob', input: { pattern, path: p } };
+  }
+
   const isWrite = /(write_to_file|write_file|file_write|str_replace|replace_file_content|multi_replace|create_file|update_file|apply_patch|save_file|^patch$|^write$|^edit$)/.test(lname);
   if (isWrite) {
-    const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.filePath, '') || '');
+    const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.filePath, args.TargetFile, '') || '');
     // Pull the attacker-influenced new text from whatever shape the host uses.
-    let content = first(args.content, args.new_content, args.new_string, args.newText, args.text);
+    // agy/Cascade write tools use PascalCase CodeContent / CodeEdit.
+    let content = first(args.content, args.new_content, args.new_string, args.newText, args.text, args.CodeContent, args.CodeEdit);
     if (content === undefined && Array.isArray(args.edits)) content = args.edits.map((e) => first(e && (e.newText || e.new_string || e.content), '')).join('\n');
     if (content === undefined && Array.isArray(args.replacements)) content = args.replacements.map((e) => first(e && (e.newText || e.new_string || e.content), '')).join('\n');
     // codex apply_patch / agy patch tools carry the change as one patch blob.
