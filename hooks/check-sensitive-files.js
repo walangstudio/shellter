@@ -132,11 +132,14 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(curl|wget|bash|sh|nc|python|perl|ruby)\b/i
 
 // Sensitive paths (extension-based, dir-based, env-style, secrets dirs).
 // Backup suffixes (.bak, .old, .backup, .orig, .swp, .save) are matched too.
-const SENSITIVE_EXTENSIONS = /\.(env|pem|key|crt|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
+// `.env` excludes the placeholder templates (.env.example/.sample/.template/.dist/
+// .defaults) -- they hold no real secrets and copying/reading them is routine.
+// .env.local / .env.production etc. still match (those carry real values).
+const SENSITIVE_EXTENSIONS = /\.(?:env(?!\.(?:example|sample|template|dist|defaults?)\b)|pem|key|crt|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
 // .gitconfig deliberately excluded: tokens normally live in .git-credentials.
 const SENSITIVE_FILES = /(^|\/)(\.git-credentials|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
-const ENV_FILE = /(^|\/)\.env(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
+const ENV_FILE = /(^|\/)\.env(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
 const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
 
