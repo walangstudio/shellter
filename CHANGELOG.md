@@ -7,6 +7,31 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.5.1] - 2026-06-28
+
+Adapter-only fixes (codex/agy shared shim). The Claude Code plugin and the core
+hooks (`hooks/`) are **unchanged from 0.5.0** — a marketplace install is unaffected;
+this matters only if you wire the codex or agy adapter from the repo.
+
+### Fixed
+- **agy adapter was inert.** Antigravity's `run_command` carries the command in
+  `args.CommandLine` (PascalCase), but the shim only read `command`/`cmd`/`script`,
+  so every agy command fell through unscreened. Now reads `CommandLine` (and write
+  tools' `TargetFile`/`CodeContent`).
+- **Native file reads bypassed the rules.** An agent could read `.env` with its own
+  `view_file`/`read_file` tool instead of a shell command. The shim now maps native
+  read/grep/find tools to shellter's sensitive-file check, so secret reads are
+  blocked on the file-tool path too, not just via the shell.
+- **agy hook-config corrected.** agy runs the hook command without a shell and does
+  not strip quotes, resolving the path relative to `.agents/` — a quoted path
+  produced `MODULE_NOT_FOUND` and the hook failed open. Docs now specify an
+  unquoted, space-free, forward-slash path and a `.*` matcher (Go regex).
+
+### Tests
+- Added codex/agy shim cases for the real agy payload shape (`CommandLine`, native
+  `view_file`, `TargetFile`/`CodeContent`): shim suite now 20. Unchanged: core hook
+  suite 375, pi adapter 15, opencode adapter 13.
+
 ## [0.5.0] - 2026-06-27
 
 Secret-exfiltration hardening across every shell, an anti-bypass notice that stops
