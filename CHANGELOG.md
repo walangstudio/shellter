@@ -39,8 +39,48 @@ an AI agent from routing around a block, and an experimental opencode adapter.
   routes `tool.execute.before` through shellter's existing hooks (one shared
   detector), so dangerous Bash/PowerShell, sensitive-file access, and prompt
   injection are gated in opencode too. Verified live (blocks `.env` reads + the
-  `Copy-Item` evasion). pi/codex adapters and an opt-in passthrough LLM judge are
-  planned.
+  `Copy-Item` evasion). On Windows it maps opencode's `bash` tool to PowerShell so
+  PS segmentation applies.
+- **pi, codex, and agy (Antigravity CLI) adapters** (`adapters/pi/`,
+  `adapters/codex/`, `adapters/agy/`, shared shim `adapters/shared/`). Every other
+  agent CLI the user runs now routes through the same shellter detector:
+  - **pi** — an extension subscribing to `tool_call`, returning `{ block, reason }`
+    on deny/ask (verified against pi 0.80.2's type defs; 11/11 adapter tests).
+  - **codex** — a `PreToolUse` command hook (Codex ≥ v0.124.0) via the shared shim;
+    `deny` is hard-blocked, Tier-2 `ask` defers to Codex's own approval prompt.
+    Shell interception is reliable; `apply_patch` file edits are best-effort.
+  - **agy** — a `PreToolUse` hook via the shared shim; honors `deny`/`ask`/`allow`.
+    Hook-config keys differ across agy builds, so the install doc says to verify
+    against the installed build; the shim itself is field-defensive.
+  - The shared `shellter-host-hook.js --host=codex|agy` normalizes each host's
+    stdin payload into shellter's Claude-shaped JSON, spawns the existing hooks,
+    and emits the host's verdict format (12/12 shared-shim tests).
+  An opt-in passthrough LLM judge for the gray zone is still planned.
+- **Archive exfil blocked.** `tar`/`zip`/`7z`/`gzip`/`xz`/`zstd`/`Compress-Archive`
+  of a secret file or whole secret dir (`tar czf k.tgz ~/.ssh`) is denied — these
+  were previously auto-approved.
+- **Closed inline-interpreter gaps.** The eval-form set now covers `php -r`,
+  `deno eval`, `node --eval`, and `perl -ne`/`-pe` (not just `-c`/`-e`).
+- **More .NET reads** — `OpenText`/`OpenRead`/`StreamReader`, not only `ReadAllText`.
+- **Leading-redirect reads** (`< .env cat`) are caught.
+
+### Changed
+- **Dev-workflow guards now ASK instead of hard-DENY.** `git push` to main / `--force`,
+  `git reset --hard`/`clean -f`/`checkout --`, `sudo`, `ssh`/`scp`, SQL `DROP`/`TRUNCATE`,
+  and `Start-Process -Verb RunAs` are mistake-guards, not malicious-skill attacks, so
+  they surface for in-session approval rather than being blocked outright. Tier-1
+  threats (secret exfil, RCE, prompt injection, persistence, miners) stay hard deny,
+  and a hard deny on any part of a command always wins over an ask.
+- **Fewer false positives.** Only the keys that make git run code as a side effect of
+  normal git operations (`credential.helper`, `core.hooksPath`/`sshCommand`/`fsmonitor`,
+  `init.templateDir`, `filter.*.clean/smudge`, `!`-aliases) are hard-blocked. The keys a
+  developer legitimately sets but an attacker could abuse (`core.editor`/`pager`,
+  `sequence.editor`, `diff.external`, `gpg.program`) now **ask** instead of deny.
+  `git config user.name/email` is allowed. `.env.example`/`.sample`/`.template` are
+  treated as placeholders, not secrets (`cp .env.example .env` is allowed). `credentials`
+  only counts as a path segment or a file with an extension, so `rg credentials src/` is
+  fine. Plain `curl`/`wget` POSTs are allowed; only uploads that reference a secret are
+  blocked.
 
 ### Notes
 - Detection stays pattern + heuristic. A determined agent that runs arbitrary code (a
@@ -48,7 +88,12 @@ an AI agent from routing around a block, and an experimental opencode adapter.
   command-pattern hook fully prevents that. The real boundary for "the agent must
   never see this secret" is not exposing it to the agent (sandbox / secret manager);
   shellter raises the bar against the casual and obvious paths.
-- Test suite grew 329 -> 349. The bash path stays byte-compatible for pre-existing cases.
+- **Evasions closed in security review** of the above: a secret after a quoted `;`
+  inside an inline interpreter (`python -c "import os; open('.env')"`), a secret read
+  via a copy *target* flag (`cp -t /exfil ~/.ssh/id_rsa`, `cp --target-directory=…`),
+  and `scp`/`sftp` of a secret (hard-deny, above the plain remote-transfer ask).
+- Test suite grew 329 -> 375 (hook), plus adapter suites (pi 11, shared codex/agy 12,
+  opencode). The bash path stays byte-compatible for pre-existing cases.
 
 ## [0.4.1] - 2026-06-26
 

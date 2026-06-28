@@ -460,6 +460,51 @@ function flagRisk(reason, snippet) {
   process.exit(0);
 }
 
+// For Tier-2 "dev-workflow" rules (git push/reset, sudo, ssh, DROP TABLE): risky
+// enough to surface, but a mistake-guard rather than a malicious-skill attack, so
+// the user can approve in-session instead of a hard deny. Hard denies (Tier-1:
+// secret exfil, RCE, injection, persistence) always run first and win.
+const ASK_NOTICE =
+  ' | shellter flagged this for your approval -- it can lose data or run with elevated/remote ' +
+  'access. Approve only if you intended it. If you do NOT approve, do not work around it -- ask the user.';
+
+function ask(reason, snippet) {
+  audit('ask', reason, snippet);
+  const output = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'ask',
+      permissionDecisionReason: reason + ASK_NOTICE,
+    },
+  });
+  process.stdout.write(output + '\n');
+  process.exit(0);
+}
+
+// Shared sensitive-token alternation so every read/copy/interpreter rule sees the
+// SAME secret set (no drift). `.env` excludes the well-known placeholder templates
+// (.env.example/.sample/.template/.dist/.defaults) which hold no real secrets;
+// `credentials` only counts as a path segment (~/.aws/credentials) or a file with
+// an extension (credentials.json), so `rg credentials src/` is NOT a secret read.
+// Directory tokens use `\b` (not a trailing slash) so archiving a whole `~/.ssh`
+// dir is caught, not just reading one file inside it.
+const SECRET_TOKENS = '(?:' + [
+  '\\.env\\b(?!\\.(?:example|sample|template|dist|defaults?)\\b)',
+  '\\.secret\\b', '\\.pem\\b', '\\.key\\b', '\\.crt\\b', '\\.p12\\b', '\\.pfx\\b',
+  '\\.jks\\b', '\\.pgpass\\b', '\\.netrc\\b', '\\.npmrc\\b',
+  'id_rsa', 'id_ed25519', 'id_ecdsa',
+  '[\\\\/]credentials\\b', 'credentials\\.\\w+', '\\.git-credentials\\b',
+  '\\.ssh\\b', '\\.gnupg\\b', '\\.aws\\b', '\\.gcloud\\b', '\\.azure\\b',
+  '\\.docker[\\\\/]config', '\\.gitconfig\\b',
+].join('|') + ')';
+
+// Readers/dumpers that can spill a secret to stdout (POSIX + macOS + busybox).
+// `openssl` deliberately excluded -- `openssl genrsa -out server.key` is routine
+// keygen, and reading a secret via openssl is niche (the gpg/cat/xxd paths cover it).
+const READ_VERBS =
+  'cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg|xxd|od|strings|base64|' +
+  'base32|hexdump|nl|tac|rev|fold|cut|tr|paste|column|jq|yq|gpg|gpg2|dd';
+
 const DENY_PATTERNS = [
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
@@ -480,10 +525,13 @@ const DENY_PATTERNS = [
   [/perl\s+-e\s+.*\bsocket\b/i, 'Perl socket one-liner blocked'],
   [/ruby\s+-e\s+.*\bTCPSocket\b/i, 'Ruby TCPSocket one-liner blocked'],
 
-  // Data exfiltration
-  [/\bcurl\s+.*(-d|--data|--data-binary|--data-raw|-F|--form|-T|--upload-file)[\s='"]/i,
-    'curl with data upload blocked -- review manually'],
-  [/\bwget\s+.*--post-(data|file)/i, 'wget POST blocked -- review manually'],
+  // Data exfiltration: uploading a SENSITIVE file. Ordinary POSTs are approved by
+  // the curl/wget rule lower down -- only an upload that references a secret is
+  // blocked, so legit API calls aren't nagged.
+  [new RegExp('\\bcurl\\b[^|;]*(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)\\b[^|;]*' + SECRET_TOKENS, 'i'),
+    'curl uploading a sensitive file blocked -- possible exfiltration'],
+  [new RegExp('\\bwget\\b[^|;]*--post-(?:data|file)\\b[^|;]*' + SECRET_TOKENS, 'i'),
+    'wget uploading a sensitive file blocked -- possible exfiltration'],
 
   // Download-and-execute / pipe-to-interpreter (incl. absolute paths)
   [/\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b/i,
@@ -510,7 +558,7 @@ const DENY_PATTERNS = [
     'Writing to CI config blocked -- possible supply-chain attack'],
 
   // Privilege escalation / identity tampering
-  [/^\s*sudo\s/, 'sudo blocked -- run privileged commands manually'],
+  [/^\s*sudo\s/, 'sudo -- runs with elevated privileges', 'ask'],
   // 4-digit numeric mode whose leading bit is 2/4/6/7 sets setuid/setgid/sticky.
   [/\bchmod\s+0?[2467][0-7]{3}\b/, 'chmod with setuid/setgid bit blocked'],
   [/\bchmod\s+[ugoa]*[+=]\S*s\b/, 'chmod setuid/setgid (symbolic) blocked'],
@@ -523,15 +571,26 @@ const DENY_PATTERNS = [
   [/\b(strace|ltrace|gdb)\s+.*-p\s+\d/i, 'Attaching debugger/tracer to running process blocked'],
 
   // Identity / git backdoor
-  [/git\s+config\s+(--global\s+|--system\s+)?(user\.(email|name|signingkey)|gpg\.program|core\.hooksPath|core\.editor|core\.sshcommand|credential\.helper|alias\.\S+\s+!)/i,
-    'git config of identity / hook / credential helper blocked -- possible backdoor'],
+  // git config keys that make git run an attacker-controlled command. Identity keys
+  // (user.name/email/signingkey) are NOT blocked -- those are normal config (ghc.bat).
+  // Hard-deny the keys that are almost never set by hand and are classic backdoors:
+  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:credential\.helper|core\.(?:hooksPath|sshCommand|fsmonitor|alternateRefsCommand)|init\.templateDir|uploadpack\.packObjectsHook|filter\.\S+\.(?:clean|smudge)|alias\.\S+\s+['"]?!)/i,
+    'git config of a hook / credential-helper / exec key blocked -- possible backdoor'],
+  // ASK on the dual-use "program git runs" keys: legit for a dev (editor/pager/diff)
+  // but RCE if a skill sets them to `sh -c ...`. Surface for approval, don't hard-block.
+  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:core\.(?:editor|pager)|sequence\.editor|diff\.external|gpg\.program)/i,
+    'git config sets a program git will run (editor/pager/diff/gpg) -- approve only if you set this', 'ask'],
 
   // Environment exfiltration
   [/\b(env|printenv|set)\b.*\|\s*(curl|wget|nc|netcat|ncat|socat)/i,
     'Piping environment to network tool blocked'],
 
   // SSH / lateral movement
-  [/^\s*(ssh|scp|sftp)\s/, 'SSH/SCP blocked -- run manually'],
+  // scp/sftp of a SECRET is exfiltration -> hard deny (must come before the ask rule
+  // below; the hard pass runs first so it wins). Non-secret scp/ssh stays ask.
+  [new RegExp('^\\s*(?:scp|sftp)\\b[^|]*' + SECRET_TOKENS, 'i'),
+    'scp/sftp of a sensitive file blocked -- possible exfiltration'],
+  [/^\s*(ssh|scp|sftp)\s/, 'SSH/SCP/SFTP -- remote access or file transfer', 'ask'],
 
   // Supply chain
   [/\b(pip|pip3|npm|yarn|pnpm|bun)\s+install\s+.*https?:\/\//i,
@@ -556,26 +615,29 @@ const DENY_PATTERNS = [
   // `git` and the subcommand -- `-C <path>`, `-c <cfg>`, `-p/-P`, and long flags
   // like `--no-pager` / `--git-dir=...` -- so e.g. `git --no-pager push -f` and
   // `git -C /repo push -f` are both still caught.
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*\b(main|master)\b/, 'git push to main/master blocked -- push to a feature branch'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+origin\s*$/, 'git push to default branch blocked'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*--force(?!-with-lease)/, 'git push --force blocked'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+(?:\S+\s+)*-f\b/, 'git push -f blocked'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*reset\s+--hard/, 'git reset --hard blocked -- can destroy uncommitted work'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*clean\s+-[a-zA-Z]*f/, 'git clean -f blocked -- deletes untracked files'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*checkout\s+--\s/, 'git checkout -- blocked -- discards uncommitted changes'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*update-ref\s+-d\b/, 'git update-ref -d blocked -- destroys refs'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*filter-(branch|repo)\b/, 'git filter-branch / filter-repo blocked -- rewrites history'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*\b(main|master)\b/, 'git push to main/master -- push to a feature branch instead?', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+origin\s*$/, 'git push to the default branch', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*--force(?!-with-lease)/, 'git push --force -- can overwrite remote history', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+(?:\S+\s+)*-f\b/, 'git push -f -- can overwrite remote history', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*reset\s+--hard/, 'git reset --hard -- can destroy uncommitted work', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*clean\s+-[a-zA-Z]*f/, 'git clean -f -- deletes untracked files', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*checkout\s+--\s/, 'git checkout -- -- discards uncommitted changes', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*update-ref\s+-d\b/, 'git update-ref -d -- destroys refs', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*filter-(branch|repo)\b/, 'git filter-branch / filter-repo -- rewrites history', 'ask'],
 
-  // Sensitive file reads via shell. Verb list covers the common readers/dumpers
+  // Sensitive file reads via shell. The verb list covers the common readers/dumpers
   // (cat/head/…, plus xxd/od/strings/base64/dd/openssl/gpg/jq) so a zsh/bash/fish
-  // user on Linux or macOS can't dump a secret around the `cat` rule.
-  [/\b(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg|xxd|od|strings|base64|base32|hexdump|nl|tac|rev|fold|cut|tr|paste|column|jq|yq|openssl|gpg|gpg2|dd)\b\s+.*\.(env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)\b/i,
+  // user on Linux or macOS can't dump a secret around the `cat` rule. Tokens come
+  // from the shared SECRET_TOKENS set (templates excluded, `credentials` anchored).
+  [new RegExp('\\b(?:' + READ_VERBS + ')\\b\\s+[^|;]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via shell blocked'],
-  [/\b(cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg|xxd|od|strings|base64|base32|hexdump|nl|tac|rev|fold|cut|tr|paste|column|jq|yq|openssl|gpg|gpg2|dd)\b\s+.*(\.env|\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\/|\.gnupg\/|\.aws\/|\.gcloud\/|\.azure\/|\.docker\/config|\.gitconfig|\.git-credentials)/i,
-    'Reading sensitive file/directory via shell blocked'],
   // Reading a secret via the shell's file-read substitution ( $(<secret) ).
-  [/\$\(\s*<\s*['"]?[^)'"]*(\.env\b|\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\/|\.gnupg\/|\.aws\/|\.(pem|key|p12|pfx|jks|pgpass|netrc))/i,
+  [new RegExp('\\$\\(\\s*<\\s*[\'"]?[^)\'"]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via $(<...) substitution blocked'],
+  // Leading-redirect read: `< .env cat` / `< ~/.aws/credentials base64` (token
+  // precedes the verb, so the verb-first rule above doesn't see it).
+  [new RegExp('(?:^|[;&|]\\s*)<\\s*[\'"]?[^\\s\'"]*' + SECRET_TOKENS, 'i'),
+    'Reading sensitive file via input redirection blocked'],
 
   // Destructive rm
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(?:\/(?![A-Za-z0-9])|(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b)/,
@@ -586,7 +648,7 @@ const DENY_PATTERNS = [
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+\/\*/, 'rm -rf /* blocked'],
 
   // SQL destructive
-  [/\b(drop|truncate)\s+(database|table|schema)\b/i, 'DROP/TRUNCATE blocked'],
+  [/\b(drop|truncate)\s+(database|table|schema)\b/i, 'SQL DROP/TRUNCATE -- destroys data', 'ask'],
 
   // Cryptocurrency miners
   [/\b(xmrig|minerd|cgminer|bfgminer|ethminer|t-rex|nbminer|lolminer|phoenixminer|gminer|teamredminer)\b/i,
@@ -637,17 +699,38 @@ const POSH_DENY_PATTERNS = [
     'PowerShell web upload blocked -- review manually'],
   // Reading sensitive files via PowerShell/cmd (Get-Content/gc/type/Select-String/.NET).
   // Mirrors the bash `cat .env` rule so a PowerShell-shaped read can't slip past it.
-  [/\b(Get-Content|gc|type|more|findstr|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)\b[^;|]*(\.secret|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh[\\\/]|\.gnupg[\\\/]|\.aws[\\\/]|\.gcloud[\\\/]|\.azure[\\\/]|\.docker[\\\/]config|\.gitconfig|\.git-credentials|\.(env|pem|key|crt|secret|pgpass|netrc|npmrc|p12|pfx|jks)\b)/i,
+  [new RegExp('\\b(?:Get-Content|gc|type|more|findstr|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)\\b[^;|]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via PowerShell/cmd blocked'],
-  [/\[(?:System\.)?IO\.File\]::Read\w*\s*\([^)]*(\.env|id_rsa|id_ed25519|\.ssh[\\\/]|credentials|\.(pem|key|pfx|p12))/i,
-    'Reading sensitive file via .NET IO.File blocked'],
-  // Copying/moving/renaming a sensitive file (exfil to a benign-named copy, then read it).
-  [/\b(Copy-Item|cpi|copy|Move-Item|mi|move|Rename-Item|rni|ren|rename|cp|mv|install|xcopy|robocopy)\b[^;|]*(\.env\b|\.secret\b|credentials|id_rsa|id_ed25519|id_ecdsa|\.ssh\b|\.gnupg\b|\.aws\b|\.gcloud\b|\.azure\b|\.docker[\\\/]config|\.gitconfig|\.git-credentials|\.(pem|key|p12|pfx|jks|pgpass|netrc))/i,
+  // .NET reads: File::ReadAllText/OpenText/OpenRead/Open and StreamReader.
+  [new RegExp('(?:\\[(?:System\\.)?IO\\.File\\]::(?:Read\\w*|OpenText|OpenRead|Open)|\\[(?:System\\.)?IO\\.StreamReader\\]|New-Object\\s+(?:System\\.)?IO\\.StreamReader)[^;|]*' + SECRET_TOKENS, 'i'),
+    'Reading sensitive file via .NET blocked'],
+  // Copying/moving/renaming a sensitive SOURCE file to a benign-named copy (then
+  // read it). The `[^;|]*\s\S` tail requires another argument AFTER the secret, so
+  // the secret is a source being read -- a bare `.env` as the final (destination)
+  // arg is NOT matched, which is why `cp .env.example .env` is allowed. Ambiguous
+  // English words (copy/move/install) are excluded so commit messages don't trip.
+  [new RegExp('\\b(?:Copy-Item|cpi|Move-Item|mi|Rename-Item|rni|cp|mv|xcopy|robocopy|rsync)\\b[^;|]*' + SECRET_TOKENS + '[^;|]*\\s\\S', 'i'),
     'Copying/moving a sensitive file blocked -- possible exfiltration'],
-  [/\[(?:System\.)?IO\.File\]::(Copy|Move|Replace)\s*\([^)]*(\.env|id_rsa|id_ed25519|\.ssh[\\\/]|credentials|\.(pem|key|pfx|p12))/i,
-    'Copying a sensitive file via .NET IO.File blocked -- possible exfiltration'],
-  // Inline interpreter referencing a sensitive file (python -c / node -e / ruby -e ...).
-  [/\b(python[0-9.]*|node|deno|bun|ruby|perl|php)\b[^;|]*\s-[ce]\b[^;|]*(\.env\b|id_rsa|id_ed25519|id_ecdsa|\.ssh[\\\/]|\.gnupg[\\\/]|\.aws[\\\/]|credentials|\.(pem|key|p12|pfx))/i,
+  // Archiving a sensitive file/dir. Here the secret is usually the LAST arg
+  // (`tar czf k.tgz ~/.ssh`), so it matches the secret anywhere -- otherwise these
+  // are auto-approved by the archive entry in APPROVE_PATTERNS.
+  [new RegExp('\\b(?:tar|zip|7z|7za|gzip|bzip2|xz|zstd|Compress-Archive)\\b[^;|]*' + SECRET_TOKENS, 'i'),
+    'Archiving a sensitive file blocked -- possible exfiltration'],
+  // Target-flag copy: when the destination is named by a flag (`cp -t DIR SECRET`,
+  // `Copy-Item -Destination x -Path SECRET`), the secret is the LAST/trailing arg, so
+  // the "needs a trailing arg" copy rule above misses it. Here the secret is still a
+  // source being staged, so match it anywhere after the target flag.
+  [new RegExp('\\b(?:cp|mv|Copy-Item|cpi|Move-Item|mi|install)\\b[^|]*(?:-t\\b|--target-directory\\b|-Destination\\b)[^|]*' + SECRET_TOKENS, 'i'),
+    'Copying a sensitive file (target-flag form) blocked -- possible exfiltration'],
+  [new RegExp('\\[(?:System\\.)?IO\\.File\\]::(?:Copy|Move|Replace)\\s*\\([^)]*' + SECRET_TOKENS, 'i'),
+    'Copying a sensitive file via .NET blocked -- possible exfiltration'],
+  // Inline interpreter referencing a sensitive file (python -c / node -e / php -r /
+  // deno eval / perl -ne ...). Flag set covers each interpreter's eval form. Spans
+  // use `[^|]*` (not `[^;|]*`) because the `;` lives inside the quoted code string
+  // (`python -c "x=1;open('.env')"`) -- segments are already split on unquoted `;`,
+  // so allowing `;` here can't span two shell commands but DOES stop the trivial
+  // "put a statement before the read" bypass.
+  [new RegExp('\\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php)\\b[^|]*(?:-[A-Za-z]{0,3}[ceprE][A-Za-z]{0,3}\\b|--eval\\b|\\beval\\s)[^|]*' + SECRET_TOKENS, 'i'),
     'Inline interpreter referencing a sensitive file blocked -- possible exfiltration'],
   // Encoded command execution.
   [/\b(powershell|pwsh)(\.exe)?\b[^;|]*-(?:e|ec|enc|encodedcommand)\b/i,
@@ -662,7 +745,7 @@ const POSH_DENY_PATTERNS = [
   [/\b(Set|New)-ItemProperty\b[^;|]*\\(Run|RunOnce)\b/i, 'Registry Run-key write blocked -- possible persistence'],
   [/\b(Add-Content|Set-Content|Out-File|Tee-Object)\b[^;|]*\$PROFILE\b/i, 'Writing to $PROFILE blocked -- possible persistence'],
   // Elevation / credential theft.
-  [/\bStart-Process\b[^;|]*-Verb\s+RunAs\b/i, 'Start-Process -Verb RunAs (elevation) blocked'],
+  [/\bStart-Process\b[^;|]*-Verb\s+RunAs\b/i, 'Start-Process -Verb RunAs -- runs elevated', 'ask'],
   [/\bConvertFrom-SecureString\b/i, 'ConvertFrom-SecureString blocked -- possible credential export'],
   [/comsvcs\.dll\b[^;|]*MiniDump/i, 'lsass MiniDump blocked -- credential theft'],
 ];
@@ -966,81 +1049,59 @@ function isSafeHeredocInvocation(rawCmd) {
   return true;
 }
 
-function checkSegmentDeny(seg, depth) {
+// mode 'hard' (default): Tier-1 deny rules fire (ask-tagged rules skipped).
+// mode 'ask': ONLY the ask-tagged Tier-2 rules fire, via ask(). The caller runs
+// the hard pass over all segments before the ask pass, so a hard deny on any
+// segment always wins over an ask on another.
+function checkSegmentDeny(seg, depth, mode) {
   if (depth === undefined) depth = 0;
+  if (mode === undefined) mode = 'hard';
   if (depth > 6) return;
 
   const stripped = seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+  const emit = mode === 'ask' ? ask : deny;
+  const wants = (sev) => (mode === 'ask' ? sev === 'ask' : sev !== 'ask');
 
-  for (const [pattern, reason] of DENY_PATTERNS) {
-    if (pattern.test(seg) || pattern.test(stripped)) {
-      deny(reason, seg);
-    }
-  }
   // PowerShell + cmd deny patterns are anchored to their own syntax, so they are
   // safe to evaluate on both tools (and catch Windows tools shelled out from bash).
-  for (const [pattern, reason] of POSH_DENY_PATTERNS) {
-    if (pattern.test(seg) || pattern.test(stripped)) {
-      deny(reason, seg);
-    }
-  }
-  for (const [pattern, reason] of CMD_DENY_PATTERNS) {
-    if (pattern.test(seg) || pattern.test(stripped)) {
-      deny(reason, seg);
+  for (const set of [DENY_PATTERNS, POSH_DENY_PATTERNS, CMD_DENY_PATTERNS]) {
+    for (const [pattern, reason, sev] of set) {
+      if (wants(sev) && (pattern.test(seg) || pattern.test(stripped))) emit(reason, seg);
     }
   }
 
   const poshC = parsePoshInvocation(seg);
   if (poshC && poshC.innerCmd) {
-    const innerSegs = splitPoshSegments(poshC.innerCmd);
-    for (const inner of innerSegs) {
-      checkSegmentDeny(inner, depth + 1);
-    }
+    for (const inner of splitPoshSegments(poshC.innerCmd)) checkSegmentDeny(inner, depth + 1, mode);
   }
 
   const cmdC = parseCmdInvocation(seg);
   if (cmdC && cmdC.innerCmd) {
-    const innerSegs = splitChainSegments(cmdC.innerCmd);
-    for (const inner of innerSegs) {
-      checkSegmentDeny(inner, depth + 1);
-    }
+    for (const inner of splitChainSegments(cmdC.innerCmd)) checkSegmentDeny(inner, depth + 1, mode);
   }
 
   const shellC = parseShellCInvocation(seg);
   if (shellC) {
-    if (shellC.opaque) {
+    if (mode !== 'ask' && shellC.opaque) {
       deny('Opaque shell -c argument blocked -- contains $(...), backticks, or $VAR', seg);
     }
-    const innerSegs = splitChainSegments(shellC.innerCmd);
-    for (const inner of innerSegs) {
-      checkSegmentDeny(inner, depth + 1);
-    }
+    for (const inner of splitChainSegments(shellC.innerCmd)) checkSegmentDeny(inner, depth + 1, mode);
   }
 
   const findCmds = parseFindExec(seg);
   if (findCmds) {
     for (const cmd of findCmds) {
-      const innerSegs = splitChainSegments(cmd);
-      for (const inner of innerSegs) {
-        checkSegmentDeny(inner, depth + 1);
-      }
+      for (const inner of splitChainSegments(cmd)) checkSegmentDeny(inner, depth + 1, mode);
     }
   }
 
   const xargsCmd = parseXargs(seg);
   if (xargsCmd) {
-    const innerSegs = splitChainSegments(xargsCmd);
-    for (const inner of innerSegs) {
-      checkSegmentDeny(inner, depth + 1);
-    }
+    for (const inner of splitChainSegments(xargsCmd)) checkSegmentDeny(inner, depth + 1, mode);
   }
 
-  const psubs = extractProcessSubstitutions(seg);
-  for (const inner of psubs) {
-    const innerSegs = splitChainSegments(inner);
-    for (const innerSeg of innerSegs) {
-      checkSegmentDeny(innerSeg, depth + 1);
-    }
+  for (const inner of extractProcessSubstitutions(seg)) {
+    for (const innerSeg of splitChainSegments(inner)) checkSegmentDeny(innerSeg, depth + 1, mode);
   }
 }
 
@@ -1284,7 +1345,7 @@ process.stdin.on('end', () => {
   if (segments.length === 0) process.exit(0);
 
   for (const seg of segments) {
-    checkSegmentDeny(seg);
+    checkSegmentDeny(seg, 0, 'hard');
   }
 
   // Script-content pass: deny rules already ran on every segment, so a trusted
@@ -1297,6 +1358,13 @@ process.stdin.on('end', () => {
     } catch (err) {
       audit('fallthrough', 'script-scan-threw: ' + (err && err.message), seg);
     }
+  }
+
+  // Tier-2 ask pass: dev-workflow guards (sudo / git push / DROP TABLE / ...)
+  // surface for in-session approval. Runs after hard deny + script scan so those
+  // always take precedence; ask() exits on the first match.
+  for (const seg of segments) {
+    checkSegmentDeny(seg, 0, 'ask');
   }
 
   let allApproved = true;
