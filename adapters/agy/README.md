@@ -36,15 +36,22 @@ it doesn't list, which is how a native `view_file` read of `.env` slips through:
   "shellter": {
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": ".*",
         "hooks": [
-          { "type": "command", "command": "node \"F:/opt/projs/ai/claude/shellter/adapters/shared/shellter-host-hook.js\" --host=agy", "timeout": 30 }
+          { "type": "command", "command": "node F:/opt/projs/ai/claude/shellter/adapters/shared/shellter-host-hook.js --host=agy", "timeout": 30 }
         ]
       }
     ]
   }
 }
 ```
+
+> **Do not quote the shim path.** agy runs the hook command *without a shell* and
+> does not strip quotes; a quoted path is kept literally and resolved relative to
+> `.agents/`, producing `Cannot find module …\.agents\"F:\…"` (`MODULE_NOT_FOUND`),
+> and the hook then fails on every call. Use forward slashes and no quotes — which
+> requires a shim path with **no spaces**. Match with `.*` (a Go regex; `*` alone
+> is not a valid pattern).
 
 Set `SHELLTER_HOOKS_DIR` in the hook's environment if `hooks/` isn't at the
 `../../hooks` dev location relative to the shim.
