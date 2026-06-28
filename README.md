@@ -307,7 +307,8 @@ node test-hooks.js
 
 ## Changelog
 
-Current version is 0.5.0 (sensitive-file read/exfil hardening across every shell +
-anti-bypass notice + Tier-2 dev-guards downgraded to ask + adapters for opencode,
-pi, codex, and agy/Antigravity; marketplace move from 0.4.1; script-content scanning
-from 0.3.0). The full history lives in [CHANGELOG.md](CHANGELOG.md).
+Current version is 0.5.1 (codex/agy adapter fixes; the plugin and core hooks are
+unchanged from 0.5.0). 0.5.0 added sensitive-file read/exfil hardening across every
+shell + anti-bypass notice + Tier-2 dev-guards downgraded to ask + adapters for
+opencode, pi, codex, and agy/Antigravity; marketplace move from 0.4.1; script-content
+scanning from 0.3.0). The full history lives in [CHANGELOG.md](CHANGELOG.md).
