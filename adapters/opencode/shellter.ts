@@ -24,7 +24,6 @@ const HOOKS =
 
 const BASH_HOOK = join(HOOKS, "check-bash.js");
 const FILE_HOOK = join(HOOKS, "check-sensitive-files.js");
-const TRUST = join(HOOKS, "shellter-trust.js");
 const DEBUG = !!process.env.SHELLTER_DEBUG;
 
 function dbg(o) {
@@ -37,13 +36,17 @@ function mapTool(tool, args) {
   const a = args || {};
   switch (tool) {
     case "bash":
-      return { hook: BASH_HOOK, name: "Bash", input: { command: a.command ?? "" } };
+      // opencode's bash tool runs PowerShell on Windows -- map to PowerShell there
+      // so PS segmentation + approve rules apply (deny rules run cross-tool anyway).
+      return { hook: BASH_HOOK, name: process.platform === "win32" ? "PowerShell" : "Bash", input: { command: a.command ?? "" } };
     case "read":
       return { hook: FILE_HOOK, name: "Read", input: { file_path: a.filePath ?? a.path ?? "" } };
     case "write":
       return { hook: FILE_HOOK, name: "Write", input: { file_path: a.filePath ?? a.path ?? "", content: a.content ?? "" } };
     case "edit":
-      return { hook: FILE_HOOK, name: "Edit", input: { file_path: a.filePath ?? a.path ?? "", content: a.newString ?? a.replacement ?? a.content ?? "" } };
+      // check-sensitive-files.js reads an Edit's new text from `new_string` -- must
+      // match that key or the content/injection scan on edits is silently skipped.
+      return { hook: FILE_HOOK, name: "Edit", input: { file_path: a.filePath ?? a.path ?? "", new_string: a.newString ?? a.replacement ?? a.content ?? "" } };
     case "grep":
       return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
     case "glob":
@@ -75,7 +78,10 @@ function decide(out) {
     const h = JSON.parse(out).hookSpecificOutput;
     return { decision: h?.permissionDecision || "allow", reason: h?.permissionDecisionReason || "" };
   } catch {
-    return { decision: "allow", reason: "" }; // blank/garbled output = fallthrough = allow
+    // blank/garbled output = fallthrough = allow. Log the raw output so a
+    // malformed-JSON regression (which silently disables the gate) is diagnosable.
+    dbg({ event: "decide-parse-fail", raw: (out || "").slice(0, 200) });
+    return { decision: "allow", reason: "" };
   }
 }
 
@@ -89,10 +95,9 @@ export const ShellterPlugin = async ({ directory, worktree }) => {
       const { decision, reason } = decide(runHook(m.hook, { tool_name: m.name, tool_input: m.input, cwd }));
       dbg({ tool: input?.tool, argKeys: Object.keys(output?.args || {}), decision });
       if (decision === "deny" || decision === "ask") {
-        throw new Error(
-          `shellter blocked this ${m.name} (${decision}): ${reason}` +
-            (decision === "ask" ? `\nReview it, then allow with: node "${TRUST}" add <path>` : "")
-        );
+        // The reason already carries the guidance (incl. any trust command for a
+        // flagged script), so surface it verbatim rather than a fixed placeholder.
+        throw new Error(`shellter ${decision === "ask" ? "needs your approval for" : "blocked"} this ${m.name}: ${reason}`);
       }
     },
   };

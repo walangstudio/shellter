@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-349%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-375%20passing-brightgreen)](test-hooks.js)
 
 Shelters you from dangerous shell commands. Global PreToolUse hooks that
 auto-allow safe operations and block dangerous ones across every Claude Code
@@ -22,17 +22,18 @@ PowerShell parsing (backtick escape, PS quoting) and the PowerShell/cmd rule set
 - Recursively descends into `bash`/`sh`/`zsh`/`dash`/`ash`/`ksh`/`fish -c '...'`, `find -exec`, `xargs`, `<(...)` / `>(...)`, and any `powershell -Command` / `pwsh -c` / `cmd /c` shelled out from a command, so wrappers can't hide a payload
 - Strips invisible/steganographic Unicode (zero-widths, bidi overrides, tag chars) before matching
 - **Scans the CONTENTS of executed scripts** (`bash`/`sh`/`zsh`/… `X`, `./X`, `source X` / `. X`, `powershell`/`pwsh -File X`, `& ./X.ps1`): reads the resolved file (first 256 KB) and looks for download-pipe-to-shell, `/dev/tcp` reverse shells, base64/xxd decode-then-exec, `-EncodedCommand`/`IEX`/`DownloadString`, and LOLBins. High-risk + untrusted → `ask` ("read this script yourself"); trusted → silent allow. See [Script trust store](#script-trust-store)
-- DENY (cross-platform): reverse shells, exfiltration, encoded payloads, privilege escalation, identity backdoors via `git config`, persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_*`), crypto miners, container escape, force-push to main (incl. `git --no-pager`/`-C` prefixes), `rm -rf` of system dirs, and more
+- DENY (cross-platform, hard block): reverse shells, exfiltration (incl. `tar`/`zip`/`7z` of a secret file or whole `.ssh`/`.aws` dir), encoded payloads, command-exec `git config` keys (`core.hooksPath` / `credential.helper` / `core.sshCommand` / `gpg.program` / `!`-aliases — identity keys like `user.name`/`user.email` are allowed), persistence (shell rc / `.git/hooks/` / CI configs), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_*`), crypto miners, container escape, `rm -rf` of system dirs, and more
 - DENY (macOS): `csrutil disable`, `spctl --master-disable`, `launchctl`/LaunchAgents persistence, `security` Keychain extraction, `dscl` user creation, `kextload`, `tccutil reset`, `diskutil erase`, quarantine stripping, `rm -rf /System|/Library|/Applications|/Users|/Volumes`
-- DENY (PowerShell): `Remove-Item -Recurse -Force` of home/root/wildcard, `Invoke-Expression`/`iex`, `iwr|iex` and `-OutFile`/`DownloadString` download-exec, `-EncodedCommand`, `Set-ExecutionPolicy`, Defender tamper (`Set-MpPreference`), service/scheduled-task/Run-key/`$PROFILE` persistence, `Start-Process -Verb RunAs`, lsass MiniDump
+- DENY (PowerShell): `Remove-Item -Recurse -Force` of home/root/wildcard, `Invoke-Expression`/`iex`, `iwr|iex` and `-OutFile`/`DownloadString` download-exec, `-EncodedCommand`, `Set-ExecutionPolicy`, Defender tamper (`Set-MpPreference`), service/scheduled-task/Run-key/`$PROFILE` persistence, lsass MiniDump, secret reads via `Get-Content`/`gc`/`type`/`.NET` and archive/copy exfil
 - DENY (cmd.exe): `del`/`rmdir /s`, `format`, `vssadmin delete shadows`, `bcdedit`, `reg add …\Run`, `schtasks /create`, `sc create`, `net user … /add`, `netsh advfirewall`, `takeown`, `icacls /grant`, `certutil -urlcache`, `bitsadmin /transfer`, `mshta`/`regsvr32`/`rundll32` LOLBins
+- ASK (in-session approval — mistake-guards, not malicious-skill attacks): `git push` to main / `--force`, `git reset --hard` / `clean -f` / `checkout --`, `sudo`, `ssh`/`scp`/`sftp`, SQL `DROP`/`TRUNCATE`, `Start-Process -Verb RunAs`. The Tier-1 DENY threats above stay a hard block; a hard deny on any segment of a command always wins over an ask
 - APPROVE (Bash): read-only git plus `pull` / `merge` / `rebase` / `switch` / `blame` / `reflog`; `gh` read-only; `go` / `kubectl get|describe|logs` / `terraform plan|validate` / `helm lint|template`; `ruff` / `black` / `mypy` / `tsc` / `eslint` / `prettier` / `vitest` / `jest`; `pnpm` / `bun` build/test; `pre-commit` / `shellcheck` / `hadolint` / `yamllint`; standard read-only Unix tools
 - APPROVE (PowerShell): read-only verb-noun cmdlets (`Get-*`/`Select-*`/`Test-Path`/`Resolve-Path`/`ConvertTo-Json` …) and their canonical aliases (`gci`/`gc`/`ls`/`cat`/`select`/`where` ...). The bash `curl`/`wget` auto-approve is deliberately excluded here, because on PowerShell those alias `Invoke-WebRequest`
 - Mixed/unknown: falls through to the normal Claude Code permission prompt
 
 **check-sensitive-files.js** gates Read, Write, Edit, Glob, Grep:
 - Resolves symlinks before checking, so `ln -s ~/.env /tmp/x; Read /tmp/x` is blocked
-- Blocks access to `.env*`, `.pem`, `.key`, `.crt`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, plus their `.bak` / `.old` / `.backup` variants
+- Blocks access to `.env*` (placeholder templates `.env.example`/`.sample`/`.template` excluded), `.pem`, `.key`, `.crt`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, plus their `.bak` / `.old` / `.backup` variants
 - Blocks read of credential files: `.gitconfig`, `.git-credentials`, `.npmrc`, `.pypirc`, `.cargo/credentials`, `.docker/config.json`, `.config/gh/hosts.yml`, `.ssh/config`
 - Blocks wallet / keystore / browser-cookie databases, macOS Keychain (`Library/Keychains/`, `login.keychain-db`, `System.keychain`), and Windows secrets (`*.ppk`, `NTUSER.DAT`, `SAM`/`SYSTEM` hives, `AppData\…\Microsoft\Credentials`)
 - Detects prompt-injection in written content: instruction-override phrases, role hijacking ("pretend you are", "assume the role of", "from now on you are"), jailbreak ("DAN mode", "developer mode"), role-tag injection (`<|im_start|>system`, `[SYSTEM]`, `[INST]`)
@@ -307,6 +308,6 @@ node test-hooks.js
 ## Changelog
 
 Current version is 0.5.0 (sensitive-file read/exfil hardening across every shell +
-anti-bypass notice + an experimental opencode adapter; marketplace move from 0.4.1;
-script-content scanning from 0.3.0). The full history
-lives in [CHANGELOG.md](CHANGELOG.md).
+anti-bypass notice + Tier-2 dev-guards downgraded to ask + adapters for opencode,
+pi, codex, and agy/Antigravity; marketplace move from 0.4.1; script-content scanning
+from 0.3.0). The full history lives in [CHANGELOG.md](CHANGELOG.md).
