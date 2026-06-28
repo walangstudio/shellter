@@ -50,6 +50,11 @@ check('write_to_file benign -> allow',   'agy', { toolCall: { name: 'write_to_fi
 // review fix: alternate write-tool names (write_file/str_replace) must be gated.
 check('write_file injection -> deny', 'agy', { toolCall: { name: 'write_file', args: { path: 'n.md', content: INJECTION } } }, 'deny');
 check('unknown tool -> allow',      'agy', { toolCall: { name: 'list_files', args: { path: '.' } } }, 'allow');
+// real agy run_command shape: command is PascalCase `CommandLine`, not `command`.
+check('run_command CommandLine rm -rf -> deny', 'agy', { toolCall: { name: 'run_command', args: { CommandLine: join('rm -rf', ' /usr') } } }, 'deny');
+check('run_command CommandLine git -> allow',   'agy', { toolCall: { name: 'run_command', args: { CommandLine: 'git status' } } }, 'allow');
+// real agy write shape: TargetFile + CodeContent.
+check('write_to_file CodeContent injection -> deny', 'agy', { toolCall: { name: 'write_to_file', args: { TargetFile: 'n.md', CodeContent: INJECTION } } }, 'deny');
 
 console.log(`\n${pass}/${total} shared host-hook checks passed`);
 process.exit(pass === total ? 0 : 1);
