@@ -43,18 +43,20 @@ function mapTool(ev) {
   const lname = toolName.toLowerCase();
 
   const isShell = /(^|[_-])(bash|sh|shell|exec|run_command|run_shell_command|run_terminal|terminal|run_code|execute)([_-]|$)/.test(lname) ||
-    (args && (args.command !== undefined || args.cmd !== undefined || args.script !== undefined));
+    (args && (args.command !== undefined || args.cmd !== undefined || args.script !== undefined || args.CommandLine !== undefined));
   if (isShell) {
-    const command = asCommand(first(args.command, args.cmd, args.script, ''));
+    // agy/Cascade run_command carries the command in PascalCase `CommandLine`.
+    const command = asCommand(first(args.command, args.cmd, args.script, args.CommandLine, args.command_line, ''));
     if (!command) return null;
     return { hook: BASH_HOOK, name: process.platform === 'win32' ? 'PowerShell' : 'Bash', input: { command } };
   }
 
   const isWrite = /(write_to_file|write_file|file_write|str_replace|replace_file_content|multi_replace|create_file|update_file|apply_patch|save_file|^patch$|^write$|^edit$)/.test(lname);
   if (isWrite) {
-    const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.filePath, '') || '');
+    const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.filePath, args.TargetFile, '') || '');
     // Pull the attacker-influenced new text from whatever shape the host uses.
-    let content = first(args.content, args.new_content, args.new_string, args.newText, args.text);
+    // agy/Cascade write tools use PascalCase CodeContent / CodeEdit.
+    let content = first(args.content, args.new_content, args.new_string, args.newText, args.text, args.CodeContent, args.CodeEdit);
     if (content === undefined && Array.isArray(args.edits)) content = args.edits.map((e) => first(e && (e.newText || e.new_string || e.content), '')).join('\n');
     if (content === undefined && Array.isArray(args.replacements)) content = args.replacements.map((e) => first(e && (e.newText || e.new_string || e.content), '')).join('\n');
     // codex apply_patch / agy patch tools carry the change as one patch blob.
