@@ -7,6 +7,55 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.5.2] - 2026-06-29
+
+Patch: kills a decode-layer false positive in the prompt-injection scanner. Core
+hooks only; no API or config change.
+
+### Fixed
+- **High-entropy tokens tripped `homoglyph-mixed-script:decoded`.** The decode-one-
+  layer pass matches any 24+ run of base64 characters, so a plain identifier (e.g. a
+  27-letter method-name fragment in an `Edit`), a hash, or a minified blob was
+  speculatively decoded into random bytes that coincidentally contained a Cyrillic
+  letter, and the homoglyph matcher -- which matches any short cross-script letter run
+  -- fired on the decoded layer. A pure-ASCII file edit was denied as prompt injection.
+  Fix: the **homoglyph** matcher now runs on **literal content only**, not on a decoded
+  layer (the random bytes of a decoded identifier are not rendered text, and a homoglyph
+  hit there is a coincidental byte run). The rule is unconditional -- not gated on any
+  "looks like garbage" property of the decoded bytes, since that signal is attacker-
+  controllable and would be an evadable suppression. The other invisible-character
+  matchers (bidi-override, variation-selector, zero-width, tag) are **unchanged**: they
+  still scan the decoded layer, because those specific code points do not occur in a
+  decoded identifier's bytes and so never caused this false positive -- a Trojan-Source
+  / invisible-char payload smuggled through base64 is still detected.
+
+### Added
+- **Confusable-folding for override detection.** Before `OVERRIDE_RE` runs, Cyrillic and
+  Greek letters that imitate ASCII are folded to the letter they spoof, so an override
+  phrase disguised with lookalike characters matches the same as its ASCII form. This
+  runs on **every layer, including the decoded one**, through the keyword path that
+  already scans encoded payloads unconditionally -- so a homoglyph-spoofed override
+  hidden in a base64 layer is caught (`instruction-override`), recovering the override
+  case the literal-only homoglyph change would otherwise drop, with no evadable gate.
+  Only `OVERRIDE_RE` is folded: it matches long multi-word phrases, so folding cannot
+  turn real foreign-script prose into a match, and the short role-label matchers are
+  left unfolded (a stray Cyrillic `аі:` must not fold into a fake `AI:` label). The fold
+  map is the single source of truth for the confusable set the mixed-script detector
+  uses, so the two cannot drift; folding is 1:1 and identity on ASCII.
+
+  Note: a **non-keyword** homoglyph spoof (e.g. a credential-phishing lure) hidden in a
+  base64 layer is no longer flagged on the decoded layer -- only spoofed override
+  phrases are recovered there. Literal-content homoglyph detection is unchanged.
+
+### Tests
+- Core hook suite 375 -> 381: a long-identifier no-false-positive case; an invalid-UTF-
+  8-padded base64 override that must still be denied; a confusable-spoofed override on
+  the literal layer and one hidden in base64 that must still be denied on the decoded
+  layer; a bidi-override smuggled through base64 that must still be denied on the decoded
+  layer; and a Cyrillic line label that must NOT fold into a fake role label. The
+  existing literal homoglyph / bidi / variation-selector deny tests and the base64-
+  decode-to-override-phrase deny test still pass.
+
 ## [0.5.1] - 2026-06-28
 
 Adapter-only fixes (codex/agy shared shim). The Claude Code plugin and the core
@@ -310,6 +359,8 @@ were cut in between:
   databases, plus prompt-injection and token-shape detection in written content.
 - Opt-in audit log via `CLAUDE_HOOK_LOG` and `CLAUDE_HOOK_DEBUG`.
 
+[0.5.2]: https://github.com/walangstudio/shellter/releases/tag/v0.5.2
+[0.5.1]: https://github.com/walangstudio/shellter/releases/tag/v0.5.1
 [0.5.0]: https://github.com/walangstudio/shellter/releases/tag/v0.5.0
 [0.4.1]: https://github.com/walangstudio/shellter/releases/tag/v0.4.1
 [0.4.0]: https://github.com/walangstudio/shellter/releases/tag/v0.4.0

@@ -1,7 +1,7 @@
 {
   "name": "shellter",
   "description": "PreToolUse security hooks: dangerous-command gating, executed-script content scanning, sensitive-file and prompt-injection protection. Bash, PowerShell, cmd; Linux, macOS, Windows.",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "author": {
     "name": "scr1p7k177y",
     "email": "scriptkitty@walang.studio"
