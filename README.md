@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.5.2-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-375%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-381%20passing-brightgreen)](test-hooks.js)
 
 Shelters you from dangerous shell commands. Global PreToolUse hooks that
 auto-allow safe operations and block dangerous ones across every Claude Code
@@ -307,8 +307,11 @@ node test-hooks.js
 
 ## Changelog
 
-Current version is 0.5.1 (codex/agy adapter fixes; the plugin and core hooks are
-unchanged from 0.5.0). 0.5.0 added sensitive-file read/exfil hardening across every
+Current version is 0.5.2 (fixes a decode-layer false positive where long camelCase
+identifiers were base64-decoded into random bytes that tripped the homoglyph matcher;
+the homoglyph matcher is now literal-only, while spoofed override phrases are still
+caught on every layer via confusable-folding and the other invisible-char matchers are
+unchanged). 0.5.1 was codex/agy adapter fixes. 0.5.0 added sensitive-file read/exfil hardening across every
 shell + anti-bypass notice + Tier-2 dev-guards downgraded to ask + adapters for
 opencode, pi, codex, and agy/Antigravity; marketplace move from 0.4.1; script-content
 scanning from 0.3.0). The full history lives in [CHANGELOG.md](CHANGELOG.md).
