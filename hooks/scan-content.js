@@ -224,9 +224,29 @@ const EXFIL_TARGET_RE = /(?:~\/?\.ssh|id_rsa|id_ed25519|\.env\b|\bcredentials?\b
 const MCP_IMPORTANT_RE = /<IMPORTANT>[\s\S]{0,400}(?:do\s+not\s+(?:mention|tell|reveal)|read\s|send\s|curl|wget|execute|\.env\b|credentials?|~\/?\.)/i;
 const HTML_COMMENT_ACTION_RE = /<!--[\s\S]{0,400}(?:curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|token|webhook|http)[\s\S]{0,400}-->/i;
 
-// Confusable Cyrillic/Greek letters that spoof ASCII Latin.
-const CONFUSABLE = 'АВЕКМНОРСТХаеіорсухΑΒΕΗΙΚΜΝΟΡΤΥΧοα';
+// Confusable Cyrillic/Greek letters that spoof ASCII Latin, mapped to the letter they
+// imitate. Single source of truth: CONFUSABLE (for the mixed-script detector) is
+// derived from the keys, so the set and the fold map cannot drift apart.
+const CONFUSABLE_FOLD = {
+  'А':'A','В':'B','Е':'E','К':'K','М':'M','Н':'H','О':'O','Р':'P','С':'C','Т':'T','Х':'X',
+  'а':'a','е':'e','і':'i','о':'o','р':'p','с':'c','у':'y','х':'x',
+  'Α':'A','Β':'B','Ε':'E','Η':'H','Ι':'I','Κ':'K','Μ':'M','Ν':'N','Ο':'O','Ρ':'P','Τ':'T','Υ':'Y','Χ':'X',
+  'ο':'o','α':'a',
+};
+const CONFUSABLE = Object.keys(CONFUSABLE_FOLD).join('');
 const HOMOGLYPH_TOKEN_RE = new RegExp('\\b(?=[A-Za-z]*[' + CONFUSABLE + '])(?=[' + CONFUSABLE + ']*[A-Za-z])[A-Za-z' + CONFUSABLE + ']{3,}\\b', 'u');
+// Fold confusables to the ASCII letters they imitate, so the semantic keyword matchers
+// (override/role/MCP) catch a phrase spoofed with lookalike letters (a Cyrillic letter
+// standing in for the Latin one). 1:1 length-preserving (each confusable -> one ASCII
+// char), so match offsets stay valid; identity on plain ASCII, so normal content is
+// unaffected. Runs on every layer including the decoded one, with no content-derived
+// gate, so it recovers spoofed-payload detection on encoded layers without the
+// homoglyph matcher's garbage-decode false positives.
+function foldConfusables(s) {
+  let out = '';
+  for (const ch of s) out += CONFUSABLE_FOLD[ch] || ch;
+  return out;
+}
 const ROLE_LINE_RE = /^[ \t>*-]*\b(System|Human|Assistant|User|AI)\s*:/gim;
 
 // ---- scanners ---------------------------------------------------------------
@@ -283,8 +303,13 @@ function scanShell(text, opts) {
   return findings;
 }
 
-function scanInjectionText(findings, text) {
+function scanInjectionText(findings, text, decodedLayer) {
   const { counts, clean } = normalizeForScan(text);
+  // Invisible / steganographic-unicode matchers (tag, bidi-override, variation-selector,
+  // zero-width) run on EVERY layer including the decoded one, as before: they catch real
+  // smuggling encoded into a base64/hex layer, and these specific code points do not
+  // appear in the random bytes of an ordinary decoded identifier/hash, so they don't
+  // cause the false positive this release fixes (that was the homoglyph matcher below).
   if (counts.tag > 0) pushFinding(findings, text, 0, 'unicode', 'tag-char-smuggling', SEVERITY.HIGH);
   if (counts.bidi > 0) pushFinding(findings, text, 0, 'unicode', 'bidi-override', SEVERITY.HIGH);
   if (counts.variationSelector > 0) pushFinding(findings, text, 0, 'unicode', 'variation-selector-smuggling', SEVERITY.HIGH);
@@ -293,19 +318,39 @@ function scanInjectionText(findings, text) {
   for (const [re, sig] of ROLE_MARKERS) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.HIGH); }
   for (const [re, sig] of POLICY_PUPPETRY) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.HIGH); }
 
-  const ov = OVERRIDE_RE.exec(clean);
+  // Override phrases are matched on confusable-folded text so a phrase spoofed with
+  // Cyrillic/Greek lookalikes is caught the same as its ASCII form, on every layer
+  // including decoded -- this is what recovers a homoglyph-spoofed override hidden in a
+  // base64 layer through the unconditional keyword path. Only OVERRIDE_RE is folded: it
+  // matches long multi-word English phrases, so folding cannot turn real foreign-script
+  // prose into a match; the short role-label matchers are left unfolded (a stray "аі:"
+  // would otherwise fold to a fake "AI:" label).
+  const folded = foldConfusables(clean);
+  const ov = OVERRIDE_RE.exec(folded);
   if (ov) {
-    const window = clean.slice(Math.max(0, ov.index - 200), ov.index + 200);
+    const window = folded.slice(Math.max(0, ov.index - 200), ov.index + 200);
     const withExfil = EXFIL_TARGET_RE.test(window);
-    pushFinding(findings, clean, ov.index, 'injection', withExfil ? 'override-with-exfil-target' : 'instruction-override', SEVERITY.HIGH);
+    pushFinding(findings, folded, ov.index, 'injection', withExfil ? 'override-with-exfil-target' : 'instruction-override', SEVERITY.HIGH);
   }
 
   const mi = MCP_IMPORTANT_RE.exec(clean); if (mi) pushFinding(findings, clean, mi.index, 'injection', 'mcp-tool-poisoning', SEVERITY.HIGH);
   const hc = HTML_COMMENT_ACTION_RE.exec(clean); if (hc) pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', SEVERITY.HIGH);
 
-  const hg = HOMOGLYPH_TOKEN_RE.exec(clean); if (hg) pushFinding(findings, clean, hg.index, 'injection', 'homoglyph-mixed-script', SEVERITY.HIGH);
+  // Homoglyph mixed-script is the one display-spoof matcher that fires on the random
+  // bytes of a decoded ordinary identifier/hash (the reported false positive), because
+  // it matches any short cross-script letter run. So it runs on LITERAL content only.
+  // A spoofed *keyword* (e.g. an override phrase) is still caught on the decoded layer
+  // via the folded OVERRIDE_RE above; a non-keyword homoglyph token hidden inside a
+  // base64/hex layer is no longer flagged on the decoded layer (literal content still
+  // is). We do not gate on a "looks like garbage" property of the decoded bytes: that
+  // signal is attacker-controllable and would be an evadable suppression.
+  if (!decodedLayer) {
+    const hg = HOMOGLYPH_TOKEN_RE.exec(clean); if (hg) pushFinding(findings, clean, hg.index, 'injection', 'homoglyph-mixed-script', SEVERITY.HIGH);
+  }
 
   // Fake transcript: only flag when >=2 distinct role labels appear at line start.
+  // Matched on unfolded text -- folding short labels risks a Cyrillic "аі:" line folding
+  // into a fake "AI:" role label.
   const seen = new Set();
   let rm; ROLE_LINE_RE.lastIndex = 0;
   let firstIdx = -1;
@@ -322,7 +367,7 @@ function scanInjection(text, opts) {
     const decoded = decodeOneLayer(text);
     if (decoded) {
       const sub = [];
-      scanInjectionText(sub, decoded);
+      scanInjectionText(sub, decoded, true);
       for (const f of sub) findings.push({ ...f, signal: f.signal + ':decoded', line: 0 });
     }
   }
