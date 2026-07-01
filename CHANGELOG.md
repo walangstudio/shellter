@@ -7,6 +7,17 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.5.3] - 2026-07-01
+
+Patch: kills a false positive in the destructive-`rm` guard. `/opt` was in the
+any-depth system-directory blocklist, so routine cleanup like `rm -rf
+/opt/projs/<repo>/scratch.png` was denied as "destructive rm on system directory"
+— but `/opt` is a user-writable software/project area, not a bare system dir. The
+guard now blocks only wiping the root (`rm -rf /opt`, `/opt/`, `/opt/*`) or a
+`..`-traversal that escapes it (`rm -rf /opt/../etc`), and lets a specific deep
+path through. Every other system/home dir (`/etc`, `/usr`, `/home`, `/Users`, `~`,
+…) stays strict — including their subpaths.
+
 ## [0.5.2] - 2026-06-29
 
 Patch: kills a decode-layer false positive in the prompt-injection scanner. Core

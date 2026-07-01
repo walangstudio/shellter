@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.5.2-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.5.3-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-381%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-394%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -202,5 +202,6 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.5.2 — homoglyph false-positive fix (matcher
-is literal-only; spoofed overrides still caught via confusable-folding).
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.5.3 — destructive-rm `/opt` false-positive fix
+(deep project paths like `/opt/projs/repo/file.png` allowed; the `/opt` root and `..`
+traversal still blocked).

@@ -250,6 +250,28 @@ testBash('Deny: rm -rf ~ (bare home)', join('rm -rf', ' ~'), 'deny');
 testBash('Deny: rm -rf ~/Documents (home subpath)', join('rm -rf', ' ~/Documents'), 'deny');
 testBash('Pass: rm -rf node_modules (not root/home)', 'rm -rf node_modules', 'fallthrough');
 
+// /opt is a user-writable software/project area (e.g. /opt/projs/...), not a bare system
+// dir: block wiping the root/wholesale/traversal, but allow rm of a specific deep path.
+testBash('Deny: rm -rf /opt (bare)', join('rm -rf', ' /opt'), 'deny');
+testBash('Deny: rm -rf /opt/ (root slash)', join('rm -rf', ' /opt/'), 'deny');
+testBash('Deny: rm -rf /opt/* (wholesale)', join('rm -rf', ' /opt/*'), 'deny');
+testBash('Deny: rm -rf /opt// (double slash)', join('rm -rf', ' /opt//'), 'deny');
+testBash('Deny: rm -rf /opt/. (dot form)', join('rm -rf', ' /opt/.'), 'deny');
+testBash('Deny: rm -rf /opt/../etc (traversal escape)', join('rm -rf', ' /opt/../etc'), 'deny');
+testBash('Deny: subshell $(rm -rf /opt) (terminator ")")', join('$(rm -rf', ' /opt)'), 'deny');
+testBash('Deny: rm -rf /opt.bak/../../etc (sibling-prefix traversal escape)',
+  join('rm -rf', ' /opt.bak/../../etc'), 'deny');
+testBash('Deny: rm -rf /opt/projs/x/build/../dist (.. component blocked conservatively)',
+  join('rm -rf', ' /opt/projs/x/build/../dist'), 'deny');
+testBash('Pass: rm -rf /opt/projs/legalmatch/page-step3-375.png (deep project file)',
+  'rm -rf /opt/projs/legalmatch/page-step3-375.png', 'fallthrough');
+testBash('Pass: rm -rf /opt/projs/legalmatch (deep project dir)',
+  'rm -rf /opt/projs/legalmatch', 'fallthrough');
+testBash('Pass: rm -rf /opt/projs/x/report.v1..v2.png (`..` in filename, not traversal)',
+  'rm -rf /opt/projs/x/report.v1..v2.png', 'fallthrough');
+testBash('Pass: rm -rf /opt/projs/repo/..cache (dir named ..cache, not traversal)',
+  'rm -rf /opt/projs/repo/..cache', 'fallthrough');
+
 // chmod precision (numeric setuid only fires on leading [2467])
 testBash('Deny: chmod 4755 (setuid)', 'chmod 4755 /usr/local/bin/foo', 'deny');
 testBash('Deny: chmod 6755 (setuid+setgid)', 'chmod 6755 /usr/local/bin/foo', 'deny');

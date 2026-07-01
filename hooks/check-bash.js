@@ -640,8 +640,17 @@ const DENY_PATTERNS = [
     'Reading sensitive file via input redirection blocked'],
 
   // Destructive rm
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(?:\/(?![A-Za-z0-9])|(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b)/,
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(?:\/(?![A-Za-z0-9])|(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b)/,
     'Destructive rm on system directory blocked'],
+  // /opt is a user-writable software/project area (e.g. /opt/projs/...): block wiping the dir
+  // itself in any shell-equivalent form (/opt, /opt/, /opt//, /opt/., /opt/*), OR any /opt*
+  // path that contains a `..` parent component (traversal, incl. escapes like
+  // /opt.bak/../../etc) — but allow rm of a specific deep path with no `..` (routine
+  // project-file cleanup). The token terminator set includes the shell metachars ) ( $ # `
+  // so a subshell/`$()` wipe (`$(rm -rf /opt)`) is still caught; and `..` must be a whole
+  // slash-delimited component, so report.v1..v2 or a dir named ..cache is NOT blocked.
+  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+\/opt(?:[\/.*]*(?=[\s;|&<>()$#\x60]|$)|[^\s;|&<>()$#\x60]*\/\.\.(?=[\/\s;|&<>()$#\x60]|$))/,
+    'Destructive rm on /opt root blocked'],
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+~/, 'Destructive rm on home directory blocked'],
   [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\{\}|\$\{?[A-Za-z_])/,
     'rm -rf with placeholder/variable target blocked'],
