@@ -81,3 +81,15 @@ for (const p of [bashHook, filesHook, scanHook, trustHook]) {
   const h = sha256(p);
   if (h) console.log('  ' + path.basename(p) + '  sha256=' + h);
 }
+
+// The hooks run as `node <hook>`. Claude Code ships as a native binary with no
+// bundled node, so if `node` is not on the PATH Claude Code launches with, every
+// hook fails to spawn and shellter FAILS OPEN (commands run unscreened). Warn now.
+try {
+  const { execFileSync } = require('child_process');
+  const v = execFileSync(process.platform === 'win32' ? 'node.exe' : 'node', ['--version'], { encoding: 'utf8' }).trim();
+  console.log('node on PATH: ' + v + ' (required at runtime -- if Claude Code cannot find node, shellter fails open)');
+} catch {
+  console.warn('WARNING: `node` was not resolvable on PATH. Claude Code must be able to run `node` or the');
+  console.warn('  hooks will not execute and shellter will FAIL OPEN (commands run unscreened).');
+}
