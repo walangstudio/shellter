@@ -7,6 +7,99 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.6.0] - 2026-07-02
+
+Security-review hardening. A full-project audit (manual + multi-agent) found and a
+runtime probe confirmed a class of shell-hook bypasses; this release closes them.
+Existing suite stays green and gains regression tests for every fix.
+
+Destructive `rm` (B1/B2). The guard was five regexes that required `r` and `f` in
+one combined flag token immediately before an unquoted literal target, so
+`rm -r -f /`, `rm -f -r /`, `rm -rf "/"`, `rm -rf --no-preserve-root /`, and
+`rm -r -f ~` all slipped past. Replaced with a real parser (`rmDanger`): flags are
+read order-independently (short clusters, `--recursive`/`--force`, interposed flags),
+targets are quote-stripped, and `rm` is detected at every command position — start,
+after `;`/`|`/`&`/`(`/backtick, and inside `$(...)` — so `` `rm -rf /etc` ``,
+`$(rm -rf /opt)`, and `uv run rm -rf /etc` are caught. Any absolute path with a `..`
+component is blocked as traversal; deep specific `/opt/projs/...` paths stay allowed.
+
+Persistence / credential writes (A4/A5/A8). The rc/hook/CI write rules missed
+`~/.ssh/authorized_keys`, `known_hosts`, in-place editors, and download-to-file. Added:
+redirect/`tee`/append into any persistence or credential target; `cp`/`mv`/`install`
+into an `.ssh` key; `sed -i`/`perl -i` of a persistence file; and `curl -o`/`wget -O`
+onto a persistence path.
+
+Shell obfuscation (A7). Deny rules now also test a de-obfuscated variant of each
+segment (`${IFS}`/`$IFS` collapsed, empty `''`/`""` pairs removed) plus a token-level
+sensitive-read check, so `cat${IFS}.env`, `cat .e''nv`, and `cat ".e"nv` are denied.
+The chain splitter also honors backslash escapes, so `find -exec ... \;` is parsed as
+one command.
+
+Interpreter laundering + scripts (A1/A2). The approve pass now recurses into every
+pipe stage and into `find -exec`/`xargs` children, so `echo x | xargs node` and
+`find . -exec node x +` are no longer auto-approved on the first stage alone. `python`
+is no longer blanket-approved; a bare `python script.py` (and ruby/node/perl/php/deno/
+bun) is content-scanned like a shell script, and the `python -c` deny now covers
+`os.remove`/`shutil`/`ctypes`/`urllib` and friends.
+
+Data upload, openssl, git config (A6/B3/C1). Uploading a FILE to a remote URL
+(`curl -T`, `curl --data @file`, `wget --post-file`) now asks (inline `-d '{json}'`
+API calls stay approved). `openssl` reading an SSH/cloud private key
+(`openssl rsa -in ~/.ssh/id_rsa`) is denied, while `openssl rsa -in server.key` key
+work is not. Setting `core.editor`/`core.pager`/`diff.external`/`gpg.program` to a
+value containing a shell command (`sh -c`, `;`, `|`, `$(...)`) is now a hard deny
+(a plain `vim` still asks).
+
+File hook coverage (A9). The `Read|Edit|Write|Glob|Grep` matcher now also gates
+`MultiEdit` and `NotebookEdit`, so injected content or a sensitive path written
+through those tools is scanned/blocked, not silently allowed.
+
+Defense-in-depth. Script-flag suppression now honors only user-level
+`~/.claude/settings.json` and gitignored project `settings.local.json`, never a
+repo-committed `settings.json` (a cloned malicious repo could otherwise whitelist its
+own payload, D1). The installer warns when `node` is not on PATH, since the hooks fail
+open without it (D2).
+
+Post-implementation review round. A second high-effort review OF THIS DIFF caught
+regressions the first pass introduced, all fixed here: the destructive-`rm` parser is
+now tokenizer-based so a backslash-escaped/quoted command name (`\rm`, `'rm'`, `"rm"`,
+`env X=1 \rm`) is caught while `rm` mentioned inside a quoted commit message is not a
+false match, and `~+`/`~-`/`~user` are treated as home; the shell-redirect injection
+scan runs per pipe stage with no end-anchor so a trailing `| cat`/`&`/`#` or a
+later-stage `echo … > f` can't hide it; `find` file-writing primaries
+(`-fprintf`/`-fprint`/`-fls`) are no longer auto-approved; the written-content scan is
+NOT truncated (a >256 KB write is scanned in full, no blind spot); a clean/trusted
+script piped into an interpreter (`. ./ok.sh | node evil.js`) is no longer laundered
+into auto-approve; `sed -i` on your own repo's CI workflow is allowed (CI stays covered
+for redirect/download-into-place); `curl -d`'s file-upload gate matches only a leading
+`@file` so inline JSON with an email is not flagged; and interpreted scripts are removed
+from blanket auto-approve without shell-scanning them (no false "high-risk" prompts on
+legit JS bundles).
+
+## [0.5.4] - 2026-07-02
+
+Patch: kills a false positive in `html-comment-action`. The rule matched an HTML
+comment opener, up to 400 of any chars, a keyword, up to 400 more, then a closer —
+and those `[\s\S]` runs crossed comment boundaries. So a decorative divider (a
+`====== GLOBAL CHROME ======` section comment) sitting within ~400 chars of a benign
+word like `token` or `http` (a design-token table, a URL) was flagged even though the
+keyword lived in unrelated content or a separate comment. The body runs are now
+tempered — `(?:(?!-->)[\s\S]){0,400}` — so the keyword must sit inside ONE comment.
+Every real single-comment payload still fires (a `curl`+`http` or `exec`+`.env` combo
+in one comment, and even weak `http`-only signals); no keywords were dropped, so
+recall is unchanged. Bounded `{0,400}` both sides means no exponential backtracking.
+
+## [0.5.3] - 2026-07-01
+
+Patch: kills a false positive in the destructive-`rm` guard. `/opt` was in the
+any-depth system-directory blocklist, so routine cleanup like `rm -rf
+/opt/projs/<repo>/scratch.png` was denied as "destructive rm on system directory"
+— but `/opt` is a user-writable software/project area, not a bare system dir. The
+guard now blocks only wiping the root (`rm -rf /opt`, `/opt/`, `/opt/*`) or a
+`..`-traversal that escapes it (`rm -rf /opt/../etc`), and lets a specific deep
+path through. Every other system/home dir (`/etc`, `/usr`, `/home`, `/Users`, `~`,
+…) stays strict — including their subpaths.
+
 ## [0.5.2] - 2026-06-29
 
 Patch: kills a decode-layer false positive in the prompt-injection scanner. Core

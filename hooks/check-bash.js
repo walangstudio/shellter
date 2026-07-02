@@ -45,6 +45,109 @@ function normalizeUnicode(s) {
     .replace(/[  -   　]/g, ' ');
 }
 
+// Collapse cheap shell obfuscation so substring deny rules see the real command:
+// `${IFS}`/`$IFS` -> space, and empty quote pairs ('' / "") -> nothing (token
+// splitting like `cat .e''nv`). Used only to build an EXTRA variant tested by the
+// deny pass -- the original string still drives chain splitting, so quoting
+// semantics are never altered for parsing, only for matching.
+function normalizeObfuscation(s) {
+  if (typeof s !== 'string') return s;
+  return s.replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, ' ').replace(/''|""/g, '');
+}
+
+// Split an argument string into tokens, honoring single/double quotes and
+// stripping them (so `"/"` -> `/`). Good enough for flag/target extraction, not a
+// full shell parser.
+function tokenizeArgs(s) {
+  const out = [];
+  let cur = '', q = null, has = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { if (c === "'") q = null; else cur += c; has = true; continue; }
+    if (q === '"') {
+      if (c === '\\' && i + 1 < s.length) { cur += s[++i]; has = true; continue; }
+      if (c === '"') q = null; else cur += c;
+      has = true; continue;
+    }
+    if (c === "'" || c === '"') { q = c; has = true; continue; }
+    if (/\s/.test(c)) { if (has) { out.push(cur); cur = ''; has = false; } continue; }
+    cur += c; has = true;
+  }
+  if (has) out.push(cur);
+  return out;
+}
+
+// System dirs that must never be recursively force-removed (any depth).
+const RM_SYSTEM_PREFIX = /^(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)(?:\/|$)/;
+
+function rmTargetDanger(t) {
+  if (!t) return null;
+  if (/^\$\{?[A-Za-z_]/.test(t) || t.includes('{}')) return 'variable/placeholder target';
+  if (t === '/' || /^\/(?![A-Za-z0-9])/.test(t)) return 'filesystem root';   // /, //, /*, /.
+  if (/^~/.test(t)) return 'home directory';   // ~, ~/x, ~+, ~-, ~user
+  if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
+  // Any absolute path with a `..` traversal component can escape upward to a
+  // system dir (`/opt.bak/../../etc`, `/opt/../etc`); block conservatively. A `..`
+  // inside a filename (report.v1..v2) or a dir named ..cache is NOT a component.
+  if (/^[\/~]/.test(t) && /(?:^|\/)\.\.(?:\/|$)/.test(t)) return 'path traversal';
+  // /opt ROOT (slash/dot/star-only tail). Deep specific /opt paths stay allowed
+  // (this tree lives under /opt/projs).
+  if (/^\/opt(?:[\/.*]*)$/.test(t)) return '/opt root';
+  return null;
+}
+
+// Given the tokens AFTER an `rm` command word, return a reason if it recursively
+// AND forcibly removes a protected target. Flag parsing is order-independent
+// (`rm -r -f`), handles long flags (`--recursive`/`--force`) and `--`.
+function evalRmArgs(argToks) {
+  let recursive = false, force = false, sawDashDash = false;
+  const targets = [];
+  for (const tok of argToks) {
+    if (sawDashDash) { targets.push(tok); continue; }
+    if (tok === '--') { sawDashDash = true; continue; }
+    if (tok.startsWith('--')) {
+      if (tok.slice(2) === 'recursive') recursive = true;
+      else if (tok.slice(2) === 'force') force = true;
+      continue;
+    }
+    if (tok.startsWith('-') && tok.length > 1) {
+      if (/[rR]/.test(tok)) recursive = true;
+      if (tok.includes('f')) force = true;
+      continue;
+    }
+    targets.push(tok);
+  }
+  if (!recursive || !force) return null;
+  for (const t of targets) { const d = rmTargetDanger(t); if (d) return 'Destructive rm (' + d + ') blocked'; }
+  return null;
+}
+
+// Flag destructive rm. Tokenizes each pipe stage (quote-aware, so a commit
+// message like `git commit -m "...rm -r -f ~..."` is ONE token, not a match),
+// and recognizes an rm command word bare, backslash-escaped (`\rm`), quoted
+// (`'rm'`/`"rm"`), or path-qualified (`/bin/rm`), whether it is the command or an
+// argument to a wrapper (`uv run rm`, `env X=1 \rm`, `sudo rm`). A separate scan
+// catches rm inside a command substitution `$(rm ...)` / `` `rm ...` `` that the
+// tokenizer keeps glued. Returns a reason or null.
+function rmDanger(seg) {
+  for (const stage of splitPipeStages(seg)) {
+    const toks = tokenizeArgs(stage);
+    for (let i = 0; i < toks.length; i++) {
+      const name = toks[i].replace(/^\\/, '').replace(/^.*[\\/]/, '');
+      if (name !== 'rm') continue;
+      const r = evalRmArgs(toks.slice(i + 1));
+      if (r) return r;
+    }
+  }
+  const sub = /(?:\$\(|`)\s*(?:[A-Za-z_]\w*=\S*\s+)*\\?(?:[^\s;|&`()]*\/)?rm(?=[\s)]|$)([^`)]*)/g;
+  let m;
+  while ((m = sub.exec(seg)) !== null) {
+    const r = evalRmArgs(tokenizeArgs(m[1]));
+    if (r) return r;
+  }
+  return null;
+}
+
 function splitChainSegments(cmd) {
   const len = cmd.length;
   let i = 0;
@@ -71,7 +174,9 @@ function splitChainSegments(cmd) {
       continue;
     }
 
-    if (ch === '\\' && inDouble) {
+    // Backslash escapes the next char outside single quotes/backticks, so `\;`
+    // (find -exec terminator) and `\&` are NOT treated as chain separators.
+    if (ch === '\\' && !inBacktick) {
       i += 2;
       continue;
     }
@@ -139,6 +244,32 @@ function splitChainSegments(cmd) {
 
   segments.push(cmd.slice(segmentStart));
   return segments.map(s => s.trim()).filter(s => s.length > 0);
+}
+
+// Split a segment into pipe stages at unquoted top-level `|` (not `||`), honoring
+// quotes/backticks and paren depth. Used by the approve pass so `echo x | xargs
+// node` isn't approved just because its first stage (`echo`) is safe.
+function splitPipeStages(cmd) {
+  const stages = [];
+  let i = 0, start = 0, depth = 0, inS = false, inD = false, inB = false;
+  while (i < cmd.length) {
+    const ch = cmd[i], next = i + 1 < cmd.length ? cmd[i + 1] : '';
+    if (inS) { if (ch === "'") inS = false; i++; continue; }
+    if (ch === "'" && !inD && !inB) { inS = true; i++; continue; }
+    if (ch === '\\' && inD) { i += 2; continue; }
+    if (ch === '"' && !inB) { inD = !inD; i++; continue; }
+    if (inD) { i++; continue; }
+    if (ch === '`') { inB = !inB; i++; continue; }
+    if (inB) { i++; continue; }
+    if (ch === '(') { depth++; i++; continue; }
+    if (ch === ')' && depth > 0) { depth--; i++; continue; }
+    if (depth === 0 && ch === '|' && next !== '|' && cmd[i - 1] !== '|') {
+      stages.push(cmd.slice(start, i)); i++; start = i; continue;
+    }
+    i++;
+  }
+  stages.push(cmd.slice(start));
+  return stages.map(s => s.trim()).filter(s => s.length > 0);
 }
 
 function extractParenContent(value, openIdx) {
@@ -498,6 +629,26 @@ const SECRET_TOKENS = '(?:' + [
   '\\.docker[\\\\/]config', '\\.gitconfig\\b',
 ].join('|') + ')';
 
+// Persistence / credential WRITE targets. Writing INTO these (redirect, tee,
+// cp/mv, sed -i, install, curl/wget -o) is a backdoor/persistence vector. Kept
+// separate from SECRET_TOKENS because those gate READS; these gate WRITES.
+// CI configs are kept in a separate group so the in-place-edit rule can EXCLUDE
+// them -- editing your own repo's CI workflow in place is routine dev work, whereas
+// redirecting/downloading a whole workflow file into place is the supply-chain attack.
+const PERSIST_CORE = [
+  '\\.(?:bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc)\\b',
+  'config\\.fish\\b',
+  '[\\\\/]\\.ssh[\\\\/]', '\\bauthorized_keys\\b', '\\bknown_hosts\\b',
+  '[\\\\/]\\.git[\\\\/]hooks[\\\\/]',
+  '[\\\\/]Library[\\\\/]Launch(?:Agents|Daemons)[\\\\/]',
+].join('|');
+const PERSIST_CI = [
+  '\\.github[\\\\/]workflows[\\\\/]', '\\.gitlab-ci\\.yml\\b', '[\\\\/]\\.circleci[\\\\/]config',
+  '\\bJenkinsfile\\b', '\\.drone\\.yml\\b', '\\.azure-pipelines\\.yml\\b', '\\.woodpecker\\.yml\\b', 'buildkite\\.yml\\b',
+].join('|');
+const PERSIST_TARGETS = '(?:' + PERSIST_CORE + '|' + PERSIST_CI + ')';
+const PERSIST_TARGETS_NOCI = '(?:' + PERSIST_CORE + ')';
+
 // Readers/dumpers that can spill a secret to stdout (POSIX + macOS + busybox).
 // `openssl` deliberately excluded -- `openssl genrsa -out server.key` is routine
 // keygen, and reading a secret via openssl is niche (the gpg/cat/xxd paths cover it).
@@ -505,7 +656,28 @@ const READ_VERBS =
   'cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg|xxd|od|strings|base64|' +
   'base32|hexdump|nl|tac|rev|fold|cut|tr|paste|column|jq|yq|gpg|gpg2|dd';
 
+const READ_VERB_SET = new Set(READ_VERBS.split('|'));
+const SECRET_TOKENS_RE = new RegExp(SECRET_TOKENS, 'i');
+
+// Token-level sensitive-read check: tokenize with quote stripping so a read verb
+// reaching a secret token survives intra-word quote splitting (`cat ".e"nv`,
+// `c"a"t .env`) that a raw-substring regex can't see. Predicate form for the deny
+// loop; returns a reason or null.
+function tokenizedSensitiveRead(seg) {
+  const s = seg.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
+  const toks = tokenizeArgs(s);
+  if (!toks.length) return null;
+  const cmd = toks[0].replace(/^.*[\\/]/, '');
+  if (!READ_VERB_SET.has(cmd)) return null;
+  for (let i = 1; i < toks.length; i++) {
+    if (toks[i].startsWith('-')) continue;
+    if (SECRET_TOKENS_RE.test(toks[i])) return 'Reading sensitive file via shell (quote-obfuscated) blocked';
+  }
+  return null;
+}
+
 const DENY_PATTERNS = [
+  [tokenizedSensitiveRead, null],
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
     'Encoded payload piped to shell blocked'],
@@ -521,7 +693,7 @@ const DENY_PATTERNS = [
   [/bash\s+-i\s+.*>\/dev\/tcp\//, 'Reverse shell pattern blocked'],
   [/\/dev\/(tcp|udp)\//, 'Direct /dev/tcp or /dev/udp access blocked'],
   [/\b(nc|ncat|netcat|socat)\s+.*-[a-zA-Z]*e\s/i, 'Netcat with -e blocked -- possible reverse shell'],
-  [/python[23]?\s+-c\s+.*(\bsocket\b|\bpty\.spawn\b|\bsubprocess\b|\bos\.system\b|\bos\.popen\b|\bos\.exec|\bos\.spawn|\b__import__\b|\bimportlib\b|\beval\s*\(|\bexec\s*\()/i, 'Python one-liner with socket/subprocess/os-exec/eval blocked'],
+  [/python[23]?\s+-c\s+.*(\bsocket\b|\bpty\.spawn\b|\bsubprocess\b|\bos\.system\b|\bos\.popen\b|\bos\.exec|\bos\.spawn|\bos\.(?:remove|unlink|rmdir|removedirs|rename|replace|truncate|chmod|chown)\b|\bshutil\b|\bctypes\b|\burllib\b|\brequests\b|\bhttpx\b|\b__import__\b|\bimportlib\b|\beval\s*\(|\bexec\s*\()/i, 'Python one-liner with dangerous stdlib (subprocess/os/shutil/ctypes/network/eval) blocked'],
   [/perl\s+-e\s+.*\bsocket\b/i, 'Perl socket one-liner blocked'],
   [/ruby\s+-e\s+.*\bTCPSocket\b/i, 'Ruby TCPSocket one-liner blocked'],
 
@@ -532,6 +704,15 @@ const DENY_PATTERNS = [
     'curl uploading a sensitive file blocked -- possible exfiltration'],
   [new RegExp('\\bwget\\b[^|;]*--post-(?:data|file)\\b[^|;]*' + SECRET_TOKENS, 'i'),
     'wget uploading a sensitive file blocked -- possible exfiltration'],
+  // Uploading a FILE (not inline data) to a remote URL -- data leaving the box is
+  // review-worthy. Inline `-d '{json}'` API calls (no @file) stay approved; the
+  // secret-file upload rules above hard-deny first.
+  // `@` must LEAD the data value (curl reads a file only for `-d @file` /
+  // `-F field=@file`), so inline JSON like `-d '{"email":"a@b.com"}'` is NOT flagged.
+  [/\bcurl\b(?=[^|;]*https?:\/\/)[^|;]*(?:(?:-T|--upload-file)\s+\S|(?:--data(?:-binary|-raw|-urlencode)?|-d)\s+['"]?@|(?:-F|--form)\s+['"]?[^=\s'"]*=['"]?@)/i,
+    'curl uploading a file to a remote URL -- approve only if intended', 'ask'],
+  [/\bwget\b(?=[^|;]*https?:\/\/)[^|;]*--post-file\b/i,
+    'wget posting a file to a remote URL -- approve only if intended', 'ask'],
 
   // Download-and-execute / pipe-to-interpreter (incl. absolute paths)
   [/\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b/i,
@@ -576,6 +757,11 @@ const DENY_PATTERNS = [
   // Hard-deny the keys that are almost never set by hand and are classic backdoors:
   [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:credential\.helper|core\.(?:hooksPath|sshCommand|fsmonitor|alternateRefsCommand)|init\.templateDir|uploadpack\.packObjectsHook|filter\.\S+\.(?:clean|smudge)|alias\.\S+\s+['"]?!)/i,
     'git config of a hook / credential-helper / exec key blocked -- possible backdoor'],
+  // Hard-deny when an editor/pager/diff/gpg program value carries a shell command
+  // (metachar, $(...), backtick, or sh/bash -c) -- that is RCE on the next git op.
+  // A plain program name (vim / code --wait) falls to the ask rule below.
+  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:core\.(?:editor|pager)|sequence\.editor|diff\.external|gpg\.program)\s+.*(?:[;&|`><]|\$\(|\bsh\s+-c\b|\bbash\s+-c\b)/i,
+    'git config sets an editor/pager/diff/gpg program to a shell command blocked -- RCE'],
   // ASK on the dual-use "program git runs" keys: legit for a dev (editor/pager/diff)
   // but RCE if a skill sets them to `sh -c ...`. Surface for approval, don't hard-block.
   [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:core\.(?:editor|pager)|sequence\.editor|diff\.external|gpg\.program)/i,
@@ -638,14 +824,35 @@ const DENY_PATTERNS = [
   // precedes the verb, so the verb-first rule above doesn't see it).
   [new RegExp('(?:^|[;&|]\\s*)<\\s*[\'"]?[^\\s\'"]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via input redirection blocked'],
+  // openssl reading an SSH / cloud private key (`openssl rsa -in ~/.ssh/id_rsa`).
+  // Deliberately narrow to the high-value key locations, NOT any `.key`/`.pem`:
+  // openssl operating on a project key (`openssl rsa -in server.key -out x`) is its
+  // job, not exfil, so it must stay unflagged (see the M3 no-FP test).
+  [/\bopenssl\s+(?:rsa|pkey|ec|dsa|pkcs8|pkcs12)\b[^|;]*\s-in\b[^|;]*(?:id_rsa|id_ed25519|id_ecdsa|[\\/]\.ssh[\\/]|[\\/]\.gnupg[\\/]|[\\/]\.aws[\\/]|\.git-credentials\b)/i,
+    'openssl reading an SSH/cloud private key blocked'],
 
-  // Destructive rm
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(?:\/(?![A-Za-z0-9])|(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/opt|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)\b)/,
-    'Destructive rm on system directory blocked'],
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+~/, 'Destructive rm on home directory blocked'],
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+(\{\}|\$\{?[A-Za-z_])/,
-    'rm -rf with placeholder/variable target blocked'],
-  [/rm\s+-[a-zA-Z]*(?=.*r)(?=.*f)[a-zA-Z]*\s+\/\*/, 'rm -rf /* blocked'],
+  // Persistence / credential WRITES. The redirect-only rc/hook/CI rules above miss
+  // .ssh/authorized_keys, in-place editors, and download-to-file. These close that.
+  // Redirect / tee / append into any persistence or credential target:
+  [new RegExp('(?:>>?|\\btee\\b(?:\\s+-a)?)\\s*[^\\n|;&]*' + PERSIST_TARGETS, 'i'),
+    'Writing to a persistence/credential file blocked -- possible backdoor'],
+  // cp / mv / install specifically INTO an .ssh key file (rc files excluded here:
+  // `cp ~/.bashrc ~/.bashrc.bak` backups are legit and can't be told from writes).
+  [/(?:\bcp\b|\bmv\b|\binstall\b)\s*[^\n|;&]*(?:[\\/]\.ssh[\\/]|\bauthorized_keys\b|\bknown_hosts\b)/i,
+    'Copying a file into ~/.ssh blocked -- possible backdoor'],
+  // in-place editors (`sed -i ~/.bashrc`, `perl -i`). Uses the NO-CI target set --
+  // editing your own repo's CI workflow with `sed -i` is routine (CI files are still
+  // covered for redirect/download-into-place by the rules above/below).
+  [new RegExp('\\b(?:sed|perl)\\b[^|;]*\\s-i\\S*\\s[^|;]*' + PERSIST_TARGETS_NOCI, 'i'),
+    'In-place edit of a persistence/credential file blocked -- possible backdoor'],
+  // download-to-file (`curl -o ~/.ssh/authorized_keys`, `wget -O ~/.bashrc`):
+  [new RegExp('\\b(?:curl|wget)\\b[^|;]*(?:-o|-O|--output(?:-document)?)\\b[^|;]*' + PERSIST_TARGETS, 'i'),
+    'Downloading a file onto a persistence/credential path blocked -- possible backdoor'],
+
+  // Destructive rm -- parsed flag-order-independently with quote stripping, so
+  // `rm -r -f /`, `rm -rf "/"`, `rm -rf --no-preserve-root /`, `rm -r -f ~`, and
+  // /opt-root/traversal all hard-block (deep /opt paths stay allowed).
+  [rmDanger, null],
 
   // SQL destructive
   [/\b(drop|truncate)\s+(database|table|schema)\b/i, 'SQL DROP/TRUNCATE -- destroys data', 'ask'],
@@ -787,7 +994,9 @@ const APPROVE_PATTERNS = [
   /^\s*git\s+(-C\s+\S+\s+)?rebase\s+(?!-i\b)(?!--interactive\b)/,
 
   // Safe system commands
-  /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|find|sort|uniq|tr|cut|paste|tee|xargs|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq|fd|bat|delta|hexdump|xxd|md5sum|sha1sum|sha256sum|sha512sum|cksum|crc32)\b/,
+  // find and xargs are NOT here: they are handled explicitly in checkSegmentApprove
+  // so their executed sub-command is inspected (else `find -exec node x` launders in).
+  /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|sort|uniq|tr|cut|paste|tee|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq|fd|bat|delta|hexdump|xxd|md5sum|sha1sum|sha256sum|sha512sum|cksum|crc32)\b/,
   // Read-only system inspection
   /^\s*(ss|ps|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|env|printenv|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
   // HTTP requests (deny rules cover dangerous flags)
@@ -808,8 +1017,10 @@ const APPROVE_PATTERNS = [
   // Docker (read-only)
   /^\s*docker\s+(ps|images|logs|inspect|stats|top|port|version|info|context\s+(ls|show|inspect)|system\s+(info|df|events)|network\s+(ls|inspect)|volume\s+(ls|inspect)|compose\s+(ps|logs|config|top|images|version|events))\b/,
 
-  // Python
-  /^\s*python[23]?\s/,
+  // Python. Broad `python <anything>` is intentionally NOT auto-approved: a bare
+  // `python script.py` is content-scanned like a shell script (see detectScriptExec)
+  // and `python -c` is gated by deny rules, so both fall through to a prompt when
+  // clean. Only pytest, `python -m <tool>`, and the linters below auto-approve.
   /^\s*pytest\b/,
   /^\s*python[23]?\s+-m\s+(pytest|unittest|black|ruff|mypy|pylint|isort|flake8|coverage|tox|build|venv|pip\s+(list|show|freeze))\b/,
   /^\s*(ruff|black|mypy|pylint|pyright|isort|flake8|bandit|pyflakes|autopep8|yapf|pycodestyle|pydocstyle|pyupgrade)\b/,
@@ -1035,6 +1246,12 @@ function isSafeHeredocInvocation(rawCmd) {
     return false;
   }
 
+  if (interp === 'cat' || interp === 'tee') {
+    const inj = scan.scanInjection(body, { decode: true });
+    const hiInj = inj.find(f => f.severity === 'high');
+    if (hiInj) deny('Prompt injection in heredoc-written content: ' + hiInj.signal, body);
+  }
+
   if (trailing.trim()) {
     const trailingSegs = splitChainSegments(trailing.replace(/\n/g, ' ; '));
     for (const seg of trailingSegs) {
@@ -1062,11 +1279,26 @@ function checkSegmentDeny(seg, depth, mode) {
   const emit = mode === 'ask' ? ask : deny;
   const wants = (sev) => (mode === 'ask' ? sev === 'ask' : sev !== 'ask');
 
+  // Test each rule against the raw segment, its env-stripped form, AND a
+  // de-obfuscated variant (${IFS}/empty-quote collapse), so `cat${IFS}.env` and
+  // `cat .e''nv` can't slip a substring rule. A rule value may be a RegExp or a
+  // predicate function returning a reason string (used by rmDanger).
+  const variants = [seg, stripped];
+  const deobf = normalizeObfuscation(seg);
+  if (deobf !== seg) variants.push(deobf);
+  const deobfStripped = normalizeObfuscation(stripped);
+  if (deobfStripped !== stripped && deobfStripped !== deobf) variants.push(deobfStripped);
+
   // PowerShell + cmd deny patterns are anchored to their own syntax, so they are
   // safe to evaluate on both tools (and catch Windows tools shelled out from bash).
   for (const set of [DENY_PATTERNS, POSH_DENY_PATTERNS, CMD_DENY_PATTERNS]) {
     for (const [pattern, reason, sev] of set) {
-      if (wants(sev) && (pattern.test(seg) || pattern.test(stripped))) emit(reason, seg);
+      if (!wants(sev)) continue;
+      if (typeof pattern === 'function') {
+        for (const v of variants) { const r = pattern(v); if (r) emit(typeof r === 'string' ? r : reason, seg); }
+      } else {
+        for (const v of variants) { if (pattern.test(v)) emit(reason, seg); }
+      }
     }
   }
 
@@ -1116,6 +1348,39 @@ function checkSegmentApprove(seg, depth, isPosh) {
       if (pattern.test(seg)) return true;
     }
     return false;
+  }
+
+  // Pipe: a segment is only safe if EVERY stage is safe. Without this, `echo x |
+  // xargs node` / `find /home | xargs rm -rf` would approve on the first stage
+  // alone. (Deny patterns that span a pipe, e.g. `curl | bash`, already ran.)
+  const stages = splitPipeStages(seg);
+  if (stages.length > 1) {
+    for (const st of stages) if (!checkSegmentApprove(st, depth + 1, false)) return false;
+    return true;
+  }
+
+  // find / xargs: auto-approve only if every executed sub-command also approves.
+  // The deny pass already recurses into these, so a dangerous child is blocked
+  // before we get here; this stops a benign-looking find/xargs from laundering an
+  // un-denied interpreter (`find ... -exec node x +`, `... | xargs node`).
+  if (/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s]*\/)?find\b/.test(seg)) {
+    // find primaries that DELETE or WRITE a file (-delete, -fprintf/-fprint/-fls/
+    // -fprint0) are not auto-approved -- otherwise `find . -fprintf ~/.ssh/authorized_keys
+    // "..."` installs a backdoor with no prompt.
+    if (/\s-(?:delete|fls|fprint(?:f|0)?)\b/.test(seg)) return false;
+    const execCmds = parseFindExec(seg);
+    if (/\s-(?:exec|execdir|ok|okdir)\b/.test(seg) && !execCmds) return false;  // exec present but unparseable
+    for (const c of (execCmds || [])) {
+      for (const inner of splitChainSegments(c)) if (!checkSegmentApprove(inner, depth + 1, false)) return false;
+    }
+    return true;
+  }
+  if (/^\s*(?:[A-Za-z_]\w*=\S*\s+)*xargs\b/.test(seg)) {
+    const xargsCmd = parseXargs(seg);
+    if (xargsCmd) {
+      for (const inner of splitChainSegments(xargsCmd)) if (!checkSegmentApprove(inner, depth + 1, false)) return false;
+    }
+    return true;
   }
 
   const shellC = parseShellCInvocation(seg);
@@ -1221,6 +1486,10 @@ function detectScriptExec(seg, isPosh) {
   // interpreter + bare script (not a flag, not a redirect/pipe operator)
   m = s.match(new RegExp('^' + SH + '\\s+' + FLAGS + "([^\\s'\"<>|&-][^\\s'\"<>|&]*)"));
   if (m) return { kind: 'exec', token: m[1] };
+  // NOTE: python/ruby/node/perl scripts are deliberately NOT routed here. scanShell
+  // is shell-oriented and false-positives on legit interpreted code (dynamic-eval
+  // idioms in JS, large bundles), so we only remove those interpreters from blanket
+  // AUTO-APPROVE (they fall through to a normal prompt) rather than scan-and-ask them.
   // ./script
   m = s.match(/^(['"]?)(\.\/[^\s'"]+)\1/);
   if (m) return { kind: 'exec', token: m[2] };
@@ -1290,18 +1559,42 @@ function checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs) {
   const r = readBoundedForScan(abs);
   if (!r) { audit('fallthrough', 'script-unreadable:' + abs, seg); return; }
   const findings = scan.scanShell(r.buf.toString('utf8'), { decode: true });
+  // Only auto-approve a clean/trusted script when it is the WHOLE segment. If the
+  // segment pipes into more stages (`. ./ok.sh | node evil.js`), don't add it to
+  // approvedScriptSegs -- otherwise the main-loop short-circuit would skip
+  // checkSegmentApprove and the piped interpreter stage would never be checked.
+  const singleStage = splitPipeStages(seg).length === 1;
+  const approve = () => { if (singleStage) approvedScriptSegs.add(seg); };
   if (!scan.hasHigh(findings) && !r.truncated) {
-    if (shape.kind === 'source') approvedScriptSegs.add(seg);
+    if (shape.kind === 'source') approve();
     return;
   }
   const hash = trust.sha256OfScan(r.buf, r.size);
-  if (trust.isTrusted(hash)) { approvedScriptSegs.add(seg); return; }
+  if (trust.isTrusted(hash)) { approve(); return; }
   const toolName = isPosh ? 'PowerShell' : 'Bash';
   if (trust.commandAllowed(seg, cwd, toolName) || trust.commandAllowed(rawCmd, cwd, toolName)) {
-    approvedScriptSegs.add(seg);
+    approve();
     return;
   }
   flagRisk(buildRiskReason(abs, shape.token, findings, r.truncated, __dirname), seg);
+}
+
+// Injection scan for content written through the shell (`echo/printf ... > file`).
+// The Write/Edit tools get this scan in check-sensitive-files; the shell redirect
+// path did not, so identical payloads slipped through. Extraction is approximate
+// (content is whatever sits between echo/printf and the redirect operator); binary
+// targets are skipped. Deny is hard on a high-severity injection finding.
+function scanShellRedirectInjection(seg) {
+  // No end-anchor and the target class stops at |/&/</> so a trailing `| cat`,
+  // `&`, or `#comment` after the redirect can't hide the write from the scan.
+  const m = seg.match(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:echo|printf)\s+([\s\S]*?)\s*>>?\s*([^\s|;&<>]+)/i);
+  if (!m) return;
+  const target = m[2];
+  if (/\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|bz2|xz|7z|tar|wasm|exe|dll|so|dylib|bin|woff2?|ttf|otf)$/i.test(target)) return;
+  const content = m[1].replace(/^(['"])([\s\S]*)\1$/, '$2');   // unwrap one outer quote
+  const inj = scan.scanInjection(content, { decode: true });
+  const hi = inj.find(f => f.severity === 'high');
+  if (hi) deny('Prompt injection in shell-redirected content: ' + hi.signal, seg);
 }
 
 let data = '';
@@ -1346,6 +1639,16 @@ process.stdin.on('end', () => {
 
   for (const seg of segments) {
     checkSegmentDeny(seg, 0, 'hard');
+  }
+
+  // Injection scan for shell-redirected writes (bash-only), per pipe stage so a
+  // later-stage `echo … > f` (or a trailing `| cat`) is still seen. deny()+exit on a hit.
+  if (!isPosh) {
+    for (const seg of segments) {
+      for (const stage of splitPipeStages(seg)) {
+        try { scanShellRedirectInjection(stage); } catch (err) { audit('fallthrough', 'redirect-scan-threw: ' + (err && err.message), stage); }
+      }
+    }
   }
 
   // Script-content pass: deny rules already ran on every segment, so a trusted

@@ -222,7 +222,11 @@ const OVERRIDE_RE = /\b(?:ignore|disregard|forget|discard|cancel)\s+(?:all\s+|th
 const EXFIL_TARGET_RE = /(?:~\/?\.ssh|id_rsa|id_ed25519|\.env\b|\bcredentials?\b|mcp\.json|~\/?\.aws|\.git-credentials|private[_-]?key)/i;
 
 const MCP_IMPORTANT_RE = /<IMPORTANT>[\s\S]{0,400}(?:do\s+not\s+(?:mention|tell|reveal)|read\s|send\s|curl|wget|execute|\.env\b|credentials?|~\/?\.)/i;
-const HTML_COMMENT_ACTION_RE = /<!--[\s\S]{0,400}(?:curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|token|webhook|http)[\s\S]{0,400}-->/i;
+// Tempered `(?:(?!-->)[\s\S])` runs so the body can't cross a `-->`: the keyword must
+// live inside ONE comment. Stops a decorative divider from pairing with a keyword in
+// unrelated content (or a separate comment) up to 400 chars away, while every real
+// single-comment payload still fires. Bounded {0,400} both sides -> no runaway backtrack.
+const HTML_COMMENT_ACTION_RE = /<!--(?:(?!-->)[\s\S]){0,400}(?:curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|token|webhook|http)(?:(?!-->)[\s\S]){0,400}-->/i;
 
 // Confusable Cyrillic/Greek letters that spoof ASCII Latin, mapped to the letter they
 // imitate. Single source of truth: CONFUSABLE (for the mixed-script detector) is
