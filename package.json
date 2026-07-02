@@ -1,6 +1,6 @@
 {
   "name": "shellter",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Claude Code security hooks that shelter you from dangerous shell commands. Bash, PowerShell, and cmd, on Linux, macOS, and Windows.",
   "license": "MIT",
   "author": "scr1p7k177y <scriptkitty@walang.studio>",
