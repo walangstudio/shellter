@@ -4,6 +4,8 @@
       "Read(*)",
       "Edit(*)",
       "Write(*)",
+      "MultiEdit(*)",
+      "NotebookEdit(*)",
       "Glob(*)",
       "Grep(*)"
     ]
@@ -39,6 +41,24 @@
       },
       {
         "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node __HOME__/.claude/hooks/check-sensitive-files.js"
+          }
+        ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node __HOME__/.claude/hooks/check-sensitive-files.js"
+          }
+        ]
+      },
+      {
+        "matcher": "NotebookEdit",
         "hooks": [
           {
             "type": "command",

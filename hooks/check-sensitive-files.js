@@ -188,12 +188,24 @@ process.stdin.on('end', () => {
 
   const tool = input?.tool_name || '';
 
-  // ---- content checks for Write / Edit ----
-  if (tool === 'Write' || tool === 'Edit') {
-    const content = tool === 'Write'
-      ? (input?.tool_input?.content || '')
-      : (input?.tool_input?.new_string || '');
-    const filePath = input?.tool_input?.file_path || '';
+  // ---- content checks for Write / Edit / MultiEdit / NotebookEdit ----
+  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+    let content = '';
+    if (tool === 'Write') content = input?.tool_input?.content || '';
+    else if (tool === 'Edit') content = input?.tool_input?.new_string || '';
+    else if (tool === 'NotebookEdit') content = input?.tool_input?.new_source || '';
+    else if (tool === 'MultiEdit') {
+      const edits = input?.tool_input?.edits;
+      content = Array.isArray(edits) ? edits.map(e => (e && e.new_string) || '').join('\n') : '';
+    }
+    const filePath = tool === 'NotebookEdit'
+      ? (input?.tool_input?.notebook_path || input?.tool_input?.file_path || '')
+      : (input?.tool_input?.file_path || '');
+
+    // NOTE: the full content is scanned (no size cap). Truncating before the scan
+    // would let a payload past the cutoff land on disk unscanned; the inline regex
+    // checks are linear and decodeOneLayer is already token-bounded, so a large
+    // write costs some CPU but never creates a blind spot.
 
     if (content) {
       const { clean, danger, zwCount } = stripInvisibles(content);
@@ -259,7 +271,11 @@ process.stdin.on('end', () => {
     case 'Read':
     case 'Edit':
     case 'Write':
+    case 'MultiEdit':
       filePath = input?.tool_input?.file_path || '';
+      break;
+    case 'NotebookEdit':
+      filePath = input?.tool_input?.notebook_path || input?.tool_input?.file_path || '';
       break;
     case 'Glob': {
       const pattern = input?.tool_input?.pattern || '';
