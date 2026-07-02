@@ -122,8 +122,10 @@ function claudeAllowRules(cwd, toolName) {
   const rules = [];
   let dir = cwd ? path.resolve(cwd) : process.cwd();
   for (let i = 0; i < 40; i++) {
+    // Only settings.local.json (gitignored, user-authored) is honored for
+    // script-flag suppression -- NOT the committed project settings.json, which a
+    // cloned malicious repo controls and could use to whitelist its own payload.
     collectAllow(path.join(dir, '.claude', 'settings.local.json'), toolName, rules);
-    collectAllow(path.join(dir, '.claude', 'settings.json'), toolName, rules);
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;

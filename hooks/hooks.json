@@ -12,7 +12,7 @@
         ]
       },
       {
-        "matcher": "Read|Edit|Write|Glob|Grep",
+        "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
         "hooks": [
           {
             "type": "command",
