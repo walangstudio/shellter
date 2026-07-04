@@ -83,36 +83,18 @@ function stripInvisibles(s) {
 
 const SOURCE_LIKE_EXT = /\.(js|ts|jsx|tsx|mjs|cjs|py|rs|go|rb|java|c|cc|cpp|h|hpp|kt|swift|sh|bash|zsh|json|yaml|yml|toml|ini|html|svelte|vue|css|scss|less|sql|php|pl|lua|nim|zig)$/i;
 
-// Prompt-injection: instruction override / role hijack phrasing.
-const INJECTION_PATTERNS = [
-  [/ignore\s+(all\s+)?previous\s+instructions/i, 'instruction-override phrase'],
-  [/forget\s+(all\s+)?your\s+(previous\s+)?instructions/i, 'instruction-override phrase'],
-  [/disregard\s+(all\s+)?(previous\s+|prior\s+)?(commands|rules|guidelines|instructions)/i, 'instruction-override phrase'],
-  [/ignore\s+(everything|all)\s+(above|before)/i, 'instruction-override phrase'],
-  [/override\s+system\s+prompt/i, 'instruction-override phrase'],
-  [/new\s+system\s+prompt/i, 'instruction-override phrase'],
-  [/\bSTOP\.\s+New\s+instruction/i, 'instruction-override phrase'],
-
-  // Role hijacking
-  [/act\s+as\s+if\s+you\s+are/i, 'role-hijack phrase'],
-  [/you\s+are\s+now\s+a/i, 'role-hijack phrase'],
-  [/pretend\s+(that\s+)?you\s+(are|'re)/i, 'role-hijack phrase'],
-  [/assume\s+the\s+role\s+of/i, 'role-hijack phrase'],
-  [/from\s+now\s+on,?\s+you\s+(are|will|must)/i, 'role-hijack phrase'],
-
-  // Jailbreak / mode-switch
-  [/you\s+have\s+been\s+(jailbroken|liberated|freed)/i, 'jailbreak phrase'],
-  [/developer\s+mode\s+(on|enabled|activated)/i, 'jailbreak phrase'],
-  [/\bDAN\s+mode|do\s+anything\s+now/i, 'jailbreak phrase'],
-
-  // Role tags (chat templates)
-  [/\[SYSTEM\]|\[\/?INST\]|\[ASSISTANT\]/i, 'role-tag injection'],
-  [/<\|im_(start|end)\|>|<\|system\|>|<\|user\|>|<\|assistant\|>/i, 'role-tag injection'],
-  [/<\/?(system|instructions?)>/i, 'role-tag injection'],
-  [/###\s*(system|instruction|new\s+instruction)\s*##/i, 'role-tag injection'],
-];
-
-const HTML_INJECTION_PATTERN = /<!--\s*(system|instruction|prompt|ignore|override|you\s+are|act\s+as)/i;
+// `scan.isAgentInstructionFile(path)` (shared, defined in scan-content.js) flags files an
+// agent auto-ingests as instructions -- an injected payload written there can hijack a
+// later agent turn, so a Class-B injection signal is hard-denied ONLY for those targets.
+// Anywhere else those signals are advisory: a security write-up, a chatbot system-prompt
+// string, or an example conversation is legitimate content, so shellter does not block it.
+//
+// Instruction-override / role-hijack PHRASE matching lives in scan-content.js
+// (`scanInjection`) -- severity-tiered (Class A always-deny vs Class B destination-gated)
+// and exfil-aware. The older flat INJECTION_PATTERNS + HTML-comment list was retired
+// here: it hard-denied any file containing "you are now a", "act as if", "<system>",
+// "[SYSTEM]", a `User:`/`Assistant:` transcript, or "<!-- ... http ... -->", which blocks
+// ordinary docs, tests, and AI-app source. The disciplined scanner below replaces it.
 const ENCODED_EVAL_PATTERN = /(eval|exec)\s*\(\s*(base64|atob|Buffer\.from)\s*\(/i;
 
 // Fake tool-call injection (attacker-controlled file pretending to be an
@@ -135,12 +117,21 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(curl|wget|bash|sh|nc|python|perl|ruby)\b/i
 // `.env` excludes the placeholder templates (.env.example/.sample/.template/.dist/
 // .defaults) -- they hold no real secrets and copying/reading them is routine.
 // .env.local / .env.production etc. still match (those carry real values).
-const SENSITIVE_EXTENSIONS = /\.(?:env(?!\.(?:example|sample|template|dist|defaults?)\b)|pem|key|crt|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
+// `.crt` dropped: an X.509 certificate is public by definition, so reading one is not a
+// secret access. Private-key extensions (.pem/.key/.p12/...) stay.
+const SENSITIVE_EXTENSIONS = /\.(?:env(?!\.(?:example|sample|template|dist|defaults?)\b)|pem|key|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
 // .gitconfig deliberately excluded: tokens normally live in .git-credentials.
 const SENSITIVE_FILES = /(^|\/)(\.git-credentials|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
 const ENV_FILE = /(^|\/)\.env(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
 const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
+// A source-code file inside a dir named credentials/secrets is code, not a secret
+// (`src/credentials/oauth.ts`), so it is exempt from the SECRETS_DIR match. Data files
+// (.json/.yaml/.env/...) inside such a dir stay flagged.
+// Source-code extensions ONLY -- deliberately excludes doc/text/data extensions (.md/.txt/
+// .rst/.json/.yaml), since a `secrets/master.txt` or `credentials/prod.json` is plausibly
+// real secret material, not code.
+const CODE_FILE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|kt|kts|swift|scala|clj|ex|exs|css|scss|less|vue|svelte|html)$/i;
 const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
 
 // Wallet / crypto / browser cookie files.
@@ -148,18 +139,25 @@ const WALLET_PATTERN = /\b(wallet\.dat|keystore\.json|UTC--\d{4}-\d{2}-\d{2}T)\b
 const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|google-chrome|mozilla)[^\/]*\/.*\/(Cookies|Cookies-journal|Login Data|Web Data)$/;
 // macOS Keychain databases.
 const MACOS_KEYCHAIN = /(^|\/)(Library\/Keychains\/|login\.keychain(-db)?$|System\.keychain$)/i;
-// Windows credential / hive files (paths use forward or back slashes here).
-const WINDOWS_SECRETS = /(^|[\/\\])(NTUSER\.DAT|SAM|SYSTEM|SECURITY)$|AppData[\/\\]Roaming[\/\\]Microsoft[\/\\](Credentials|Vault|Protect)([\/\\]|$)/i;
+// Windows credential / hive files. The bare hive names (SAM/SYSTEM/SECURITY) require a
+// registry `config\` path context so a repo file named `SECURITY` or a module `SYSTEM`
+// is not flagged; NTUSER.DAT and the AppData credential stores stay matched anywhere.
+const WINDOWS_SECRETS = /(^|[\/\\])NTUSER\.DAT$|[\/\\]config[\/\\](SAM|SYSTEM|SECURITY|SOFTWARE|DEFAULT)$|AppData[\/\\]Roaming[\/\\]Microsoft[\/\\](Credentials|Vault|Protect)([\/\\]|$)/i;
 
-// Grep patterns that try to extract secret values rather than do structural search.
+// Concrete secret-token SHAPES -- blocked on any path (grepping for a live key value is
+// harvesting regardless of where you look).
 const GREP_SECRET_EXTRACTION = [
-  /(password|secret|api.?key|token|credential|private.?key)\s*[:=]\s*[^${\s]/i,
   /AKIA[0-9A-Z]{16}/,
   /gh[pousr]_[A-Za-z0-9_]{36,}/,
   /xox[bpoa]-[\w-]+/,
   /eyJ[A-Za-z0-9_-]{10,}\.eyJ/,
   /[Bb]earer\s+[A-Za-z0-9_\-\.]{20,}/,
 ];
+// A `keyword = value` extraction (searching for a plaintext credential assignment). This is
+// a routine self-audit inside your own repo, so it is denied ONLY when the search path is a
+// broad off-project location (a home/system root) -- i.e. mass credential harvesting.
+const GREP_KEYWORD_EXTRACTION = /(password|secret|api.?key|token|credential|private.?key)\s*[:=]\s*[^${\s]/i;
+const BROAD_SEARCH_PATH = /^(?:~|\/(?:home|Users|etc|root|var|opt|usr|private|srv|mnt|mount)\b|\/$|[A-Za-z]:[\\\/]Users\b)/i;
 
 function pathMatchesAnySensitive(p) {
   if (!p) return null;
@@ -167,7 +165,7 @@ function pathMatchesAnySensitive(p) {
   if (SENSITIVE_DIRS.test(p)) return 'sensitive directory/file';
   if (SENSITIVE_FILES.test(p)) return 'sensitive credential file';
   if (ENV_FILE.test(p)) return '.env file';
-  if (SECRETS_DIR.test(p)) return 'secrets/credentials directory';
+  if (SECRETS_DIR.test(p) && !CODE_FILE_EXT.test(p)) return 'secrets/credentials directory';
   if (WALLET_PATTERN.test(p)) return 'wallet / crypto key file';
   if (BROWSER_DATA_PATTERN.test(p)) return 'browser cookie/login database';
   if (MACOS_KEYCHAIN.test(p)) return 'macOS Keychain database';
@@ -221,18 +219,12 @@ process.stdin.on('end', () => {
         }
       }
 
-      for (const [pattern, label] of INJECTION_PATTERNS) {
-        if (pattern.test(flat)) {
-          deny('Prompt injection detected: ' + label, filePath);
-        }
-      }
+      const instructionSurface = scan.isAgentInstructionFile(filePath);
 
-      if (HTML_INJECTION_PATTERN.test(flat)) {
-        deny('Possible prompt injection in HTML comment', filePath);
-      }
-
-      if (TOOL_CALL_INJECTION_PATTERN.test(flat)) {
-        deny('Fake tool-call tag in written content blocked', filePath);
+      // A fake tool-call tag is legitimate content when documenting an agent framework,
+      // so it hard-denies only when written to a file an agent auto-ingests.
+      if (TOOL_CALL_INJECTION_PATTERN.test(flat) && instructionSurface) {
+        deny('Fake tool-call tag written to an agent-instruction file blocked', filePath);
       }
 
       if (ENCODED_EVAL_PATTERN.test(flat)) {
@@ -251,14 +243,22 @@ process.stdin.on('end', () => {
         deny('Shell command substitution in data file blocked', filePath);
       }
 
-      // 2025-2026 techniques the inline patterns above don't cover: variation-
-      // selector smuggling, homoglyph/mixed-script, broadened role markers,
-      // Policy-Puppetry, MCP tool-poisoning, override+exfil, decode-one-layer.
+      // Disciplined injection scan (variation-selector smuggling, homoglyph, role
+      // markers, Policy-Puppetry, MCP tool-poisoning, override+exfil, decode-one-layer).
+      // Class A (HIGH) always denies. Class B (MEDIUM injection: bare override phrase,
+      // role marker, fake transcript, HTML-comment action) denies only on an
+      // agent-instruction surface -- elsewhere it is legitimate authored content.
       if (!isBinary) {
         const inj = scan.scanInjection(content, { decode: true });
         const hi = inj.find(f => f.severity === 'high');
         if (hi) {
           deny('Prompt injection detected: ' + hi.signal + (hi.line ? ' (line ' + hi.line + ')' : ''), filePath);
+        }
+        if (instructionSurface) {
+          const med = inj.find(f => f.severity === 'medium' && f.category === 'injection');
+          if (med) {
+            deny('Prompt injection in agent-instruction file: ' + med.signal + (med.line ? ' (line ' + med.line + ')' : ''), filePath);
+          }
         }
       }
     }
@@ -290,6 +290,11 @@ process.stdin.on('end', () => {
         if (re.test(searchPattern)) {
           deny('Searching for secret values / token shapes blocked', searchPattern);
         }
+      }
+      // keyword=value harvesting across a broad off-project path (a self-audit in your own
+      // repo, i.e. a relative path, stays allowed).
+      if (BROAD_SEARCH_PATH.test(filePath) && GREP_KEYWORD_EXTRACTION.test(searchPattern)) {
+        deny('Searching for plaintext credentials across a home/system path blocked', searchPattern);
       }
       break;
     }

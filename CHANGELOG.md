@@ -7,6 +7,68 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.7.0] - 2026-07-04
+
+False-positive reduction + correctness hardening. Every prior audit pushed one direction —
+block more — so nobody had checked whether the hooks now over-block safe work. They did. This
+release makes shellter allow safe commands, `ask` on the genuinely fuzzy, and hard-`deny` only
+real threats, while closing several silent-approve / fallthrough bypasses the review surfaced.
+Suite 453 → 549 passing (benign-twin tests for every FP fix, attack-shape tests for every new
+deny). All decisions verified against the live hooks, and a high-effort multi-agent code review
+of the diff caught ten over-broad-exemption / regression defects that are fixed and regression-
+tested (firewall read-flag case, pip `.git` archive URL, `bash -m` download-exec, quoted-redirect
+gate bypass, dropped jailbreak-phrase family, case-insensitive socat, secrets-dir `.txt`, broad
+credential-grep, parted read subcommands, dd Windows-file path).
+
+Injection-on-write (WS1). `check-sensitive-files.js` ran a crude context-free pattern set AND
+the disciplined `scanInjection`, both hard-denying — so writing a security write-up, a test
+fixture, a chatbot system-prompt string, a `User:`/`Assistant:` transcript, `<system>` markup,
+an INI `[system]` section, or `<!-- see http://… -->` was blocked. The crude set is retired.
+`scanInjection` signals are now split: Class A (override **with** an exfil target, MCP tool-
+poisoning, policy-puppetry, tag/bidi/variation-selector Unicode smuggling) still denies
+everywhere; Class B (a bare override phrase, a role marker, a fake transcript, a lone HTML-
+comment action) denies **only** when the write target is an agent-instruction file an agent
+auto-ingests (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.mcp.json`, `.claude/**`, …). The same
+gate is applied to the shell-redirect and heredoc write paths. `isAgentInstructionFile` is a
+single shared export in `scan-content.js`.
+
+PowerShell rules no longer fire on Bash (WS2). `grep -w hidden` (matched the `-WindowStyle
+hidden` rule) and Elixir `iex "…"` (matched the `Invoke-Expression` rule) are fixed by anchoring
+those two patterns to a real PowerShell context. The cross-platform secret-exfil rules
+(`cp`/`tar`/`python` + secret) and the cmd.exe LOLBin rules still run on both tools, so Windows
+coverage is unchanged.
+
+Shell-idiom false positives (WS3), narrowed or moved to `ask`: `eval "$(ssh-agent)"` / `direnv`
+/ `pyenv` / `starship` init idioms (generic eval → ask; eval of decoded/downloaded content still
+denies); `source <(kubectl completion bash)`; appending to / `sed -i` your own `~/.bashrc` (→
+ask; `~/.ssh/authorized_keys`, git hooks, CI configs still hard-deny); `LD_LIBRARY_PATH=` (→ ask;
+`LD_PRELOAD` still denies); read-only `crontab -l` / `iptables -L` / `parted -l`; `pip/npm install`
+from a VCS URL (`git+https`, `github.com`, `*.git`); `curl … | python -m json.tool`; `python -c`
+touching network/`subprocess`/`os.remove` (→ ask; `os.system`/`socket`/`eval(` still deny);
+`dd of=<local file>` (→ ask; `dd of=/dev/…` still denies); and a pager pipeline in
+`git config core.pager` (a lone `|` no longer reads as RCE; `$(…)`/`sh -c` still deny).
+
+Secret-token / sensitive-path over-breadth (WS4): `.crt` dropped (an X.509 cert is public);
+a source file inside a `credentials/` or `secrets/` directory is treated as code, not a secret;
+the Windows hive names `SAM`/`SYSTEM`/`SECURITY` require a registry `config\` path context, so a
+repo file named `SECURITY` is no longer flagged; a `grep "api_key="` self-audit is allowed (only
+concrete token shapes — AKIA/`ghp_`/JWT/Bearer — are blocked); `git push` to a feature branch
+that merely contains `main`/`master` is not treated as a push to trunk; and `DROP TABLE` in a git
+commit message is no longer flagged (a SQL client is now required).
+
+Correctness / bypass hardening (WS5), new hard denies for shapes that previously auto-approved or
+fell through: the eval-launder that reduced the flagship `rm` guard to a silent allow
+(`command eval "rm -rf /"`, `timeout 5 eval …`) is closed by recursing the deny pass into an
+`eval` literal; `chmod` world-writable modes (`777`/`o+w`); `curl -d "$(env)"` / a secret-env-var
+POST to a URL; `php -r` fsockopen/exec, `socat EXEC:`, and `nc -c` reverse shells the `-e` rule
+missed; classic fork bombs (`:(){ :|:& };:`); shell-history tampering (→ ask); and a `rm -rf`
+split across a backslash-newline continuation (now joined before matching).
+
+Accepted limits (documented, not coded — high FP cost or high complexity): cross-segment
+`VAR=value; … $VAR` resolution, non-shell interpreter one-liners with a non-secret destructive
+payload (`node -e "…rm -rf…"`), a public `.pem`/`.key` still reading as a secret, and double
+base64/hex decoding. See `SECURITY-REVIEW.md`.
+
 ## [0.6.0] - 2026-07-02
 
 Security-review hardening. A full-project audit (manual + multi-agent) found and a
