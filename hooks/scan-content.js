@@ -219,6 +219,10 @@ const POLICY_PUPPETRY = [
 // Override-phrase family. Built with \s+ so the source isn't itself a clean
 // override sentence.
 const OVERRIDE_RE = /\b(?:ignore|disregard|forget|discard|cancel)\s+(?:all\s+|the\s+|any\s+|your\s+)?(?:previous|prior|earlier|above|current|the\s+system)\s+(?:instructions?|prompts?|rules?|commands?|guidelines?)\b|\bstop\s+following\s+(?:your\s+|the\s+)?(?:instructions?|rules?)\b|\byou\s+are\s+now\s+(?:a|an|the|in)\b|\bnew\s+(?:instructions?|system\s+prompt)\b/i;
+// Jailbreak / role-hijack phrase family. Class B (destination-gated): legitimate in security
+// write-ups and prompt datasets, but on an agent-instruction file it is a hijack. Built with
+// \s+ so this source file is not itself a clean instance.
+const ROLE_HIJACK_RE = /\byou\s+have\s+been\s+(?:jailbroken|liberated|freed)\b|\bdeveloper\s+mode\s+(?:on|enabled|activated)\b|\bDAN\s+mode\b|\bdo\s+anything\s+now\b|\bact\s+as\s+if\s+you\s+(?:are|were)\b|\bpretend\s+(?:that\s+)?you\s+(?:are|'re)\b|\bassume\s+the\s+role\s+of\b|\bfrom\s+now\s+on,?\s+you\s+(?:are|will|must)\b|\boverride\s+(?:the\s+)?system\s+prompt\b/i;
 const EXFIL_TARGET_RE = /(?:~\/?\.ssh|id_rsa|id_ed25519|\.env\b|\bcredentials?\b|mcp\.json|~\/?\.aws|\.git-credentials|private[_-]?key)/i;
 
 const MCP_IMPORTANT_RE = /<IMPORTANT>[\s\S]{0,400}(?:do\s+not\s+(?:mention|tell|reveal)|read\s|send\s|curl|wget|execute|\.env\b|credentials?|~\/?\.)/i;
@@ -319,7 +323,19 @@ function scanInjectionText(findings, text, decodedLayer) {
   if (counts.variationSelector > 0) pushFinding(findings, text, 0, 'unicode', 'variation-selector-smuggling', SEVERITY.HIGH);
   if (counts.zeroWidth > 0) pushFinding(findings, text, 0, 'unicode', 'zero-width-chars', SEVERITY.MEDIUM);
 
-  for (const [re, sig] of ROLE_MARKERS) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.HIGH); }
+  // Severity policy (drives the caller's deny decision):
+  //   HIGH  = Class A -- (near-)never legitimate in authored content; always denied.
+  //           tag/bidi/variation-selector smuggling, policy-puppetry, MCP tool-poisoning,
+  //           and an override phrase co-located with an exfil target.
+  //   MEDIUM = Class B -- legitimately appears in docs, tests, prompt datasets, and
+  //           AI-app source (role markers, a bare override phrase, a Q&A transcript, an
+  //           HTML-comment action, a homoglyph token). The caller hard-denies these ONLY
+  //           when the write target is an agent-instruction file that an agent auto-ingests
+  //           (CLAUDE.md, AGENTS.md, .cursorrules, .mcp.json, ...); elsewhere they fall
+  //           through. This is what stops shellter blocking a security write-up, a chatbot
+  //           system-prompt string, or an example conversation.
+  // Role markers (chatml/llama/`<system>`/`BEGIN SYSTEM PROMPT`) -> Class B.
+  for (const [re, sig] of ROLE_MARKERS) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.MEDIUM); }
   for (const [re, sig] of POLICY_PUPPETRY) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.HIGH); }
 
   // Override phrases are matched on confusable-folded text so a phrase spoofed with
@@ -334,11 +350,24 @@ function scanInjectionText(findings, text, decodedLayer) {
   if (ov) {
     const window = folded.slice(Math.max(0, ov.index - 200), ov.index + 200);
     const withExfil = EXFIL_TARGET_RE.test(window);
-    pushFinding(findings, folded, ov.index, 'injection', withExfil ? 'override-with-exfil-target' : 'instruction-override', SEVERITY.HIGH);
+    // With an exfil target nearby -> Class A (real attack). A bare override phrase (a
+    // security doc, a test fixture, a chatbot prompt string) -> Class B.
+    pushFinding(findings, folded, ov.index, 'injection', withExfil ? 'override-with-exfil-target' : 'instruction-override', withExfil ? SEVERITY.HIGH : SEVERITY.MEDIUM);
   }
 
+  // Jailbreak / role-hijack phrases -> Class B (MEDIUM): denied only on an agent-instruction file.
+  const rh = ROLE_HIJACK_RE.exec(clean);
+  if (rh) pushFinding(findings, clean, rh.index, 'injection', 'role-hijack', SEVERITY.MEDIUM);
+
   const mi = MCP_IMPORTANT_RE.exec(clean); if (mi) pushFinding(findings, clean, mi.index, 'injection', 'mcp-tool-poisoning', SEVERITY.HIGH);
-  const hc = HTML_COMMENT_ACTION_RE.exec(clean); if (hc) pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', SEVERITY.HIGH);
+  const hc = HTML_COMMENT_ACTION_RE.exec(clean);
+  if (hc) {
+    // HIGH only when the comment also names an exfil/secret target -- a real data-theft
+    // payload (`<!-- curl ...~/.ssh/id_rsa... -->`). A lone keyword (`<!-- see http://... -->`,
+    // `<!-- auth token handling -->`) is Class B and destination-gated by the caller.
+    const hcHigh = EXFIL_TARGET_RE.test(hc[0]);
+    pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', hcHigh ? SEVERITY.HIGH : SEVERITY.MEDIUM);
+  }
 
   // Homoglyph mixed-script is the one display-spoof matcher that fires on the random
   // bytes of a decoded ordinary identifier/hash (the reported false positive), because
@@ -349,7 +378,7 @@ function scanInjectionText(findings, text, decodedLayer) {
   // is). We do not gate on a "looks like garbage" property of the decoded bytes: that
   // signal is attacker-controllable and would be an evadable suppression.
   if (!decodedLayer) {
-    const hg = HOMOGLYPH_TOKEN_RE.exec(clean); if (hg) pushFinding(findings, clean, hg.index, 'injection', 'homoglyph-mixed-script', SEVERITY.HIGH);
+    const hg = HOMOGLYPH_TOKEN_RE.exec(clean); if (hg) pushFinding(findings, clean, hg.index, 'injection', 'homoglyph-mixed-script', SEVERITY.MEDIUM);
   }
 
   // Fake transcript: only flag when >=2 distinct role labels appear at line start.
@@ -359,7 +388,7 @@ function scanInjectionText(findings, text, decodedLayer) {
   let rm; ROLE_LINE_RE.lastIndex = 0;
   let firstIdx = -1;
   while ((rm = ROLE_LINE_RE.exec(clean))) { seen.add(rm[1].toLowerCase()); if (firstIdx < 0) firstIdx = rm.index; }
-  if (seen.size >= 2) pushFinding(findings, clean, firstIdx, 'injection', 'fake-transcript-role-labels', SEVERITY.HIGH);
+  if (seen.size >= 2) pushFinding(findings, clean, firstIdx, 'injection', 'fake-transcript-role-labels', SEVERITY.MEDIUM);
 }
 
 function scanInjection(text, opts) {
@@ -378,6 +407,13 @@ function scanInjection(text, opts) {
   return findings;
 }
 
+// Files an agent auto-ingests as instructions. A Class-B (MEDIUM) injection signal is
+// hard-denied only when written to one of these; elsewhere it is legitimate authored
+// content. Single source of truth, shared by check-sensitive-files.js (Write/Edit) and
+// check-bash.js (shell redirect / heredoc write).
+const AGENT_INSTRUCTION_FILE = /(^|[\/\\])(CLAUDE(\.local)?\.md|AGENTS?\.md|GEMINI\.md|\.cursorrules|\.clinerules|\.windsurfrules|\.aider\.conf\.yml|copilot-instructions\.md|\.?mcp\.json)$|(^|[\/\\])\.claude[\/\\]/i;
+function isAgentInstructionFile(p) { return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p); }
+
 function hasHigh(findings) { return findings.some(f => f.severity === SEVERITY.HIGH); }
 function highest(findings) {
   let best = null;
@@ -387,5 +423,5 @@ function highest(findings) {
 
 module.exports = {
   SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
-  scanShell, scanInjection, hasHigh, highest,
+  scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile,
 };

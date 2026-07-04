@@ -19,6 +19,34 @@ the live hook (deny/ask fires, benign twin still approves). See the CHANGELOG
 drift) are documentation items; D5 is fixed, D4 is a documented, accepted limit.
 The sections below are the original audit, retained as the record of what was found.
 
+## Second-axis review — false positives + residual bypasses (v0.7.0, 2026-07-04)
+
+Every audit up to v0.6.0 pushed one direction: block more. This pass checked the opposite
+axis — is shellter now over-blocking safe commands? — and the low-risk correctness gaps that
+axis surfaced. All findings verified against the live hooks; fixes shipped in v0.7.0 with
+benign-twin + attack-shape regression tests (suite 526 passing). See the CHANGELOG `[0.7.0]`
+entry for the per-workstream summary. The big FP class was injection-on-write hard-denying
+ordinary content (security docs, test fixtures, chatbot prompts, transcripts, `<system>`
+markup) — now gated to agent-instruction files or exfil-carrying payloads.
+
+### Accepted limits (known, deliberately not fixed)
+
+These were considered and left as documented gaps because the fix would either reintroduce
+false positives or add fragile complexity out of proportion to the risk:
+
+- **Cross-segment variable indirection** — `X=.env; cat $X` and `X=rm; $X -rf /` still evade
+  the path/command matchers. A taint pre-pass that resolves `VAR=literal` into later `$VAR`
+  uses would close it but risks new FPs on ordinary variable use.
+- **Non-shell interpreter one-liners with a non-secret destructive payload** —
+  `node -e "require('child_process').execSync('rm -rf /')"`, `perl -e 'system("…")'`. Scanning
+  arbitrary JS/Perl/Ruby for destruction false-positives on legit code (dynamic-eval idioms,
+  bundles); these interpreters are removed from blanket auto-approve (→ prompt) instead.
+- **Public `.pem` / `.key` still read as a secret** — a private key and a public cert chain
+  share the extension, so reading `fullchain.pem` is still denied. `.crt` (unambiguously public)
+  was dropped; `.pem`/`.key` stay conservative to avoid missing a private key.
+- **Double base64 / hex decoding (D4)** — the content scanner decodes one layer; a payload
+  encoded twice evades the decoded-layer scan.
+
 ## Read the verdict labels precisely
 
 shellter is deny → script-scan → ask → approve → **fallthrough**. A finding's
