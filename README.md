@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.7.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-549%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-598%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -21,7 +21,7 @@ Unix parsing, PowerShell gets PS parsing and the PowerShell/cmd rule sets.
 - Descends into `bash`/`sh`/`zsh`/`dash`/`ash`/`ksh`/`fish -c`, `find -exec`, `xargs`, process substitution, `powershell -Command`/`pwsh -c`/`cmd /c`
 - Strips invisible/steganographic Unicode (zero-widths, bidi overrides, tag chars) before matching
 - Scans the contents of executed scripts (`bash X`, `./X`, `source X`, `pwsh -File X`, `& ./X.ps1`): reads the resolved file (first 256 KB) for download-pipe-to-shell, dev-tcp reverse shells, base64/xxd decode-then-exec, EncodedCommand/IEX/DownloadString, LOLBins. High-risk + untrusted → `ask`; trusted → allow. See [Script trust](#script-trust)
-- DENY (cross-platform): reverse shells (incl. `socat EXEC:`, `nc -c`, `php -r` fsockopen), exfiltration (`tar`/`zip`/`7z` of a secret or whole `.ssh`/`.aws`; `curl -d "$(env)"`/secret-env-var POST to a URL), encoded payloads, command-exec `git config` keys (`core.hooksPath`/`credential.helper`/`core.sshCommand`/`gpg.program`/`!`-aliases; `user.name`/`user.email` allowed), persistence (`.git/hooks/`, CI configs, `~/.ssh/authorized_keys`), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`), crypto miners, container escape, fork bombs, `rm -rf` of system dirs (incl. across a `\`-newline continuation, and `eval "rm -rf /"` / `command eval …`)
+- DENY (cross-platform): reverse shells (incl. `socat EXEC:`, `nc -c`, `php -r` fsockopen), exfiltration (`tar`/`zip`/`7z` of a secret or whole `.ssh`/`.aws`; `curl -d "$(env)"`/secret-env-var POST to a URL), encoded payloads, *setting* a command-exec `git config` key (`core.hooksPath`/`credential.helper`/`core.sshCommand`/`gpg.program`/`!`-aliases; `user.name`/`user.email` allowed, and reading any key back is allowed), persistence (`.git/hooks/`, CI configs, `~/.ssh/authorized_keys`), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`), crypto miners, container escape, fork bombs, `rm -rf` of system dirs (incl. across a `\`-newline continuation, and `eval "rm -rf /"` / `command eval …`)
 - DENY (macOS): `csrutil disable`, `spctl --master-disable`, `launchctl`/LaunchAgents, `security` Keychain extraction, `dscl` user creation, `kextload`, `tccutil reset`, `diskutil erase`, quarantine stripping, `rm -rf /System|/Library|/Applications|/Users|/Volumes`
 - DENY (PowerShell): `Remove-Item -Recurse -Force` of home/root/wildcard, `Invoke-Expression`/`iex`, `iwr|iex` and `-OutFile`/`DownloadString` download-exec, EncodedCommand, `Set-ExecutionPolicy`, `Set-MpPreference`, service/scheduled-task/Run-key/`$PROFILE` persistence, lsass MiniDump, secret reads and archive/copy exfil
 - DENY (cmd): `del`/`rmdir /s`, `format`, `vssadmin delete shadows`, `bcdedit`, `reg add …\Run`, `schtasks /create`, `sc create`, `net user … /add`, `netsh advfirewall`, `takeown`, `icacls /grant`, `certutil -urlcache`, `bitsadmin /transfer`, `mshta`/`regsvr32`/`rundll32`
@@ -230,7 +230,9 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.7.0 — false-positive reduction + correctness
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.7.1 — two false-positive fixes: `git config <key>`
+reads (auditing a hooks-path backdoor is not setting one) and `jq`/`rg`/`sed` filter arguments
+(a `.key` selector is not a private key). Previously 0.7.0 — false-positive reduction + correctness
 hardening: injection-on-write now denies only agent-instruction files or exfil-carrying
 payloads (security docs, test fixtures, chatbot prompts, Q&A transcripts stop being blocked);
 PowerShell rules no longer fire on Bash (`grep -w hidden`, Elixir `iex`); shell idioms

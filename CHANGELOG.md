@@ -7,6 +7,69 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.7.1] - 2026-07-29
+
+Two false positives from live use, both in the same family: a rule matching a *name* without
+looking at what the command does with it.
+
+`git config` backdoor keys — read vs write. `git config core.hooksPath` (no value) only prints
+the setting; that is how you audit a repo for a hooks-path backdoor, and it was hard-denied.
+The key now has to be followed by a value token to deny, so the write forms
+(`git config core.hooksPath /tmp/evil`, `--global credential.helper store`) still block while
+every read form (`git config <key>`, `git config --get <key>`) passes.
+
+Program/pattern arguments are not paths. `jq -r '.issues[] | .key' out.json` was denied as
+"reading a sensitive file" because the jq filter contains `.key`, which is in the secret-token
+set (`id_rsa`, `.pem`, `.key`, …). Same shape for `rg '\.pem' src/` and `sed 's/.env/x/' f`.
+The first positional of `jq`/`yq`/`sed`/`awk`/`grep`/`rg` is the program, not a file, so it is
+now skipped — unless a flag already supplied the pattern, in which case the first positional
+really is a file. `-e`/`--regexp`/`--expression` carry the pattern inline, so their value is
+skipped too (`grep -e '\.pem' src/`); `-f`/`--file`/`--from-file` name a file holding it, so that
+value stays checked (`grep -f ~/.aws/credentials src/` still denies). `jq -e` is `--exit-status`,
+not a pattern flag, and is treated as such. Those six verbs are excluded from the substring rule
+(which cannot tell a filter from a path) and covered by the tokenized rule instead, which now
+runs per pipe stage so `ls | cat .env` is still caught. Real file arguments after the filter
+(`jq -r '.a' ~/.aws/credentials`) still deny.
+
+Four defects in that same skip logic were caught by review rounds on this diff and are fixed
+here, all the same shape — a flag-parsing gap that let the real file argument land in the
+skipped slot:
+
+- A bare `--` now ends option parsing. `grep -- -e .env` reads the FILE `.env` with `-e` as a
+  literal pattern, and was slipping through as a flag+value pair — a full-file dump primitive.
+- The attached short-option form is recognized. `grep -fpats.txt .env`, `sed -es/a/b/ .env`,
+  and the bundled `sed -nes/a/b/p .env` all supply the pattern in the flag token itself, so the
+  next token is the file, not the pattern.
+- `grep`/`rg` context/count flags (`-A`/`-B`/`-C`/`-m`) consume their number instead of letting
+  it eat the pattern slot, so `grep -A 2 .env app.log` stops being denied.
+- The tokenized rule steps over command wrappers (`sudo`, `env FOO=1`, `time`, `nohup`, `nice`,
+  `timeout`, …). The substring rule caught those for free by matching the verb anywhere in the
+  segment; moving these six verbs off it would otherwise have downgraded `env grep x .env` from
+  deny to allow.
+- Wrapper flags that take a separate value (`sudo -u root`, `env -u VAR`, `nice -n 5`) are
+  modeled per wrapper, so the value is not mistaken for the command word. `env -u PATH grep foo
+  .env` was the worst case: it reached the approve stage and was auto-approved outright.
+- A wrapper flag's value is never allowed to swallow a read verb, so a wrong arity in that table
+  degrades to one extra token checked rather than a blind spot (`ionice -t` and `sudo -h` are
+  boolean and were initially mis-listed). An unknown wrapper flag falls back to the first read
+  verb in the stage for the same reason.
+
+Two adjacent holes surfaced while fixing the above and are closed here. `doas` had no
+elevated-privilege floor at all — `sudo` asks, `doas` fell through — so it now asks the same way.
+And `env` sat in the read-only approve list matched by a bare `\benv\b`, which auto-approved
+anything of the form `env [-u VAR] <command>`; only bare `env` (which just dumps the environment)
+is approved now, and `env <command>` gets a normal prompt.
+
+One behaviour change falls out of this and is intended: a LONE positional to one of those six
+verbs is the program, with input coming from stdin, so `sed .env`, `grep ~/.ssh/id_rsa` and
+`jq ~/.aws/credentials` no longer deny — none of them opens the named file. Two positionals
+still mean the second is a file (`sed 1p .env` denies). A 1087-command before/after sweep across
+wrapper × verb × flag-form × secret-token found this to be the only class whose decision relaxed,
+and no command that started denying.
+
+Note for both: the path `~/.claude/projects/**/tool-results/**` was never the trigger — no
+`.claude` token exists in the secret set — so no path allowlist was added.
+
 ## [0.7.0] - 2026-07-04
 
 False-positive reduction + correctness hardening. Every prior audit pushed one direction —

