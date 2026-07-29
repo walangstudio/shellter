@@ -691,19 +691,109 @@ const READ_VERBS =
 const READ_VERB_SET = new Set(READ_VERBS.split('|'));
 const SECRET_TOKENS_RE = new RegExp(SECRET_TOKENS, 'i');
 
-// Token-level sensitive-read check: tokenize with quote stripping so a read verb
-// reaching a secret token survives intra-word quote splitting (`cat ".e"nv`,
+// Verbs whose FIRST positional is a program/pattern, not a path: `jq '.key' out.json`,
+// `rg '\.pem' src/`, `sed 's/.env/x/' f`. Matching that argument against SECRET_TOKENS
+// is a false positive, so these are checked ONLY by the tokenized rule (which skips
+// that one argument and still checks every real file argument after it).
+const PROGRAM_ARG_VERBS = new Set(['jq', 'yq', 'sed', 'awk', 'grep', 'rg']);
+// Flags that move the program/pattern off the first positional -- which is then a real
+// file, so nothing is skipped. An INLINE flag carries the pattern in its own value
+// (`grep -e '\.pem' src/`), which is never a path, so that value is skipped too. A FILE
+// flag names a file holding the pattern (`grep -f pats.txt`, `jq -f prog.jq`), and that
+// value IS a path, so it stays checked. `jq -e` is --exit-status, not a pattern flag, so
+// the inline form is recognized only for the pattern-taking verbs.
+const INLINE_PATTERN_VERBS = new Set(['sed', 'awk', 'grep', 'rg']);
+const INLINE_PATTERN_FLAG = /^(?:-e|--regexp|--expression|--source)(?:=|$)/;
+const FILE_PATTERN_FLAG = /^(?:-f|--file|--from-file)(?:=|$)/;
+// getopt also accepts the value ATTACHED to a short flag, on its own (`grep -fpats.txt`,
+// `sed -es/a/b/`) or at the end of a bundle (`sed -nes/a/b/p`). The loop skips those as
+// flags, so they must still disable the first-positional skip -- otherwise the real file
+// argument lands in the skipped slot and is never checked. A bundle like `rg -tfoo` is
+// genuinely ambiguous; resolving it toward "a value flag is present" only ever checks
+// MORE tokens, so that is the safe direction.
+const ATTACHED_PATTERN_FLAG = /^-[A-Za-z]*[ef]\S/;
+const ATTACHED_FILE_FLAG = /^-[A-Za-z]*f\S/;
+// Command wrappers the read verb can hide behind. The substring rule used to catch these
+// for free (it matched the verb anywhere in the segment); the tokenized rule looks at the
+// command word, so it has to step over them itself.
+const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'timeout']);
+// Wrapper flags that take a SEPARATE value token (`sudo -u root grep …`). Without these the
+// value ('root') is mistaken for the command word and the read verb behind it is never seen.
+const WRAPPER_VALUE_FLAGS = {
+  sudo: /^(?:-u|--user|-U|--other-user|-g|--group|-p|--prompt|-r|--role|-t|--type|-C|--close-from|-D|--chdir|-R|--chroot)$/,
+  doas: /^(?:-u|-C)$/,
+  env: /^(?:-u|--unset|-C|--chdir|-S|--split-string)$/,
+  nice: /^(?:-n|--adjustment)$/,
+  ionice: /^(?:-c|-n|-p|-P|-u)$/,
+  stdbuf: /^(?:-i|-o|-e|--input|--output|--error)$/,
+  timeout: /^(?:-s|--signal|-k|--kill-after)$/,
+  time: /^(?:-f|--format|-o|--output)$/,
+};
+// grep/rg context+count flags take a NUMBER as a separate token. Without this the number
+// is mistaken for the pattern slot and the real pattern gets path-checked, so a plain
+// `grep -A 2 .env app.log` is denied. The attached forms (`-A2`) need no entry.
+const COUNT_FLAG_VERBS = new Set(['grep', 'rg']);
+const COUNT_FLAG = /^(?:-A|-B|-C|-m|--after-context|--before-context|--context|--max-count)(?:=|$)/;
+const READ_VERBS_PATH = READ_VERBS.split('|').filter(v => !PROGRAM_ARG_VERBS.has(v)).join('|');
+
+// Token-level sensitive-read check: tokenize each pipe stage with quote stripping so a
+// read verb reaching a secret token survives intra-word quote splitting (`cat ".e"nv`,
 // `c"a"t .env`) that a raw-substring regex can't see. Predicate form for the deny
 // loop; returns a reason or null.
 function tokenizedSensitiveRead(seg) {
-  const s = seg.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
-  const toks = tokenizeArgs(s);
-  if (!toks.length) return null;
-  const cmd = toks[0].replace(/^.*[\\/]/, '');
-  if (!READ_VERB_SET.has(cmd)) return null;
-  for (let i = 1; i < toks.length; i++) {
-    if (toks[i].startsWith('-')) continue;
-    if (SECRET_TOKENS_RE.test(toks[i])) return 'Reading sensitive file via shell (quote-obfuscated) blocked';
+  for (const stage of splitPipeStages(seg)) {
+    const s = stage.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
+    const toks = tokenizeArgs(s);
+    if (!toks.length) continue;
+    // Step over command wrappers (`sudo grep …`, `env FOO=1 sed …`, `time cat …`) and the
+    // flags / VAR=val / durations they take, so the read verb behind one is still seen.
+    let at = 0;
+    let wrapped = false;
+    while (at < toks.length && CMD_WRAPPERS.has(toks[at].replace(/^.*[\\/]/, ''))) {
+      const valueFlag = WRAPPER_VALUE_FLAGS[toks[at].replace(/^.*[\\/]/, '')];
+      wrapped = true;
+      at++;
+      while (at < toks.length) {
+        const t = toks[at];
+        // Never let a supposed flag value swallow a read verb: if this table entry is wrong
+        // about the flag's arity (a boolean flag listed as value-taking), the token it eats
+        // is the real command word, and the whole check goes blind. Treat the flag as
+        // boolean in that case -- the cost is one extra token checked, never a missed read.
+        if (valueFlag && valueFlag.test(t) &&
+            !READ_VERB_SET.has((toks[at + 1] || '').replace(/^.*[\\/]/, ''))) { at += 2; continue; }
+        if (t.startsWith('-') || /^[A-Za-z_]\w*=/.test(t) || /^\d+(?:\.\d+)?[smhd]?$/.test(t)) { at++; continue; }
+        break;
+      }
+    }
+    // A wrapper flag we don't know the arity of would leave `at` on its value instead of the
+    // command word, which would hide the read entirely -- so fall back to the first read verb
+    // anywhere in a wrapped stage. Only wrapped stages, to keep this off ordinary commands.
+    if (wrapped && !READ_VERB_SET.has((toks[at] || '').replace(/^.*[\\/]/, ''))) {
+      const found = toks.findIndex((t, i) => i > 0 && READ_VERB_SET.has(t.replace(/^.*[\\/]/, '')));
+      if (found > 0) at = found;
+    }
+    const cmd = (toks[at] || '').replace(/^.*[\\/]/, '');
+    if (!READ_VERB_SET.has(cmd)) continue;
+    const inline = INLINE_PATTERN_VERBS.has(cmd);
+    const counted = COUNT_FLAG_VERBS.has(cmd);
+    let skipProgramArg = PROGRAM_ARG_VERBS.has(cmd) &&
+      !toks.slice(at + 1).some(t => FILE_PATTERN_FLAG.test(t) || ATTACHED_FILE_FLAG.test(t) ||
+        (inline && (INLINE_PATTERN_FLAG.test(t) || ATTACHED_PATTERN_FLAG.test(t))));
+    // A bare `--` ends option parsing: `grep -- -e .env` reads the FILE .env with `-e` as
+    // the literal pattern. Nothing after it may be treated as a flag or swallowed as a
+    // flag's value, or that is a way to hide the real file argument from the check.
+    let endOfFlags = false;
+    for (let i = at + 1; i < toks.length; i++) {
+      if (!endOfFlags) {
+        if (toks[i] === '--') { endOfFlags = true; continue; }
+        // A pattern/count flag consumes the next token as its value (unless `--flag=value`).
+        if (((inline && INLINE_PATTERN_FLAG.test(toks[i])) || (counted && COUNT_FLAG.test(toks[i]))) &&
+            !toks[i].includes('=')) { i++; continue; }
+        if (toks[i].startsWith('-')) continue;
+      }
+      if (skipProgramArg) { skipProgramArg = false; continue; }
+      if (SECRET_TOKENS_RE.test(toks[i])) return 'Reading sensitive file via shell (quote-obfuscated) blocked';
+    }
   }
   return null;
 }
@@ -792,6 +882,7 @@ const DENY_PATTERNS = [
 
   // Privilege escalation / identity tampering
   [/^\s*sudo\s/, 'sudo -- runs with elevated privileges', 'ask'],
+  [/^\s*doas\s/, 'doas -- runs with elevated privileges', 'ask'],
   // 4-digit numeric mode whose leading bit is 2/4/6/7 sets setuid/setgid/sticky.
   [/\bchmod\s+0?[2467][0-7]{3}\b/, 'chmod with setuid/setgid bit blocked'],
   [/\bchmod\s+[ugoa]*[+=]\S*s\b/, 'chmod setuid/setgid (symbolic) blocked'],
@@ -816,8 +907,12 @@ const DENY_PATTERNS = [
   // Identity / git backdoor
   // git config keys that make git run an attacker-controlled command. Identity keys
   // (user.name/email/signingkey) are NOT blocked -- those are normal config (ghc.bat).
-  // Hard-deny the keys that are almost never set by hand and are classic backdoors:
-  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:credential\.helper|core\.(?:hooksPath|sshCommand|fsmonitor|alternateRefsCommand)|init\.templateDir|uploadpack\.packObjectsHook|filter\.\S+\.(?:clean|smudge)|alias\.\S+\s+['"]?!)/i,
+  // Hard-deny the keys that are almost never set by hand and are classic backdoors --
+  // but only the WRITE form. `git config core.hooksPath` (or `--get <key>`) with no
+  // value only prints the setting, which is how you AUDIT for such a backdoor, so the
+  // key must be followed by a value token (not end-of-segment, `;`, `&&`, a pipe or a
+  // redirect) to deny.
+  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:(?:credential\.helper|core\.(?:hooksPath|sshCommand|fsmonitor|alternateRefsCommand)|init\.templateDir|uploadpack\.packObjectsHook|filter\.\S+\.(?:clean|smudge))(?=\s+[^\s;&|<>])|alias\.\S+\s+['"]?!)/i,
     'git config of a hook / credential-helper / exec key blocked -- possible backdoor'],
   // Hard-deny when an editor/pager/diff/gpg program value carries a shell command
   // (`;`/`&`/redirect, $(...), backtick, or sh/bash -c) -- that is RCE on the next git op.
@@ -907,10 +1002,13 @@ const DENY_PATTERNS = [
   [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*filter-(branch|repo)\b/, 'git filter-branch / filter-repo -- rewrites history', 'ask'],
 
   // Sensitive file reads via shell. The verb list covers the common readers/dumpers
-  // (cat/head/…, plus xxd/od/strings/base64/dd/openssl/gpg/jq) so a zsh/bash/fish
+  // (cat/head/…, plus xxd/od/strings/base64/dd/openssl/gpg) so a zsh/bash/fish
   // user on Linux or macOS can't dump a secret around the `cat` rule. Tokens come
   // from the shared SECRET_TOKENS set (templates excluded, `credentials` anchored).
-  [new RegExp('\\b(?:' + READ_VERBS + ')\\b\\s+[^|;]*' + SECRET_TOKENS, 'i'),
+  // Program/pattern-taking verbs (jq/yq/sed/awk/grep/rg) are excluded here -- a
+  // substring match can't tell their filter argument from a path -- and are covered
+  // by tokenizedSensitiveRead instead.
+  [new RegExp('\\b(?:' + READ_VERBS_PATH + ')\\b\\s+[^|;]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via shell blocked'],
   // Reading a secret via the shell's file-read substitution ( $(<secret) ).
   [new RegExp('\\$\\(\\s*<\\s*[\'"]?[^)\'"]*' + SECRET_TOKENS, 'i'),
@@ -1115,7 +1213,10 @@ const APPROVE_PATTERNS = [
   // so their executed sub-command is inspected (else `find -exec node x` launders in).
   /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|sort|uniq|tr|cut|paste|tee|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq|fd|bat|delta|hexdump|xxd|md5sum|sha1sum|sha256sum|sha512sum|cksum|crc32)\b/,
   // Read-only system inspection
-  /^\s*(ss|ps|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|env|printenv|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
+  /^\s*(ss|ps|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|printenv|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
+  // `env` ALONE dumps the environment and is read-only; `env [-u X|VAR=v] <cmd>` RUNS <cmd>,
+  // so it must not inherit that approve -- it falls through to a normal prompt instead.
+  /^\s*env\s*(?:-0|--null)?\s*(?:\||$)/,
   // HTTP requests (deny rules cover dangerous flags)
   /^\s*(curl|wget)\b/,
   // Version checks
