@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-598%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-632%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -213,6 +213,23 @@ Does not protect against: TOCTOU symlink races, kernel-level attacks or processe
 running as you, tools other than Bash/Read/Write/Edit/Glob/Grep, brand-new patterns not
 yet in the deny list.
 
+**shellter fails open.** If `node` is not on the PATH Claude Code launches hooks with, the
+hook exits 127 and Claude Code treats that as non-blocking — the tool call runs unchecked.
+Two consequences worth knowing:
+
+- A broad allow rule turns that into silence. With `Read(*)` / `Write(*)` / `Bash(*)` in
+  `permissions.allow`, or `defaultMode` set to auto-accept, any verdict shellter does *not*
+  produce is an automatic allow rather than a prompt. Grant narrow rules, not wildcards.
+  Through 0.7.1 the manual installer added exactly those wildcards for the file tools. As
+  of 0.8.0 it does not, and it no longer overwrites your existing allow list — but **it
+  cannot clean up an install you already have.** If you ran an older manual installer,
+  those seven entries are still in your `settings.json`; re-running `merge-settings.js`
+  now warns about them and names the file, and you remove the ones you did not add
+  yourself. Plugin installs were never affected.
+- When shellter cannot fully analyze a command — an undecodable script, a parse failure —
+  it now returns `ask` rather than staying silent, so an unexamined command still stops at
+  a prompt. A ceiling is a safety boundary, not evidence the part it skipped was clean.
+
 A compound command auto-approves only when every subcommand matches an APPROVE pattern
 (env-var prefixes stripped). Python heredocs auto-approve only with no dangerous imports,
 no `os.system|popen|exec*`, no dynamic eval, and `open()` on literal safe relative paths.
@@ -230,7 +247,10 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.7.1 — two false-positive fixes: `git config <key>`
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.8.0 — closes a cross-segment variable-indirection
+bypass that auto-approved secret reads (`X=.env; cat $X`), adds a coverage gate so a command
+the engine could not fully analyze degrades to `ask` instead of falling through, and stops the
+manual installer granting blanket file-tool permissions. Previously 0.7.1 — two false-positive fixes: `git config <key>`
 reads (auditing a hooks-path backdoor is not setting one) and `jq`/`rg`/`sed` filter arguments
 (a `.key` selector is not a private key). Previously 0.7.0 — false-positive reduction + correctness
 hardening: injection-on-write now denies only agent-instruction files or exfil-carrying

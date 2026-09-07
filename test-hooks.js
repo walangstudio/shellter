@@ -1006,6 +1006,14 @@ try {
 
   mkScript(sdir, 'conf.sh', 'x=$(pwd)\neval echo $x\ncat /dev/null\n');
   testBashCwd('script: configure-like eval/$() -> fallthrough', 'bash conf.sh', sdir, 'fallthrough', noTrust);
+  // ---- coverage ledger: "we could not look" must never read as "it is clean" ----
+  // A script we cannot decode is a gap: we were asked to vet it and could not, so
+  // the verdict degrades to ask rather than falling through to an auto-approval.
+  fs.writeFileSync(path.join(sdir, 'opaque.sh'), Buffer.from([0x23, 0x21, 0x00, 0x41, 0x42, 0x0a]));
+  testBashCwd('coverage: undecodable script -> ask', 'bash opaque.sh', sdir, 'ask', noTrust);
+  // A script that simply is not there is NOT a gap -- the command fails on its own,
+  // and treating it as one would prompt on every mistyped path.
+  testBashCwd('coverage: missing script stays fallthrough', 'bash nope-missing.sh', sdir, 'fallthrough', noTrust);
 
   mkScript(sdir, 'fetch.sh', 'curl https://api.example.com/v1/things -o out.json\n');
   testBashCwd('script: bare curl no pipe (FP guard) -> fallthrough', 'bash fetch.sh', sdir, 'fallthrough', noTrust);
@@ -1376,6 +1384,61 @@ testBash('v0.7.1 fallthrough: env running a command is not auto-approved', 'env 
 // ...and jq -e/-r bundles are still not pattern flags.
 testBash('v0.7.1 pass: jq -er filter selecting .key', join("jq -er '.credentials.k", "ey' out.json"), 'allow');
 testBash('v0.7.1 deny: secret read in a later pipe stage', join('ls | cat .en', 'v'), 'deny');
+
+console.log('\n--- cross-segment variable indirection (the v0.7.2 bypass) ---');
+// The payload lives in one chain segment and the use in another, so no single
+// segment holds the literal. This used to AUTO-APPROVE (allow, no prompt).
+testBash('var: X=.env then cat $X', join('X=.en', 'v; cat $X'), 'deny');
+testBash('var: braced form', join('X=.en', 'v; cat ${X}'), 'deny');
+testBash('var: ssh key via variable', join('X=~/.ssh/id_r', 'sa; cat $X'), 'deny');
+testBash('var: && separator', join('X=.en', 'v && cat $X'), 'deny');
+testBash('var: newline separator', join('X=.en', 'v\ncat $X'), 'deny');
+testBash('var: quoted value', join('X=".en', 'v"; cat $X'), 'deny');
+testBash('var: export prefix', join('export X=.en', 'v; cat $X'), 'deny');
+testBash('var: read verb behind a pipe', join('X=.en', 'v; ls | cat $X'), 'deny');
+testBash('var: aws credentials via variable', join('X=~/.aws/creden', 'tials; base64 $X'), 'deny');
+// The deny tables accept predicate matchers, so rmDanger sees the expansion too:
+// command-word indirection is closed by the same change, not just path indirection.
+testBash('var: command word via variable', 'X=rm; $X -rf /', 'deny');
+testBash('var: command word, home target', 'X=rm; $X -rf ~', 'deny');
+// Approve floor: a read whose target we cannot resolve must not auto-approve.
+testBash('var floor: unresolvable $X is not auto-approved', 'cat $X', 'fallthrough');
+testBash('var floor: computed value stays unresolved', 'D=$HOME/.ssh; cat $D/known_hosts', 'fallthrough');
+testBash('var floor: command substitution arg', 'cat $(find . -name x)', 'fallthrough');
+// ...but a resolvable one behaves exactly as before (no new prompts).
+testBash('var floor: resolvable path still approves', 'F=/t/out.txt; cat $F', 'allow');
+testBash('var: benign value does not manufacture a deny', 'F=notes.txt; cat $F', 'allow');
+testBash('var: template file is still excluded', join('X=.en', 'v.example; cat $X'), 'allow');
+// A non-read verb is not gated by the floor (ls of a dir is not a secret read).
+testBash('var: echo of a secret-looking value is not a read', join('X=.en', 'v; echo $X'), 'allow');
+// Order matters: a TRAILING assignment must not retroactively mark $X resolvable.
+// Using the final variable map here would let `cat $X; X=.env` suppress the floor.
+testBash('var floor: trailing assignment does not suppress the floor', 'cat $X; X=.env', 'fallthrough');
+// Bounds degrade to a prompt, never to a silent allow.
+testBash('var bound: padding past VAR_MAX degrades to ask',
+  Array.from({ length: 40 }, (_, i) => 'A' + i + '=x').join('; ') + join('; X=.en', 'v; cat $X'), 'ask');
+testBash('var bound: oversized value degrades to ask', 'X=' + 'a'.repeat(300) + join('/.en', 'v; cat $X'), 'ask');
+
+// ---- v0.8.0 review round: the approve floor must see past wrappers ----
+// Checking only the first token left every command wrapper as a way around the floor,
+// and combined with a silent VAR_MAX ceiling that was a complete bypass.
+testBash('floor: timeout wrapper', join('X=.en', 'v; timeout 5 cat $X'), 'deny');
+testBash('floor: command wrapper', join('X=.en', 'v; command cat $X'), 'deny');
+testBash('floor: sudo -u wrapper', join('X=.en', 'v; sudo -u root cat $X'), 'deny');
+testBash('floor: for-loop body is not auto-approved', 'for f in .env; do cat $f; done', 'fallthrough');
+testBash('floor: unresolved read behind a wrapper is not auto-approved', 'timeout 5 cat $X', 'fallthrough');
+// The full chain: pad past VAR_MAX so no expansion is produced, then read via a wrapper.
+// Returned `allow` before the ceilings recorded a coverage gap.
+testBash('floor: padding + wrapper is not a silent allow',
+  Array.from({ length: 40 }, (_, i) => 'A' + i + '=x').join('; ') + join('; X=.en', 'v; timeout 5 cat $X'), 'ask');
+// ---- expansion must not manufacture a deny bash would never make ----
+// A hard deny is unappealable in-session, so over-expansion is worse than under-expansion.
+testBash('expand: single quotes suppress expansion', join('X=.en', "v; cat '$X'"), 'allow');
+testBash('expand: unset drops the value', join('X=.en', 'v; unset X; cat $X'), 'fallthrough');
+testBash('expand: double quotes still expand', join('X=.en', 'v; cat "$X"'), 'deny');
+// Host vars are pre-seeded: ordinary reads keep approving, secret ones still deny.
+testBash('expand: $HOME read still approves', 'cat $HOME/notes.txt', 'allow');
+testBash('expand: $HOME secret still denies', join('cat $HOME/.ssh/id_r', 'sa'), 'deny');
 
 console.log('\n=== Results: ' + passed + ' passed, ' + failed + ' failed ===');
 process.exit(failed > 0 ? 1 : 0);

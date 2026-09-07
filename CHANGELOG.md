@@ -7,6 +7,71 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.8.0] - 2026-09-07
+
+A live bypass, a fail-open floor, and an installer that was handing out the permissions the
+hooks exist to gate.
+
+**Cross-segment variable indirection auto-approved secret reads.** `X=.env; cat $X` returned
+`allow` — not a prompt, not a fallthrough. The assignment and the use land in different chain
+segments, so no single segment ever contained the literal and every deny rule was blind to it,
+while `cat $X` still matched a plain-read approve rule. `SECURITY-REVIEW.md` had this filed as
+an accepted limit on the assumption it merely fell through; it did not.
+
+Literal assignments are now collected in command order and expanded into one more match
+variant, reusing the same mechanism as `${IFS}` / empty-quote de-obfuscation. No new deny
+rules — the existing ones just get a string they can read, so an indirect read behaves exactly
+like its direct form. Only literal values expand (no `$`, no backtick), so expansion can never
+reveal anything the user did not literally type. Bounded to 32 assignments, 256 chars each.
+
+Paired with an approve floor: a read verb whose argument still holds an expansion we could
+*not* resolve (`cat $X` with no assignment, `D=$HOME/.ssh; cat $D/known_hosts`, `cat $(...)`)
+no longer auto-approves. It falls through to the normal prompt. Narrow to read verbs and to
+genuinely unresolved names, so `F=/t/out.txt; jq -r '.a' $F` still approves as before.
+
+**Coverage gate.** Every place the engine gave up — an undecodable script, a heredoc parse
+throw, a redirect-scan throw, nesting past the depth cap — ended in a silent fallthrough,
+which under a broad allow rule or an auto-accept mode reads as ALLOW. Those now record a gap
+and, after every deny pass has run but before the approve pass, degrade the verdict to `ask`.
+A hard deny still wins; an unanalyzed command can no longer be laundered into an approval.
+A *missing* script is deliberately not a gap — the command fails on its own, and treating it
+as one would prompt on every mistyped path.
+
+**Manual installer no longer grants blanket file permissions.** `settings-template.json`
+granted `Read(*) Edit(*) Write(*) MultiEdit(*) NotebookEdit(*) Glob(*) Grep(*)` — the exact
+tools these hooks gate — so a hook that failed to run left unprompted file access behind. The
+plugin install path never granted it, making this pure asymmetric risk. The block is gone, and
+`merge-settings.js` no longer replaces your existing `permissions` (it used to overwrite the
+whole allow list). Manual-install users will see more prompts than before. That is the point.
+
+A first review round on this diff found the floor was incomplete and the fix is folded in
+here: `hasUnresolvedRead` checked only the first token, so every command wrapper walked past
+it (`timeout 5 cat $X`, `command cat $X`, `sudo -u root cat $X`), as did a loop body
+(`for f in .env; do cat $f; done`, whose segment starts with `do`). It now steps over shell
+keywords and `CMD_WRAPPERS` using the same flag-arity table `tokenizedSensitiveRead` uses.
+The three expansion ceilings also failed silently; padding past `VAR_MAX` with dummy
+assignments suppressed the deny variant, and combined with the wrapper gap
+`A0=x; ...; A39=x; X=.env; timeout 5 cat $X` returned **allow**. Each ceiling now records a
+coverage gap, so that command degrades to `ask`.
+
+Over-expansion is corrected too, because a hard deny is unappealable in-session while `ask`
+is not. Single-quoted spans are no longer expanded (bash does not expand there, so
+`X=.env; cat '$X'` was a wrong deny), `unset X` drops the value, and `HOME`/`PWD`/`TMPDIR`/
+`USER` are pre-seeded at their real values — which both keeps `cat $HOME/notes.txt`
+auto-approving and turns `cat $HOME/.ssh/id_rsa` into a literal the deny rules can read.
+
+Existing manual installs are not silently fixed. Removing the block from the template does
+nothing for a `settings.json` an older installer already wrote, so `merge-settings.js` now
+detects those seven wildcards and warns, naming the file. It does not edit the list, since
+you may have added entries of your own to it.
+
+**Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
+marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
+fixtures now target an agent-instruction file and a new assertion pins the gate itself.
+First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
+
+632 tests.
+
 ## [0.7.1] - 2026-07-29
 
 Two false positives from live use, both in the same family: a rule matching a *name* without

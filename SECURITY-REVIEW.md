@@ -34,9 +34,27 @@ markup) — now gated to agent-instruction files or exfil-carrying payloads.
 These were considered and left as documented gaps because the fix would either reintroduce
 false positives or add fragile complexity out of proportion to the risk:
 
-- **Cross-segment variable indirection** — `X=.env; cat $X` and `X=rm; $X -rf /` still evade
-  the path/command matchers. A taint pre-pass that resolves `VAR=literal` into later `$VAR`
-  uses would close it but risks new FPs on ordinary variable use.
+- ~~**Cross-segment variable indirection**~~ — **FIXED in 0.8.0, and it was worse than this
+  entry claimed.** `X=.env; cat $X` did not "evade the matchers" into a fallthrough; it
+  returned `allow` with no prompt, because `cat $X` matched a plain-read approve rule. The
+  `VAR=literal` pre-pass described here is what shipped, plus an approve floor for the
+  unresolvable case. The feared FPs did not materialise: expansion only fires where a read
+  verb meets a secret token, which is precisely the attack, and the suite stays green.
+  `X=rm; $X -rf /` is covered by the same change: the deny tables accept predicate matchers,
+  and `rmDanger` is evaluated over the expanded variant like every other rule.
+- **Subshell scoping is not modelled** — `( X=.env ); cat $X` hard-denies, though bash scopes
+  the assignment to the subshell and `$X` is unset outside. Deliberate over-approximation:
+  telling `( … )` (scoped) from `{ … ; }` (not scoped) would risk the two adjacent shapes
+  where the deny is correct — `{ X=.env; cat $X; }` and `X=.env; ( cat $X )` — and the cost
+  is one blocked contrived command, not a missed read. The general rule the 0.8.0 review
+  established still holds and was applied everywhere else: prefer `ask` over a hard deny when
+  the analysis is uncertain, because a deny cannot be overridden in-session.
+- **PowerShell variable indirection is not expanded** — `$X = ".env"; Get-Content $X`.
+  The assignment syntax differs (`$X = "v"`, not `X=v`), so the bash pre-pass does not match
+  it and `varEnv` stays empty on the PS path. This is a lesser hole than the bash one was:
+  the conservative PS approve set never auto-approved a `Get-Content $X`, so it lands on a
+  prompt rather than a silent allow. Under a broad `PowerShell(*)` allow rule it would still
+  pass unexamined. Worth closing if the PS surface grows.
 - **Non-shell interpreter one-liners with a non-secret destructive payload** —
   `node -e "require('child_process').execSync('rm -rf /')"`, `perl -e 'system("…")'`. Scanning
   arbitrary JS/Perl/Ruby for destruction false-positives on legit code (dynamic-eval idioms,
@@ -232,15 +250,21 @@ contains a shell metacharacter / `sh -c` / `&&` / `;` / `|`, `ask` otherwise.
   in the exact "cloned repo ships malware" threat the scanner defends. Fix: honor
   only user-level `~/.claude/settings.json` for script-flag suppression.
 - **D2 — fail-open has no floor; manual install widens the blast radius.**
-  Missing node / hook crash / unparseable input → allow. The manual-install
-  template grants `allow:[Read(*),Edit(*),Write(*),Glob(*),Grep(*)]`
-  (`settings-template.json:2-10`), so a dead file hook = blanket unprompted file
-  access, not a prompt. Fix: install-time node-on-PATH check; reconsider shipping
-  blanket `allow`; surface "detector did not run" on the native path (the adapter
-  already warns, `shellter-host-hook.js:106`).
-- **D3 — written-content scan is unbounded.** `check-sensitive-files.js:198-251`
-  scans the whole Write buffer + base64/hex decode with no size cap, while the
-  script path caps at 256 KB. Multi-MB writes → latency/DoS. Fix: cap to first N KB.
+  **Mostly fixed in 0.8.0.** The blanket `allow:[Read(*),Edit(*),Write(*),Glob(*),Grep(*)]`
+  is gone from `settings-template.json`, and `merge-settings.js` no longer replaces the
+  user's `permissions` at all (it used to overwrite the whole allow list). Unparseable or
+  partially-analyzed input now degrades to `ask` via the coverage gate rather than
+  falling through. The install-time node-on-PATH check was already present
+  (`merge-settings.js:88-95`), and the README now states the fail-open behaviour
+  explicitly. **Still open:** a missing `node` at hook-exec time is unfixable from
+  inside a hook that cannot run — that is a property of the host, not of shellter.
+- **D3 — written-content scan is unbounded.** **Accepted, measured — do not "fix" this.**
+  Benchmarked at ~150 ms/MB, linear, with no backtracking blowup: 1 MB 137 ms, 4 MB 654 ms,
+  10 MB 1478 ms, and 5 MB of adversarial low-entropy base64-shaped tokens (the pathological
+  case for `decodeOneLayer`'s entropy gate) 628 ms. Capping would trade a latency problem
+  that does not exist for a real blind spot past the cutoff, exactly as the code comment at
+  `check-sensitive-files.js:203-206` argues. The per-call cost is dominated by node process
+  startup (~510 ms on Windows) regardless.
 - **D4 — single-layer decode.** `decodeOneLayer` (`scan-content.js:98-139`) is
   one layer by design; double-encoded payloads evade the decoded-layer scan.
   Acceptable, but document the limit.
