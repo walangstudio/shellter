@@ -201,12 +201,29 @@ pre-existing denial of service:
   up to 256KB. Capped at `{2,12}` -- 8000 repetitions went from 22s to 62ms, linear, with
   detection verified unchanged on short and 15-deep variable chains.
 
+The two limits this release had recorded rather than fixed are now closed:
+
+- *PowerShell variable indirection.* `$X = ".env"; Get-Content $X` reached the deny rules
+  with the literal nowhere in sight, because the bash assignment pattern cannot match PS
+  syntax. It fell through to a prompt rather than auto-approving, so it was never a silent
+  allow, but under a broad `PowerShell(*)` rule it passed unexamined. PS assignments now get
+  their own pattern, names folded to lower case (PowerShell is case-insensitive), and a
+  backtick as the in-string escape. Same literal-only rule as bash.
+  PowerShell quoting is respected on the same terms as bash: a backtick escapes the next
+  character everywhere (not just inside double quotes), single-quoted values do not expand,
+  and `$env:`/`$using:` stay separate namespaces while `$script:`/`$global:` resolve. Names
+  fold to lower case because PowerShell really is case-insensitive, so a later `$X` overwrites
+  an earlier `$x`.
+- *The installer warned only at three or more leftover wildcards*, so a half-cleaned
+  `settings.json` went quiet while still blanket-approving tools these hooks gate. It warns
+  on one.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-690 tests.
+705 tests.
 
 ## [0.7.1] - 2026-07-29
 

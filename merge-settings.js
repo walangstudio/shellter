@@ -75,7 +75,10 @@ const stale = LEGACY_WILDCARDS.filter((r) => allowNow.includes(r));
 fs.writeFileSync(targetPath, JSON.stringify(existing, null, 2) + '\n');
 console.log('Merged hooks into', targetPath);
 
-if (stale.length >= 3) {
+// Warn on even ONE leftover. The earlier `>= 3` threshold meant a partially cleaned
+// settings.json went quiet while still blanket-approving a tool these hooks gate, which is
+// the exact state someone lands in halfway through removing them.
+if (stale.length) {
   console.warn('');
   console.warn('WARNING: your settings.json still allows ' + stale.join(' '));
   console.warn('  An older shellter installer (<= 0.7.1) wrote these. They blanket-approve');

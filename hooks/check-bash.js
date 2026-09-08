@@ -728,6 +728,20 @@ function noteGap(kind) {
 }
 
 const ASSIGN_RE = /(?:^|[;&|(\s])([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*)'|([^\s;&|)]*))/g;
+// PowerShell writes `$X = "value"`, which the bash pattern above cannot match, so the PS
+// path had no expansion at all: `$X = ".env"; Get-Content $X` reached the deny rules with
+// the literal nowhere in sight. It fell through to a prompt rather than auto-approving
+// (the PS approve set is conservative), so it was never a silent allow -- but under a broad
+// `PowerShell(*)` allow rule it passed unexamined. Names are case-insensitive in PS.
+// Scope prefixes (`$script:X`, `$global:X`) name the same variable for a single command
+// line, so they are stripped. `env:` and `using:` are deliberately NOT in the list: they are
+// separate namespaces, and folding `$env:X` into `$X` would be a false expansion.
+const PS_SCOPE = '(?:(?:script|global|local|private):)?';
+const PS_ASSIGN_RE = new RegExp(
+  '\\$(?:\\{' + PS_SCOPE + '([A-Za-z_]\\w*)\\}|' + PS_SCOPE + '([A-Za-z_]\\w*))\\s*=\\s*' +
+  '(?:"([^"`]*)"|\'([^\']*)\'|([^\\s;|&]+))', 'g');
+const PS_VAR_AT = new RegExp(
+  '^\\$\\{' + PS_SCOPE + '([A-Za-z_]\\w*)\\}|^\\$' + PS_SCOPE + '([A-Za-z_]\\w*)');
 
 // Bash does not expand inside single quotes, so expanding there manufactures a HARD deny
 // for a command that would never read the secret (`X=.env; cat '$X'` reads a file literally
@@ -740,21 +754,34 @@ const ASSIGN_RE = /(?:^|[;&|(\s])([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*
 // exists to close. One apostrophe was enough.
 const VAR_AT = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}|^\$([A-Za-z_][A-Za-z0-9_]*)/;
 
-function expandVars(s, env) {
+function expandVars(s, env, isPosh) {
+  const at = isPosh ? PS_VAR_AT : VAR_AT;
   let out = '';
   let q = null;
   let i = 0;
   while (i < s.length) {
     const c = s[i];
+    // In PowerShell the backtick escapes the NEXT character everywhere, not only inside a
+    // double-quoted string. `` Get-Content `$X `` reads a file literally named `$X`, so
+    // expanding there manufactured a hard deny for a command PS would never run that way --
+    // and a deny cannot be overridden in-session.
+    if (isPosh && c === '`' && q !== "'" && i + 1 < s.length) {
+      out += c + s[i + 1];
+      i += 2;
+      continue;
+    }
+    // PowerShell does not expand inside single quotes either, and its escape character
+    // inside a double-quoted string is a backtick, not a backslash.
     if (q === "'") { out += c; if (c === "'") q = null; i++; continue; }
     if (q === '"') {
-      if (c === '\\' && i + 1 < s.length) { out += c + s[i + 1]; i += 2; continue; }
+      const esc = isPosh ? '`' : '\\';
+      if (c === esc && i + 1 < s.length) { out += c + s[i + 1]; i += 2; continue; }
       if (c === '"') { out += c; q = null; i++; continue; }
     } else if (c === "'" || c === '"') { out += c; q = c; i++; continue; }
     if (c === '$') {
-      const m = VAR_AT.exec(s.slice(i));
+      const m = at.exec(s.slice(i));
       if (m) {
-        const v = env.get(m[1] || m[2]);
+        const v = env.get(varKey(m[1] || m[2], isPosh));
         if (v !== undefined) { out += v; i += m[0].length; continue; }
       }
     }
@@ -764,6 +791,9 @@ function expandVars(s, env) {
   if (q) noteGap('quote-parse');   // unterminated quote: we cannot say what expands
   return out;
 }
+
+// PowerShell variable names are case-insensitive; bash's are not.
+function varKey(name, isPosh) { return isPosh ? name.toLowerCase() : name; }
 
 // Blank out single-quoted spans (same quote-state rules) so callers can reason about the
 // parts bash would actually expand. Length-preserving, so offsets stay valid.
@@ -789,7 +819,7 @@ function blankSingleQuoted(s) {
 // is expanded, matching shell order -- `X=a; echo $X` expands in segment 1, and
 // `X=a echo $X` (env-prefix form) correctly does not, because bash expands $X
 // before the assignment takes effect there.
-function expandSegments(segments, cwd) {
+function expandSegments(segments, cwd, isPosh) {
   const out = new Array(segments.length).fill(null);
   varEnv = new Map();
   resolvableAt = new Array(segments.length).fill(NO_NAMES);
@@ -798,14 +828,14 @@ function expandSegments(segments, cwd) {
   // expands into a literal the deny rules can read.
   for (const [name, val] of [['HOME', os.homedir()], ['PWD', cwd || process.cwd()],
                              ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username]]) {
-    if (typeof val === 'string' && val && val.length <= VAR_VALUE_MAX) varEnv.set(name, val);
+    if (typeof val === 'string' && val && val.length <= VAR_VALUE_MAX) varEnv.set(varKey(name, isPosh), val);
   }
   if (segments.length > VAR_SEGMENT_MAX) { noteGap('var-segment-limit'); return out; }
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
     resolvableAt[i] = varEnv.size ? new Set(varEnv.keys()) : NO_NAMES;
     if (varEnv.size) {
-      const e = expandVars(seg, varEnv);
+      const e = expandVars(seg, varEnv, isPosh);
       if (e !== seg) out[i] = e;
     }
     // `unset X` drops the value, so a later $X is unresolved again -- without this,
@@ -821,6 +851,23 @@ function expandSegments(segments, cwd) {
     // shell so its assignments persist, while a subshell's do not (`( X=.env ); cat $X`
     // reads nothing). Keeping the paren in the body makes the test below fail, which is
     // exactly the wanted behaviour.
+    if (isPosh) {
+      // PowerShell has no env-prefix form, so an assignment anywhere in the segment
+      // persists. Same literal-only rule: a value containing `$` or a backtick is computed,
+      // and expanding it could only ever invent text the user did not write.
+      PS_ASSIGN_RE.lastIndex = 0;
+      let pm;
+      while ((pm = PS_ASSIGN_RE.exec(seg))) {
+        if (varEnv.size >= VAR_MAX) { noteGap('var-count-limit'); break; }
+        const val = pm[3] !== undefined ? pm[3] : (pm[4] !== undefined ? pm[4] : (pm[5] || ''));
+        if (!val) continue;
+        if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
+        if (/[$`]/.test(val)) continue;
+        varEnv.set(varKey(pm[1] || pm[2], true), val);
+      }
+      continue;
+    }
+
     let body = seg.replace(/^\s*\{\s*/, '');
     body = body.replace(/^\s*(?:export|declare|typeset|readonly|local)\s+/, '');
     const persists = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|)]*)\s*)+$/.test(body);
@@ -2142,7 +2189,7 @@ process.stdin.on('end', () => {
 
   // Cross-segment variable expansion, computed once and fed to both deny passes
   // as an extra match variant. Also populates varEnv for the approve floor.
-  const expanded = expandSegments(segments, cwd);
+  const expanded = expandSegments(segments, cwd, isPosh);
 
   for (let i = 0; i < segments.length; i++) {
     checkSegmentDeny(segments[i], 0, 'hard', expanded[i]);

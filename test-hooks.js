@@ -1649,5 +1649,33 @@ testBash('param: resolvable read still approves', 'F=/t/out.txt; cat $F', 'allow
     bscan.scanBundle(nodeDir).findings.some(f => f.rule === 'SH'), false);
 }
 
+console.log('\n--- v0.8.0: PowerShell variable indirection ---');
+// PS writes `$X = "value"`, which the bash assignment pattern cannot match, so the PS path
+// had no expansion at all and the deny rules never saw the literal. Not a silent allow
+// (the PS approve set is conservative) but it passed unexamined under a broad allow rule.
+testPosh('ps var: spaced assignment', join('$X = ".en', 'v"; Get-Content $X'), 'deny');
+testPosh('ps var: tight assignment', join('$X=".en', 'v"; Get-Content $X'), 'deny');
+testPosh('ps var: braced use', join('$X = ".en', 'v"; Get-Content ${X}'), 'deny');
+testPosh('ps var: alias cat', join('$X = ".en', 'v"; cat $X'), 'deny');
+testPosh('ps var: single-quoted value', join("$X = '.en", "v'; Get-Content $X"), 'deny');
+// Names are case-insensitive in PowerShell.
+testPosh('ps var: case-insensitive name', join('$Secret = ".en', 'v"; Get-Content $SECRET'), 'deny');
+// A computed value is never expanded, so it cannot invent a literal the user did not write.
+testPosh('ps var: computed value not expanded', '$p = "$HOME/x"; Get-Content $p', 'fallthrough');
+// Benign reads must not start denying.
+testPosh('ps var: benign path still not denied', '$p = "out.txt"; Get-Content $p', 'fallthrough');
+testPosh('ps var: plain read still approves', 'Get-Content README.md', 'allow');
+// PowerShell quoting and namespaces. A wrong deny here is unappealable in-session, so the
+// false-positive side matters as much as detection.
+testPosh('ps var: backtick escapes the dollar', join('$X = ".en', 'v"; Get-Content `$X'), 'fallthrough');
+testPosh('ps var: single quotes do not expand', join("$X = '.en", "v'; Get-Content '$X'"), 'fallthrough');
+testPosh('ps var: $env: is a separate namespace', join('$env:X = ".en', 'v"; Get-Content $X'), 'fallthrough');
+// Scope prefixes name the same variable on one command line.
+testPosh('ps var: $script: scope resolves', join("$script:X = '.en", "v'; Get-Content $script:X"), 'deny');
+testPosh('ps var: $global: scope resolves', join("$global:X = '.en", "v'; Get-Content $X"), 'deny');
+// PowerShell variable names really are case-insensitive, so the later assignment wins and
+// this read genuinely does hit the secret -- the deny is correct, not a fold collision.
+testPosh('ps var: case-insensitive reassignment wins', join("$x = 'safe.txt'; $X = '.en", "v'; Get-Content $x"), 'deny');
+
 console.log('\n=== Results: ' + passed + ' passed, ' + failed + ' failed ===');
 process.exit(failed > 0 ? 1 : 0);

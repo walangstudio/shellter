@@ -49,12 +49,12 @@ false positives or add fragile complexity out of proportion to the risk:
   the current shell, still does (`{ X=.env; cat $X; }` denies). The rule this round
   established and applied throughout: prefer `ask` over a hard deny when the analysis is
   uncertain, because a deny cannot be overridden in-session.
-- **PowerShell variable indirection is not expanded** — `$X = ".env"; Get-Content $X`.
-  The assignment syntax differs (`$X = "v"`, not `X=v`), so the bash pre-pass does not match
-  it and `varEnv` stays empty on the PS path. This is a lesser hole than the bash one was:
-  the conservative PS approve set never auto-approved a `Get-Content $X`, so it lands on a
-  prompt rather than a silent allow. Under a broad `PowerShell(*)` allow rule it would still
-  pass unexamined. Worth closing if the PS surface grows.
+- ~~**PowerShell variable indirection is not expanded**~~ - **FIXED.**
+  `$X = ".env"; Get-Content $X` now denies. PS assignments are collected with their own
+  pattern (`$NAME = value`), names folded to lower case since PowerShell is
+  case-insensitive, and a backtick treated as the in-string escape. PS has no env-prefix
+  form, so an assignment anywhere in the segment persists. A value containing a dollar sign
+  or a backtick is still treated as computed and never expanded.
 - **Non-shell interpreter one-liners with a non-secret destructive payload** —
   `node -e "require('child_process').execSync('rm -rf /')"`, `perl -e 'system("…")'`. Scanning
   arbitrary JS/Perl/Ruby for destruction false-positives on legit code (dynamic-eval idioms,
