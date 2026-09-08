@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-651%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-668%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -233,6 +233,49 @@ Two consequences worth knowing:
 A compound command auto-approves only when every subcommand matches an APPROVE pattern
 (env-var prefixes stripped). Python heredocs auto-approve only with no dangerous imports,
 no `os.system|popen|exec*`, no dynamic eval, and `open()` on literal safe relative paths.
+
+## Bundle audit (`shellter scan`)
+
+The two hooks guard what the agent *emits*. Nothing guarded what the agent is *given*: a
+plugin's `SKILL.md` is loaded straight into context, its `hooks.json` runs on lifecycle
+events before any tool call, and its `.mcp.json` points at a server whose tool descriptions
+the model reads as instructions. None of that passes through a PreToolUse hook.
+
+```
+npm run scan -- path/to/plugin          # or: node hooks/shellter-scan.js <path> [--json]
+```
+
+Exits 1 on any high-severity finding, so it drops into a pre-install check or CI. `--strict`
+also exits 1 when anything went uninspected: a skipped dependency tree, a symlink, an
+oversize file, a depth or file limit. Those are always listed under NOT INSPECTED, because
+a clean result over an unwalked subtree is not evidence of anything.
+
+| rule | what it looks for |
+|---|---|
+| `BH1` | bundle ships hooks; ambient matchers (`*`, empty) rank higher |
+| `BH2` | a shipped hook command posts to a non-loopback URL, or contains shell malice |
+| `BH3` | shipped `settings.json` with blanket `permissions.allow` or a bypassing `defaultMode` |
+| `LP2` | `allowed-tools` granting every tool, a tool unrestricted, or scoping to an interpreter that runs arbitrary code |
+| `AS1` | bundle reads `.claude/`, `mcp.json`, another agent's config, or a peer skill's `SKILL.md` |
+| `SC1` / `SC2` | MCP server launched from an unpinned package, or over plaintext `http` |
+| `INJ` / `SH` | the full injection and shell-malice scanners over the bundle's own files |
+
+A bundle is untrusted by definition, so **both** injection tiers are reported here - the
+agent-instruction-file gate used on the write path does not apply, because every file in a
+skill bundle is in effect an instruction file.
+
+It is deliberately a CLI, not a hook: the result only changes at install time, so paying a
+directory walk on every session start would be latency for nothing.
+
+**Scope.** This is triage - what a zero-dependency file walker does well. No AST, no taint
+analysis, no YARA, no vulnerability database, and it cannot read the tool descriptions a
+running MCP server serves. For that depth use NVIDIA's
+[SkillSpector](https://github.com/NVIDIA/skillspector), which is built for it.
+
+Scanning a security tool with a security tool lights up: shellter's own detector source
+contains the literal patterns it matches, and its test corpus contains attack strings by
+design. That is expected. shellter does **not** exempt its own files - a self-exemption was
+tried once and reverted as a confirmed security regression.
 
 ## Troubleshooting
 

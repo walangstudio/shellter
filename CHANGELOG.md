@@ -116,12 +116,66 @@ the first round. Folded in here:
   linear `split`/`join`, so reconstruction is complete and there is no truncation point to
   go unrecorded.
 
+**`shellter scan` — the half that was never guarded.** The hooks inspect what the agent
+emits. Nothing inspected what it is given: a plugin's `SKILL.md` goes straight into context,
+its `hooks.json` runs on lifecycle events before any tool call, and its `.mcp.json` names a
+server whose tool descriptions the model reads as instructions. None of that crosses a
+PreToolUse hook, so none of it was ever looked at.
+
+`node hooks/shellter-scan.js <path>` (or `npm run scan --`) walks a bundle and reports
+BH1/BH2/BH3 (shipped hooks, a hook that posts to a non-loopback URL, shipped blanket
+permissions), LP2 (`allowed-tools` breadth), AS1 (reads `.claude/`, `mcp.json`, a peer
+skill), SC1/SC2 (unpinned or plaintext MCP servers), plus the full injection and
+shell-malice scanners over the bundle's files with BOTH tiers reported, since every file in
+a skill bundle is in effect an instruction file. Exits 1 on any high finding. CLI, not a
+hook: the answer only changes at install time.
+
+Triage only - no AST, taint, YARA, or vulnerability database, and it cannot see a running
+MCP server's tool descriptions. The README points at NVIDIA SkillSpector for that depth.
+
+Running it against real installed plugins immediately found a false positive in its own
+LP2 rule: `Bash(node *)` is scoped to node, not a grant of everything, and is now reported
+as medium ("scoped to an interpreter that runs arbitrary code") rather than high.
+
+**Derived scan views no longer re-report what the raw scan already found.** Stripping
+markers or folding compatibility forms does not remove the original payload, so a single
+hit was surfacing three times (`x`, `x:nfkc`, `x:marker-stripped`), burying the one view
+that had actually found something new. On shellter's own tree that alone cut findings from
+20 high / 51 medium to 8 / 36 with no loss of detection.
+
+A third review round found eight more, including one regression from round two:
+
+- *The view dedupe dropped an escalation.* Keying only on the signal name meant a derived
+  view could not report `html-comment-action` as HIGH when the raw pass had already emitted
+  it as MEDIUM - and that signal's severity is context-dependent (HIGH only when the comment
+  names an exfil target). A marker-obfuscated payload that reconstructed into a real
+  exfil comment therefore went from deny to **allow**. Dedupe now keys on signal AND
+  severity, so a view may still escalate; noise reduction is unchanged.
+- `commandWindows` in a shipped hook was never read, though it is what actually runs on
+  Windows and shellter's own `hooks.json` uses it.
+- Hooks declared in `settings.json` were never checked, only `hooks.json` - and
+  `settings.json` is where Claude Code hooks actually live, so the scanner's highest-value
+  rule was blind at its most likely location.
+- `dist`, `build`, `target` and `vendor` were skipped. That is a linter convention applied
+  to the wrong question: for a pre-install audit those hold the shipped code that will run.
+  They are walked now, and every remaining skip (dependency tree, symlink, depth or file
+  limit, oversize, unreadable) is named under NOT INSPECTED rather than silently folded into
+  a clean result. `--strict` exits 1 when any gap exists.
+- The 1 MB file cap made "pad the file" a one-line evasion, and reported the result as
+  "skipped (binary/non-text)". Cap raised to 4 MB and oversize is now reported honestly.
+- `allowed-tools` in YAML block-list form only ever read the first item, so a `- Bash`
+  below any other entry was missed.
+- A bare `"Bash"` in `permissions.allow` grants every Bash invocation but was not matched -
+  only the more explicit `Bash(*)` was.
+- `allowed-tools` was only checked in `SKILL.md`, never in a plugin's `commands/*.md` or
+  `agents/*.md`, which carry the same grant.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-651 tests.
+668 tests.
 
 ## [0.7.1] - 2026-07-29
 

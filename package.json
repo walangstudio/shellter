@@ -21,7 +21,8 @@
   ],
   "scripts": {
     "test": "node test-hooks.js",
-    "install-hooks": "node merge-settings.js"
+    "install-hooks": "node merge-settings.js",
+    "scan": "node hooks/shellter-scan.js"
   },
   "engines": {
     "node": ">=18"

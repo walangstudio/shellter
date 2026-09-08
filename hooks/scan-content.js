@@ -465,6 +465,28 @@ function scanInjection(text, opts) {
   const findings = [];
   scanInjectionText(findings, text);
 
+  // A derived view re-reports whatever the raw scan already saw, because stripping markers
+  // or folding compatibility forms does not remove the original payload. Reporting the same
+  // signal three times (raw, :nfkc, :marker-stripped) is noise that buries the one view that
+  // actually found something new. Only a signal no earlier view produced is worth adding.
+  // Dedupe on signal AND severity, never on the name alone. The same signal is emitted at
+  // two severities depending on context -- `html-comment-action` is HIGH only when the
+  // comment also names an exfil target. If the raw pass saw the MEDIUM form and a derived
+  // view then reveals the exfil target, that HIGH is new information and must survive;
+  // skipping it by name turned a deny into an allow.
+  const seenSeverity = new Map();
+  for (const f of findings) {
+    seenSeverity.set(f.signal, Math.max(seenSeverity.get(f.signal) || 0, RANK[f.severity] || 0));
+  }
+  const addView = (sub, suffix) => {
+    for (const f of sub) {
+      const rank = RANK[f.severity] || 0;
+      if ((seenSeverity.get(f.signal) || 0) >= rank) continue;   // nothing new to say
+      seenSeverity.set(f.signal, rank);
+      findings.push({ ...f, signal: f.signal + suffix, line: 0 });
+    }
+  };
+
   // Extra views. Each is gated on a cheap test so ordinary ASCII content pays nothing
   // (the non-ASCII probe is ~0.01ms on 28KB), and each reports line 0 like the decoded
   // layer already does -- these transforms are not length-preserving, so an offset into
@@ -478,7 +500,7 @@ function scanInjection(text, opts) {
     if (nfkc !== text) {
       const sub = [];
       scanInjectionText(sub, nfkc, true);
-      for (const f of sub) findings.push({ ...f, signal: f.signal + ':nfkc', line: 0 });
+      addView(sub, ':nfkc');
     }
   }
 
@@ -486,7 +508,7 @@ function scanInjection(text, opts) {
   if (rebuilt) {
     const sub = [];
     scanInjectionText(sub, rebuilt, true);
-    for (const f of sub) findings.push({ ...f, signal: f.signal + ':marker-stripped', line: 0 });
+    addView(sub, ':marker-stripped');
   }
 
   if (opts.decode !== false) {
@@ -494,7 +516,7 @@ function scanInjection(text, opts) {
     if (decoded) {
       const sub = [];
       scanInjectionText(sub, decoded, true);
-      for (const f of sub) findings.push({ ...f, signal: f.signal + ':decoded', line: 0 });
+      addView(sub, ':decoded');
     }
   }
   return findings;
