@@ -42,13 +42,13 @@ false positives or add fragile complexity out of proportion to the risk:
   verb meets a secret token, which is precisely the attack, and the suite stays green.
   `X=rm; $X -rf /` is covered by the same change: the deny tables accept predicate matchers,
   and `rmDanger` is evaluated over the expanded variant like every other rule.
-- **Subshell scoping is not modelled** — `( X=.env ); cat $X` hard-denies, though bash scopes
-  the assignment to the subshell and `$X` is unset outside. Deliberate over-approximation:
-  telling `( … )` (scoped) from `{ … ; }` (not scoped) would risk the two adjacent shapes
-  where the deny is correct — `{ X=.env; cat $X; }` and `X=.env; ( cat $X )` — and the cost
-  is one blocked contrived command, not a missed read. The general rule the 0.8.0 review
-  established still holds and was applied everywhere else: prefer `ask` over a hard deny when
-  the analysis is uncertain, because a deny cannot be overridden in-session.
+- ~~**Subshell scoping is not modelled**~~ — **FIXED during the second 0.8.0 review round.**
+  An assignment is now only carried into later segments when the segment is assignments and
+  nothing else, so a subshell (`( X=.env ); cat $X`) and a command prefix
+  (`X=.env cat notes.txt; cat $X`) no longer leak — while a brace group, which does run in
+  the current shell, still does (`{ X=.env; cat $X; }` denies). The rule this round
+  established and applied throughout: prefer `ask` over a hard deny when the analysis is
+  uncertain, because a deny cannot be overridden in-session.
 - **PowerShell variable indirection is not expanded** — `$X = ".env"; Get-Content $X`.
   The assignment syntax differs (`$X = "v"`, not `X=v`), so the bash pre-pass does not match
   it and `varEnv` stays empty on the PS path. This is a lesser hole than the bash one was:
@@ -265,9 +265,12 @@ contains a shell metacharacter / `sh -c` / `&&` / `;` / `|`, `ask` otherwise.
   that does not exist for a real blind spot past the cutoff, exactly as the code comment at
   `check-sensitive-files.js:203-206` argues. The per-call cost is dominated by node process
   startup (~510 ms on Windows) regardless.
-- **D4 — single-layer decode.** `decodeOneLayer` (`scan-content.js:98-139`) is
-  one layer by design; double-encoded payloads evade the decoded-layer scan.
-  Acceptable, but document the limit.
+- **D4 — single-layer decode.** **FIXED in 0.8.0.** `decodeLayers` runs two rounds of
+  `decodeOneLayer` sharing ONE token budget, so a double-encoded payload is now decoded
+  while the worst-case work is unchanged and it is still not a decode bomb. Three layers
+  remains out of scope; each extra round buys a rarer payload for the same budget split
+  more thinly, and the marker/NFKC views cover the obfuscation an attacker would more
+  plausibly reach for next.
 - **D5 — README version/claim drift.** `README.md:205` says
   "Current: 0.6.0 — HTML-comment FP fix + self-exemption for shellter's own
   source" while badge/manifests/CHANGELOG are 0.5.4 and the self-exemption was

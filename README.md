@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-632%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-651%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -38,7 +38,7 @@ Unix parsing, PowerShell gets PS parsing and the PowerShell/cmd rule sets.
 - Prompt-injection detection in written content is **two-tier** (see [Injection-on-write](#injection-on-write)):
   - **Always blocked** (near-zero legitimate use): steganographic Unicode (invisible / tag-char / bidi-override / variation-selector smuggling, U+FE00–FE0F / U+E0100–E01EF, interleaved-surrogate re-forming), an override phrase co-located with an exfil target, MCP tool-poisoning `<IMPORTANT>` blocks, Policy-Puppetry config tags, encoded eval/exec, polyglot shell substitution in data files, markdown `javascript:`/`data:text/html` URLs, ANSI escapes in source
   - **Blocked only when written to an agent-instruction file** (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.clinerules`, `.windsurfrules`, `copilot-instructions.md`, `.mcp.json`, `.claude/**`), since the same text is legitimate in docs, tests, and AI-app source anywhere else: a bare instruction-override / jailbreak / role-hijack phrase, role markers (ChatML / Llama / Mistral), fake tool-call tags, line-start fake transcripts, homoglyph/mixed-script tokens, a lone HTML-comment action
-- Bounded base64/hex decode-one-layer rescan applies to both tiers
+- Both tiers are rescanned across extra views, each behind a cheap prefilter so plain-ASCII content pays nothing: a bounded **two-round** base64/hex decode sharing one token budget (double-encoded payloads no longer evade), an NFKC + confusable fold (a keyword written in fullwidth or Cyrillic/Greek lookalikes folds to ASCII), and **declared-marker reconstruction** — text that says "remove the `%%` markers below" then hides `i%%gn%%ore prev%%ious in%%structions` is reassembled and rescanned
 - Blocks grep patterns that extract a concrete secret token shape (AWS keys, GitHub/Slack tokens, JWTs, Bearer) on any path; a `keyword=value` credential search is blocked only across a broad off-project path (`/home`, `~`, a system root) — a self-audit inside your own repo is allowed
 
 ## Installation

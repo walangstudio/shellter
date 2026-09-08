@@ -733,27 +733,55 @@ const ASSIGN_RE = /(?:^|[;&|(\s])([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*
 // for a command that would never read the secret (`X=.env; cat '$X'` reads a file literally
 // named `$X`). A deny is unappealable in-session, unlike the `ask` used for uncertain
 // analysis, so single-quoted spans are left alone. Double-quoted spans DO expand.
+//
+// This MUST track both quote characters. Scanning for a bare `'` treats the apostrophe in
+// `cat "it's" $X` as opening a single-quoted span, which swallows the rest of the segment
+// and leaves `$X` unexpanded -- reopening the auto-approved secret read this whole pass
+// exists to close. One apostrophe was enough.
+const VAR_AT = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}|^\$([A-Za-z_][A-Za-z0-9_]*)/;
+
 function expandVars(s, env) {
   let out = '';
+  let q = null;
   let i = 0;
   while (i < s.length) {
-    const q = s.indexOf("'", i);
-    if (q === -1) { out += expandUnquoted(s.slice(i), env); break; }
-    out += expandUnquoted(s.slice(i, q), env);
-    const close = s.indexOf("'", q + 1);
-    if (close === -1) { out += s.slice(q); break; }   // unterminated: copy verbatim
-    out += s.slice(q, close + 1);
-    i = close + 1;
+    const c = s[i];
+    if (q === "'") { out += c; if (c === "'") q = null; i++; continue; }
+    if (q === '"') {
+      if (c === '\\' && i + 1 < s.length) { out += c + s[i + 1]; i += 2; continue; }
+      if (c === '"') { out += c; q = null; i++; continue; }
+    } else if (c === "'" || c === '"') { out += c; q = c; i++; continue; }
+    if (c === '$') {
+      const m = VAR_AT.exec(s.slice(i));
+      if (m) {
+        const v = env.get(m[1] || m[2]);
+        if (v !== undefined) { out += v; i += m[0].length; continue; }
+      }
+    }
+    out += c;
+    i++;
   }
+  if (q) noteGap('quote-parse');   // unterminated quote: we cannot say what expands
   return out;
 }
 
-function expandUnquoted(s, env) {
-  return s.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
-    (m, braced, bare) => {
-      const v = env.get(braced || bare);
-      return v === undefined ? m : v;
-    });
+// Blank out single-quoted spans (same quote-state rules) so callers can reason about the
+// parts bash would actually expand. Length-preserving, so offsets stay valid.
+function blankSingleQuoted(s) {
+  let out = '';
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { out += (c === "'" ? c : ' '); if (c === "'") q = null; continue; }
+    if (q === '"') {
+      if (c === '\\' && i + 1 < s.length) { out += c + s[++i]; continue; }
+      if (c === '"') q = null;
+      out += c; continue;
+    }
+    if (c === "'" || c === '"') { q = c; out += c; continue; }
+    out += c;
+  }
+  return out;
 }
 
 // Returns an array parallel to `segments`: the expanded form, or null when the
@@ -761,14 +789,14 @@ function expandUnquoted(s, env) {
 // is expanded, matching shell order -- `X=a; echo $X` expands in segment 1, and
 // `X=a echo $X` (env-prefix form) correctly does not, because bash expands $X
 // before the assignment takes effect there.
-function expandSegments(segments) {
+function expandSegments(segments, cwd) {
   const out = new Array(segments.length).fill(null);
   varEnv = new Map();
   resolvableAt = new Array(segments.length).fill(NO_NAMES);
   // Pre-seed unambiguous host variables at their real values. Two-way win: an ordinary
   // `cat $HOME/notes.txt` resolves and keeps auto-approving, and `cat $HOME/.ssh/id_rsa`
   // expands into a literal the deny rules can read.
-  for (const [name, val] of [['HOME', os.homedir()], ['PWD', process.cwd()],
+  for (const [name, val] of [['HOME', os.homedir()], ['PWD', cwd || process.cwd()],
                              ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username]]) {
     if (typeof val === 'string' && val && val.length <= VAR_VALUE_MAX) varEnv.set(name, val);
   }
@@ -784,6 +812,19 @@ function expandSegments(segments) {
     // `X=.env; unset X; cat $X` produced a hard deny for a read bash would never make.
     const un = /(?:^|[;&|(\s])unset\s+((?:[A-Za-z_]\w*\s*)+)/.exec(seg);
     if (un) for (const n of un[1].trim().split(/\s+/)) varEnv.delete(n);
+
+    // An assignment only PERSISTS when the segment is assignments and nothing else
+    // (optionally behind export/declare/...). `X=.env cat notes.txt` is a prefix scoped to
+    // that one command: bash runs `cat` with an empty argument and reads nothing, so
+    // carrying X forward produced an unappealable false deny on a later `cat $X`.
+    // A leading `{` is stripped but a leading `(` is not: a brace group runs in the current
+    // shell so its assignments persist, while a subshell's do not (`( X=.env ); cat $X`
+    // reads nothing). Keeping the paren in the body makes the test below fail, which is
+    // exactly the wanted behaviour.
+    let body = seg.replace(/^\s*\{\s*/, '');
+    body = body.replace(/^\s*(?:export|declare|typeset|readonly|local)\s+/, '');
+    const persists = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|)]*)\s*)+$/.test(body);
+    if (!persists) continue;
 
     ASSIGN_RE.lastIndex = 0;
     let m;
@@ -1804,9 +1845,18 @@ function checkSegmentApprove(seg, depth, isPosh, idx) {
 // through -- the same auto-approve-a-secret-read shape this floor exists to stop.
 const CMD_KEYWORDS = new Set(['do', 'then', 'else', 'elif']);
 
+// Flags whose value is a count or an offset, never a path. Without this,
+// `head -n $N file.txt` and `grep -A $N notes.md` lose auto-approval over a variable that
+// could not name a file. `-f`/`--file` deliberately absent: those DO name a file.
+const NUMERIC_VALUE_FLAG =
+  /^-(?:n|c|m|A|B|C|-lines|-bytes|-max-count|-after-context|-before-context|-context)$/;
+
 function hasUnresolvedRead(seg, idx) {
   const known = resolvableAt[idx] || NO_NAMES;
-  const toks = tokenizeArgs(seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, ''));
+  // Single-quoted spans are program text, not paths, and bash never expands them --
+  // `awk '{print $NF}' access.log` and `grep -o 'v$VERSION' f` must keep approving.
+  // Same reasoning as expandVars; blanking keeps offsets intact.
+  const toks = tokenizeArgs(blankSingleQuoted(seg).replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, ''));
   if (!toks.length) return false;
   // Step over shell keywords and command wrappers (`timeout 5 cat $X`, `sudo -u x cat $X`,
   // `do cat $f`) and the flags/values they take, so the read verb behind one is still seen.
@@ -1829,9 +1879,16 @@ function hasUnresolvedRead(seg, idx) {
     }
   }
   if (at >= toks.length) return false;
-  if (!READ_VERB_SET.has(toks[at].replace(/^.*[\\/]/, ''))) return false;
+  const verb = toks[at].replace(/^.*[\\/]/, '');
+  if (!READ_VERB_SET.has(verb)) return false;
+  // A program/pattern verb's first positional is its program, not a path (`jq '.a' f`).
+  // The deny side already skips it; the floor must too, or `sed $EXPR f` stops approving.
+  let skipProgramArg = PROGRAM_ARG_VERBS.has(verb);
   for (let i = at + 1; i < toks.length; i++) {
     const t = toks[i];
+    if (NUMERIC_VALUE_FLAG.test(t)) { i++; continue; }   // its value is a count, not a path
+    if (t.startsWith('-')) continue;
+    if (skipProgramArg) { skipProgramArg = false; continue; }
     if (/\$\(|`/.test(t)) return true;               // command substitution: opaque
     for (const m of t.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) {
       if (!known.has(m[1])) return true;             // no literal value at this point
@@ -1926,7 +1983,7 @@ function readBoundedForScan(absPath) {
     const n = fs.readSync(fd, buf, 0, trust.TRUST_SCAN_BYTES, 0);
     const size = fs.fstatSync(fd).size;
     const slice = buf.subarray(0, n);
-    for (let i = 0; i < slice.length; i++) if (slice[i] === 0) return { opaque: 'binary' }; // binary
+    for (let i = 0; i < slice.length; i++) if (slice[i] === 0) return null;   // binary: nothing to scan, not a coverage gap
     return { buf: slice, size, truncated: size > n };
   } catch (e) {
     // A script that is simply not there is not a coverage gap -- the command will
@@ -2058,7 +2115,7 @@ process.stdin.on('end', () => {
 
   // Cross-segment variable expansion, computed once and fed to both deny passes
   // as an extra match variant. Also populates varEnv for the approve floor.
-  const expanded = expandSegments(segments);
+  const expanded = expandSegments(segments, cwd);
 
   for (let i = 0; i < segments.length; i++) {
     checkSegmentDeny(segments[i], 0, 'hard', expanded[i]);

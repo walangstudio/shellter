@@ -95,6 +95,22 @@ function locate(text, index) {
   return { line, snippet: maskSecrets(snippet) };
 }
 
+// Two rounds of decodeOneLayer, sharing ONE token budget. Double-encoded payloads
+// (base64 of base64, the documented D4 gap) were invisible to a single pass, while an
+// unbounded recursion would be a decode bomb. Splitting a fixed budget across two rounds
+// buys the extra layer at no extra worst-case work: round 2 only runs on what round 1
+// produced, and only with the tokens round 1 did not spend.
+function decodeLayers(text, opts) {
+  opts = opts || {};
+  const budget = opts.maxTokens || 8;
+  const first = decodeOneLayer(text, Object.assign({}, opts, { maxTokens: budget, _report: true }));
+  if (!first.text) return '';
+  const left = budget - first.used;
+  if (left <= 0) return first.text;
+  const second = decodeOneLayer(first.text, Object.assign({}, opts, { maxTokens: left, _report: true }));
+  return second.text ? first.text + '\n' + second.text : first.text;
+}
+
 // Decode the highest-value encoded tokens once (NO recursion -- a DoS guard).
 // Returns concatenated decoded text (utf8, plus utf16le when the buffer looks
 // like UTF-16LE, e.g. PowerShell -EncodedCommand). Empty string when nothing
@@ -135,7 +151,9 @@ function decodeOneLayer(text, opts) {
       if (printableRatio(u8) > 0.8) { out.push(u8); used++; }
     } catch { /* not hex */ }
   }
-  return out.join('\n');
+  // `_report` is for decodeLayers, which needs the spend to size round 2. Every other
+  // caller keeps the original string return.
+  return opts._report ? { text: out.join('\n'), used } : out.join('\n');
 }
 
 function printableRatio(s) {
@@ -240,7 +258,18 @@ const CONFUSABLE_FOLD = {
   'а':'a','е':'e','і':'i','о':'o','р':'p','с':'c','у':'y','х':'x',
   'Α':'A','Β':'B','Ε':'E','Η':'H','Ι':'I','Κ':'K','Μ':'M','Ν':'N','Ο':'O','Ρ':'P','Τ':'T','Υ':'Y','Χ':'X',
   'ο':'o','α':'a',
+  // More Cyrillic/Greek lookalikes. Every entry MUST be a single char mapping to a
+  // single ASCII char: foldConfusables relies on the fold being length-preserving so
+  // match offsets stay valid against the unfolded text.
+  'Ѕ':'S','ѕ':'s','Ј':'J','ј':'j','Ԛ':'Q','ԛ':'q','Ԝ':'W','ԝ':'w','Ғ':'F','Ӏ':'l',
+  'Ζ':'Z','Ν':'N','Ρ':'P','Ϲ':'C','ϲ':'c','Ϳ':'J','ι':'i','κ':'k','ρ':'p','τ':'t','χ':'x',
 };
+// Fullwidth Latin (U+FF21-FF3A, U+FF41-FF5A) folds 1:1 onto ASCII. Generated rather than
+// typed out, and merged in the same map so the two stay in sync by construction.
+for (let i = 0; i < 26; i++) {
+  CONFUSABLE_FOLD[String.fromCharCode(0xff21 + i)] = String.fromCharCode(65 + i);
+  CONFUSABLE_FOLD[String.fromCharCode(0xff41 + i)] = String.fromCharCode(97 + i);
+}
 const CONFUSABLE = Object.keys(CONFUSABLE_FOLD).join('');
 const HOMOGLYPH_TOKEN_RE = new RegExp('\\b(?=[A-Za-z]*[' + CONFUSABLE + '])(?=[' + CONFUSABLE + ']*[A-Za-z])[A-Za-z' + CONFUSABLE + ']{3,}\\b', 'u');
 // Fold confusables to the ASCII letters they imitate, so the semantic keyword matchers
@@ -256,6 +285,45 @@ function foldConfusables(s) {
   return out;
 }
 const ROLE_LINE_RE = /^[ \t>*-]*\b(System|Human|Assistant|User|AI)\s*:/gim;
+
+// ---- declared-marker reconstruction -----------------------------------------
+// The payload tells the reader how to reassemble it: "ignore the %% markers below",
+// then `i%%gn%%ore prev%%ious in%%structions`. Every literal matcher sees only the
+// broken form. Parse the directive, strip the declared marker, rescan the result.
+//
+// Deliberately just the head of the distribution -- one directive shape, quoted marker.
+// The long tail (HTML-entity-encoded quotes, passive voice, spaced-out verbs, paired
+// tags) is a large amount of code for progressively rarer phrasings.
+// Built from parts: both word orders occur naturally ("remove the '%%' markers" and
+// "remove the markers '%%'"), and only matching one of them misses half the phrasings.
+const MK_VERB = '\\b(?:remov|strip|delet|drop|omit|eras|ignor|skip)\\w*';
+const MK_FILL = '(?:\\s+(?:the|all|any|every|each|literal|following|below|above|these|those))*';
+const MK_NOUN = '(?:marker|token|separator|delimiter|substring|string|char\\w*|symbol|sequence)s?';
+const MK_Q = '["\'`‘’“”]';
+const MK_BODY = '([^"\'`‘’“”\\s]{1,16})';
+const MARKER_DIRECTIVE_RES = [
+  new RegExp(MK_VERB + MK_FILL + '\\s+' + MK_Q + MK_BODY + MK_Q + '[^\\n]{0,30}?' + MK_NOUN, 'gi'),
+  new RegExp(MK_VERB + MK_FILL + '\\s+' + MK_NOUN + '[^\\n]{0,30}?' + MK_Q + MK_BODY + MK_Q, 'gi'),
+];
+const MAX_MARKERS = 3;
+
+function reconstructDeclaredMarkers(text) {
+  const markers = [];
+  for (const re of MARKER_DIRECTIVE_RES) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text)) && markers.length < MAX_MARKERS) {
+      if (!markers.includes(m[1])) markers.push(m[1]);
+    }
+  }
+  if (!markers.length) return '';
+  // split/join is linear and removes every occurrence, so there is no removal ceiling to
+  // truncate at -- and therefore no silent "we stopped reconstructing here" blind spot.
+  // (The earlier bounded slice loop was quadratic, which is why it needed one.)
+  let out = text;
+  for (const mk of markers) out = out.split(mk).join('');
+  return out === text ? '' : out;
+}
 
 // ---- scanners ---------------------------------------------------------------
 
@@ -301,7 +369,7 @@ function scanShell(text, opts) {
   const findings = [];
   runShellPack(findings, text, 'shell');
   if (opts.decode !== false) {
-    const decoded = decodeOneLayer(text);
+    const decoded = decodeLayers(text);
     if (decoded) {
       const sub = [];
       runShellPack(sub, decoded, 'shell');
@@ -396,8 +464,33 @@ function scanInjection(text, opts) {
   if (typeof text !== 'string' || !text) return [];
   const findings = [];
   scanInjectionText(findings, text);
+
+  // Extra views. Each is gated on a cheap test so ordinary ASCII content pays nothing
+  // (the non-ASCII probe is ~0.01ms on 28KB), and each reports line 0 like the decoded
+  // layer already does -- these transforms are not length-preserving, so an offset into
+  // them would point at the wrong source line.
+  //
+  // NFKC folds compatibility forms (fullwidth, ligatures, circled letters) onto their
+  // ASCII equivalents, catching a keyword spoofed with characters foldConfusables does
+  // not enumerate.
+  if (/[^\x00-\x7F]/.test(text)) {
+    const nfkc = text.normalize('NFKC');
+    if (nfkc !== text) {
+      const sub = [];
+      scanInjectionText(sub, nfkc, true);
+      for (const f of sub) findings.push({ ...f, signal: f.signal + ':nfkc', line: 0 });
+    }
+  }
+
+  const rebuilt = reconstructDeclaredMarkers(text);
+  if (rebuilt) {
+    const sub = [];
+    scanInjectionText(sub, rebuilt, true);
+    for (const f of sub) findings.push({ ...f, signal: f.signal + ':marker-stripped', line: 0 });
+  }
+
   if (opts.decode !== false) {
-    const decoded = decodeOneLayer(text);
+    const decoded = decodeLayers(text);
     if (decoded) {
       const sub = [];
       scanInjectionText(sub, decoded, true);
@@ -422,6 +515,7 @@ function highest(findings) {
 }
 
 module.exports = {
-  SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
+  SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer, decodeLayers,
+  foldConfusables,
   scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile,
 };

@@ -65,12 +65,63 @@ nothing for a `settings.json` an older installer already wrote, so `merge-settin
 detects those seven wildcards and warns, naming the file. It does not edit the list, since
 you may have added entries of your own to it.
 
+**Scanner depth.** Three gaps in `scan-content.js`, all reached by every caller at once
+since the file is shared:
+
+- *Double-encoded payloads (documented gap D4).* `decodeOneLayer` was one pass by design, so
+  base64-of-base64 was invisible. `decodeLayers` runs two rounds sharing ONE token budget:
+  round 2 only sees what round 1 produced, and only spends what round 1 did not, so the extra
+  layer costs no extra worst-case work and is still not a decode bomb.
+- *Declared-marker reconstruction.* The payload tells the reader how to reassemble it -
+  "remove the '%%' markers below", then `i%%gn%%ore prev%%ious in%%structions`. Every literal
+  matcher saw only the broken form. The directive is now parsed (both word orders), the
+  declared marker stripped, and the result rescanned. Bounded to 3 markers and 256 removals.
+- *Compatibility-form spoofing.* An NFKC view plus a widened confusable table catch a keyword
+  written in fullwidth or other compatibility characters (`Ｉｇｎｏｒｅ`). The table stays
+  strictly 1:1 so `foldConfusables` keeps match offsets valid; fullwidth entries are generated
+  in a loop rather than typed.
+
+Each new view sits behind a cheap prefilter, so pure-ASCII content pays nothing: scanning a
+28 KB ASCII file went 1.98 ms -> 2.03 ms, and only files actually containing non-ASCII take
+the extra NFKC pass (2.10 ms -> 3.92 ms). Against the ~520 ms of `node` process startup that
+dominates every hook call on Windows, end-to-end cost is unchanged to +2%.
+
+CI runs on current major action versions (`checkout@v7`, `setup-node@v7`) and adds Node 24.
+
+A second review round on this diff caught six more, four of them regressions introduced by
+the first round. Folded in here:
+
+- *One apostrophe reopened the whole bypass.* The single-quote skip scanned for a bare `'`,
+  so the apostrophe in `cat "it's" $X` opened a "quoted span" that swallowed the rest of the
+  segment, `$X` never expanded, and the read was auto-approved again. Quote state is now
+  tracked properly across both quote characters, with backslash escapes inside double
+  quotes; an unterminated quote records a coverage gap rather than silently not expanding.
+- *Local binaries prompted forever.* Treating a binary as a coverage gap returned `ask`
+  before the trust-store lookup, so `./mytool --help` prompted on every run and
+  `shellter-trust add` could not silence it. A binary is a file we were never going to scan,
+  not a failed scan; it falls through as before. A genuine read failure (EACCES) still
+  records a gap.
+- *`awk '{print $NF}'` lost auto-approval.* The approve floor tokenized single-quoted
+  program text and saw `$NF` as an unresolved path variable. It now blanks single-quoted
+  spans, skips a program/pattern verb's first positional, and skips the value of numeric
+  flags (`head -n $N file.txt`).
+- *Command-prefix assignments leaked.* `X=.env cat notes.txt; cat $X` hard-denied, though
+  bash scopes the prefix to that one command and reads nothing. An assignment is carried
+  forward only when the segment is assignments and nothing else. This also fixed the
+  subshell over-deny recorded as an accepted limit above, while `{ X=.env; cat $X; }` still
+  denies because a brace group does run in the current shell.
+- *`$PWD` used the hook's cwd* rather than the tool call's, which could mask a hit or
+  manufacture one.
+- *The marker-removal ceiling was silent.* Replaced the quadratic bounded slice loop with a
+  linear `split`/`join`, so reconstruction is complete and there is no truncation point to
+  go unrecorded.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-632 tests.
+651 tests.
 
 ## [0.7.1] - 2026-07-29
 
