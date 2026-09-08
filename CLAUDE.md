@@ -64,3 +64,7 @@ Every line here exists because it went wrong at least once.
 - The approve floor must step over wrappers and shell keywords before looking for the command word. `timeout 5 cat $X` and `do cat $f` walked past a first-token check.
 - An assignment persists to later segments only when the segment is assignments and nothing else; a brace group counts, a subshell and a command prefix do not.
 - `git config` is blocked by shellter's own rules in this tree. Use `F:\bin\ghc.bat kitty` from inside the repo to set identity.
+- Any check that asks "is this variable resolved?" must mirror `VAR_AT` exactly. `${X:-d}`, `${X#p}`, `${X/a/b}` and `${X:0:9}` are never expanded, so treating them as resolved auto-approves a secret read.
+- Classify files by content, not extension. Selecting scan targets by suffix meant renaming `hook.sh` to `hook` skipped it entirely, with no gap recorded.
+- `#!/usr/bin/env node` is not a shell script. Listing `env` in a shebang alternation matches every Node CLI and scans it with shell rules.
+- Bound every regex repetition that can match attacker-controlled text. Unbounded `{2,}` in the var-composed rule was quadratic: 24KB stalled the hook 22 seconds.

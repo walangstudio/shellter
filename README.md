@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-668%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-690%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -258,7 +258,7 @@ a clean result over an unwalked subtree is not evidence of anything.
 | `LP2` | `allowed-tools` granting every tool, a tool unrestricted, or scoping to an interpreter that runs arbitrary code |
 | `AS1` | bundle reads `.claude/`, `mcp.json`, another agent's config, or a peer skill's `SKILL.md` |
 | `SC1` / `SC2` | MCP server launched from an unpinned package, or over plaintext `http` |
-| `INJ` / `SH` | the full injection and shell-malice scanners over the bundle's own files |
+| `INJ` / `SH` | the full injection and shell-malice scanners over the bundle's own files, including `secret-read-uploaded` (a script that reads a secret and posts it out) |
 
 A bundle is untrusted by definition, so **both** injection tiers are reported here - the
 agent-instruction-file gate used on the write path does not apply, because every file in a

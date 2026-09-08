@@ -30,7 +30,6 @@ const MAX_DEPTH = 12;
 // actually run, so skipping them is the linter convention applied to the wrong question.
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__',
                            '.tox', '.pytest_cache', '.mypy_cache']);
-const TEXT_EXT = /\.(md|markdown|json|ya?ml|toml|sh|bash|zsh|ps1|psm1|js|mjs|cjs|ts|py|rb|txt)$/i;
 
 const SEV_RANK = { high: 3, medium: 2, low: 1 };
 
@@ -70,7 +69,7 @@ function walk(root) {
 
 // Returns { text } when readable, or { skip } naming why. Oversize is NOT the same as
 // binary: padding a SKILL.md past the cap would otherwise be a one-line evasion reported
-// as "skipped (binary/non-text)".
+// as an ordinary binary skip.
 function readText(file) {
   try {
     const st = fs.statSync(file);
@@ -79,6 +78,19 @@ function readText(file) {
     for (let i = 0; i < buf.length; i++) if (buf[i] === 0) return { skip: null };   // binary
     return { text: buf.toString('utf8') };
   } catch (e) { return { skip: 'unreadable (' + ((e && e.code) || 'error') + ')' }; }
+}
+
+const SCRIPT_EXT = /\.(sh|bash|zsh|ksh|fish|ps1|psm1|cmd|bat)$/i;
+// The interpreter after an optional `env` must itself be a shell. Listing `env` as an
+// alternative made `#!/usr/bin/env node` match, so every Node CLI in a bundle was scanned
+// with shell rules and lit up on its own string literals.
+const SHEBANG = /^#!\s*(?:\S*\/)?(?:env\s+)?(?:sh|bash|zsh|ksh|dash|ash|fish)\b/;
+
+function looksLikeScript(file, text) {
+  const base = path.basename(file);
+  if (SCRIPT_EXT.test(base)) return true;
+  if (SHEBANG.test(text)) return true;
+  return !base.includes('.');            // extensionless file in a bundle
 }
 
 // ---- structural checks -------------------------------------------------------
@@ -260,8 +272,10 @@ function scanBundle(root) {
   for (const file of files) {
     const rel = path.relative(root, file).replace(/\\/g, '/');
     const base = path.basename(file).toLowerCase();
-    const isText = TEXT_EXT.test(file) || base === 'skill.md';
-    if (!isText) { skipped++; continue; }
+    // Do NOT gate on the extension. Dropping `.sh` off a malicious hook script was a
+    // one-token way to go completely uninspected -- no scan, no gap, and `--strict` still
+    // exited 0, defeating this file's own completeness guarantee. Decide by CONTENT: read
+    // it, and only skip when the bytes say binary. `readText` is already bounded.
     const r = readText(file);
     if (r.skip !== undefined) {
       skipped++;
@@ -279,7 +293,13 @@ function scanBundle(root) {
       add({ rule: 'INJ', severity: f.severity, file: rel,
             detail: f.signal + (f.line ? ' (line ' + f.line + ')' : '') });
     }
-    if (/\.(sh|bash|zsh|ps1|psm1)$/i.test(file)) {
+    // Shell rules belong on shell scripts. Gating on the extension alone let a hook script
+    // go uninspected just by dropping `.sh`, but running them over every .md and .js
+    // instead is worse noise than signal: `eval(` in JavaScript source and a `curl | sh`
+    // line in install docs are not payloads. Identify a script by what it is -- shell
+    // extension, an interpreter shebang, or no extension at all (in a bundle, that is
+    // overwhelmingly a script).
+    if (looksLikeScript(file, text)) {
       for (const f of scan.scanShell(text, { decode: true })) {
         if (f.severity !== 'high') continue;
         add({ rule: 'SH', severity: 'high', file: rel,
@@ -340,7 +360,7 @@ if (require.main === module) {
     console.log(JSON.stringify({ target: root, ...r, highCount: high.length }, null, 2));
   } else {
     console.log('shellter scan: ' + root);
-    console.log('  ' + r.inspected + ' files inspected, ' + r.skipped + ' skipped (binary/non-text)');
+    console.log('  ' + r.inspected + ' files inspected, ' + r.skipped + ' skipped (binary)');
     if (!r.findings.length) {
       console.log('\n  no findings.');
     } else {

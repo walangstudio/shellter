@@ -1889,10 +1889,37 @@ function hasUnresolvedRead(seg, idx) {
     if (NUMERIC_VALUE_FLAG.test(t)) { i++; continue; }   // its value is a count, not a path
     if (t.startsWith('-')) continue;
     if (skipProgramArg) { skipProgramArg = false; continue; }
-    if (/\$\(|`/.test(t)) return true;               // command substitution: opaque
-    for (const m of t.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g)) {
-      if (!known.has(m[1])) return true;             // no literal value at this point
+    if (tokenHasOpaqueExpansion(t, known)) return true;
+  }
+  return false;
+}
+
+// This MUST mirror VAR_AT (what expandVars actually substitutes) exactly. A looser test
+// here is a bypass, not a nicety: `${X:-default}`, `${X#pat}`, `${X%pat}`, `${X/a/b}` and
+// `${X:0:9}` are never expanded by the deny pass, so the deny rules never see the secret --
+// but a regex that merely scraped the base name out of them called the read "resolved" and
+// auto-approved it. `${X:-nope}` is an ordinary bash idiom, not exotic obfuscation.
+function tokenHasOpaqueExpansion(t, known) {
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] !== '$') continue;
+    const rest = t.slice(i);
+    if (rest.startsWith('$(') || rest.startsWith('`')) return true;   // command substitution
+    let m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}/.exec(rest);             // exact ${NAME}
+    if (m) {
+      if (!known.has(m[1])) return true;
+      i += m[0].length - 1;
+      continue;
     }
+    if (rest.startsWith('${')) return true;                           // any operator form
+    m = /^\$([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);                     // bare $NAME
+    if (m) {
+      if (!known.has(m[1])) return true;
+      i += m[0].length - 1;
+      continue;
+    }
+    // Positional and special parameters ($1, $@, $*, $?, $$, $-) expand in bash too and
+    // are never resolved here, so a read through one is opaque.
+    if (/^\$[0-9@*?$!#-]/.test(rest)) return true;
   }
   return false;
 }
