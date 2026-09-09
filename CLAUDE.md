@@ -73,3 +73,4 @@ Every line here exists because it went wrong at least once.
 - Hooks are stateless but PowerShell variables persist across tool calls. A cross-segment guard proves nothing about an attacker who just sends two separate calls.
 - A `:` after a PowerShell variable name means a namespace (`$env:`, `$using:`), not that variable. Expanding it splices the local value in and hard-denies a safe command.
 - Treat an embedded NUL in otherwise-printable text as obfuscation, not as a binary. `. script` and `cat script | bash` execute straight past it.
+- UTF-16 is ~50% NUL by construction, so any printable-ratio binary test skips every UTF-16 file. Windows PowerShell writes UTF-16LE from Out-File by default - decode before classifying.

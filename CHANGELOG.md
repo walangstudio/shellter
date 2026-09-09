@@ -254,12 +254,19 @@ simply false, plus a one-byte way to blind the bundle scanner:
   the presence of a NUL: mostly-printable content is scanned with NULs stripped and the NULs
   themselves reported, while a genuine binary stays a silent skip because a .png is not a gap.
 
+- *UTF-16 files went uninspected.* The printable-ratio test that separates a planted NUL
+  from a real binary classifies every UTF-16 file as binary, because UTF-16 is roughly half
+  NUL by construction - so a `.ps1` in the encoding Windows PowerShell's `Out-File` writes by
+  default was silently skipped while the identical payload in UTF-8 was caught. Both BOMs and
+  the BOM-less form (NULs sitting on one parity of byte offsets) are now decoded and scanned.
+  A genuine binary is still a silent skip.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-725 tests.
+730 tests.
 
 ## [0.7.1] - 2026-07-29
 

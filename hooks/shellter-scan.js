@@ -77,11 +77,48 @@ function walk(root) {
 // bytes are, not by the mere presence of a NUL: mostly-printable content is a script with
 // NULs planted in it, which we strip and scan; genuinely binary content is skipped as
 // before, silently, because a .png is not a coverage gap.
+// Returns decoded text for UTF-16 content, or null when it is not UTF-16. Recognises both
+// BOMs, and the BOM-less form by its signature: NULs sitting almost entirely on one parity
+// of byte offsets, which is what an ASCII-range payload looks like in UTF-16.
+function utf16Decode(buf) {
+  if (buf.length < 4) return null;
+  const bom = buf[0] === 0xFF && buf[1] === 0xFE ? 'le'
+            : buf[0] === 0xFE && buf[1] === 0xFF ? 'be' : null;
+  let endian = bom;
+  let start = bom ? 2 : 0;
+  if (!endian) {
+    let even = 0;
+    let odd = 0;
+    const n = Math.min(buf.length, 8192);
+    for (let i = 0; i < n; i++) if (buf[i] === 0) (i % 2 ? odd++ : even++);
+    const nul = even + odd;
+    if (nul < n * 0.3) return null;                 // not NUL-dense enough to be UTF-16
+    if (even > odd * 8) endian = 'be';
+    else if (odd > even * 8) endian = 'le';
+    else return null;                               // NULs on both parities: real binary
+  }
+  let body = buf.subarray(start);
+  if (endian === 'be') {                            // Node decodes LE only; swap pairs
+    const swapped = Buffer.from(body);
+    if (swapped.length % 2) return null;
+    swapped.swap16();
+    body = swapped;
+  }
+  const text = body.toString('utf16le');
+  return /�/.test(text.slice(0, 512)) ? null : text;
+}
+
 function readText(file) {
   try {
     const st = fs.statSync(file);
     if (st.size > MAX_FILE_BYTES) return { skip: 'over size cap (' + Math.round(st.size / 1024) + 'KB)' };
-    const buf = fs.readFileSync(file);
+    let buf = fs.readFileSync(file);
+    // UTF-16 is ~50% NUL by construction, so a printable-ratio test alone classifies every
+    // UTF-16 file as binary and skips it. That is not exotic: UTF-16LE-with-BOM is what
+    // Windows PowerShell's Out-File writes by default, so a perfectly ordinary .ps1 was
+    // going uninspected. Decode it to UTF-8 first and scan the real text.
+    const wide = utf16Decode(buf);
+    if (wide !== null) return { text: wide };
     let nul = 0;
     let printable = 0;
     for (let i = 0; i < buf.length; i++) {
