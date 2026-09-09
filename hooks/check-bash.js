@@ -795,6 +795,20 @@ function expandVars(s, env, isPosh) {
 // PowerShell variable names are case-insensitive; bash's are not.
 function varKey(name, isPosh) { return isPosh ? name.toLowerCase() : name; }
 
+// A value that is EXACTLY one already-known variable reference is an alias, so resolve it:
+// `X=.env; Y=$X; cat $Y` is the obvious next move once single-hop indirection is closed, and
+// both shells were leaving it to a prompt. One hop only, resolved against names already in
+// the map, so this cannot recurse or cycle -- and it keeps the invariant that expansion only
+// ever reveals text the user literally typed, since the alias target was itself a literal.
+const ALIAS_ONLY = /^(?:\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*))$/;
+
+function resolveAlias(val, env, isPosh) {
+  const bare = val.replace(/^(["'])([\s\S]*)\1$/, '$2');
+  const m = ALIAS_ONLY.exec(bare.trim());
+  if (!m) return undefined;
+  return env.get(varKey(m[1] || m[2], isPosh));
+}
+
 // Blank out single-quoted spans (same quote-state rules) so callers can reason about the
 // parts bash would actually expand. Length-preserving, so offsets stay valid.
 function blankSingleQuoted(s) {
@@ -862,7 +876,12 @@ function expandSegments(segments, cwd, isPosh) {
         const val = pm[3] !== undefined ? pm[3] : (pm[4] !== undefined ? pm[4] : (pm[5] || ''));
         if (!val) continue;
         if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
-        if (/[$`]/.test(val)) continue;
+        if (/[$`]/.test(val)) {                 // computed, not a literal
+          const alias = resolveAlias(val, varEnv, true);
+          if (alias === undefined) continue;
+          varEnv.set(varKey(pm[1] || pm[2], true), alias);
+          continue;
+        }
         varEnv.set(varKey(pm[1] || pm[2], true), val);
       }
       continue;
@@ -883,7 +902,12 @@ function expandSegments(segments, cwd, isPosh) {
       // the expansion. Record it: padding past the limits then reads through a wrapper
       // would otherwise be a silent allow rather than a prompt.
       if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
-      if (/[$`]/.test(val)) continue;   // computed, not a literal
+      if (/[$`]/.test(val)) {                 // computed, not a literal
+        const alias = resolveAlias(val, varEnv, false);
+        if (alias === undefined) continue;
+        varEnv.set(varKey(m[1], false), alias);
+        continue;
+      }
       varEnv.set(m[1], val);
     }
   }

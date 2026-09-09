@@ -218,12 +218,22 @@ The two limits this release had recorded rather than fixed are now closed:
   `settings.json` went quiet while still blanket-approving tools these hooks gate. It warns
   on one.
 
+One-hop variable aliases resolve on both paths. Once `cat $X` was closed, `X=.env; Y=$X;
+cat $Y` was the obvious next move, and both shells were leaving it to a prompt. A value that
+is exactly one already-known variable reference is now resolved through. Deliberately one hop,
+against names already in the map: it cannot recurse or cycle, and it keeps the invariant that
+expansion only ever reveals text the user literally typed, since the alias target was itself
+a literal. A concatenation (`Y=$X$X`) or an unknown source (`Y=$UNSET`) stays unresolved.
+
+Known limits, all landing on a prompt rather than an auto-approval: `Set-Variable` /
+`New-Variable` assignment forms, PowerShell here-strings, and chains longer than one hop.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-705 tests.
+712 tests.
 
 ## [0.7.1] - 2026-07-29
 

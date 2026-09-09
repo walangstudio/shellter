@@ -68,3 +68,4 @@ Every line here exists because it went wrong at least once.
 - Classify files by content, not extension. Selecting scan targets by suffix meant renaming `hook.sh` to `hook` skipped it entirely, with no gap recorded.
 - `#!/usr/bin/env node` is not a shell script. Listing `env` in a shebang alternation matches every Node CLI and scans it with shell rules.
 - Bound every regex repetition that can match attacker-controlled text. Unbounded `{2,}` in the var-composed rule was quadratic: 24KB stalled the hook 22 seconds.
+- Resolve a variable alias one hop only, against names already known. General re-expansion of computed values would break the invariant that expansion reveals only text the user literally typed.

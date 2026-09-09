@@ -1677,5 +1677,19 @@ testPosh('ps var: $global: scope resolves', join("$global:X = '.en", "v'; Get-Co
 // this read genuinely does hit the secret -- the deny is correct, not a fold collision.
 testPosh('ps var: case-insensitive reassignment wins', join("$x = 'safe.txt'; $X = '.en", "v'; Get-Content $x"), 'deny');
 
+console.log('\n--- v0.8.0: one-hop variable alias ---');
+// `Y=$X` is the obvious next move once `cat $X` is closed. One hop only, resolved against
+// names already known, so it cannot recurse -- and it keeps the invariant that expansion
+// only reveals text the user literally typed.
+testBash('alias: bash one-hop chain', join('X=.en', 'v; Y=$X; cat $Y'), 'deny');
+testBash('alias: bash quoted one-hop', join('X=.en', 'v; Y="$X"; cat $Y'), 'deny');
+testBash('alias: bash braced one-hop', join('X=.en', 'v; Y=${X}; cat $Y'), 'deny');
+testPosh('alias: ps one-hop chain', join("$X = '.en", "v'; $Y = $X; Get-Content $Y"), 'deny');
+// A benign alias must still auto-approve, and anything not a single known reference stays
+// unresolved rather than being guessed at.
+testBash('alias: benign chain still approves', 'X=notes.txt; Y=$X; cat $Y', 'allow');
+testBash('alias: unknown source is not resolved', 'Y=$UNSET; cat $Y', 'fallthrough');
+testBash('alias: concatenation is not an alias', 'X=a; Y=$X$X; cat $Y', 'fallthrough');
+
 console.log('\n=== Results: ' + passed + ' passed, ' + failed + ' failed ===');
 process.exit(failed > 0 ? 1 : 0);
