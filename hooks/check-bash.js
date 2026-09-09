@@ -881,7 +881,10 @@ function expandSegments(segments, cwd, isPosh) {
         const val = pm[3] !== undefined ? pm[3] : (pm[4] !== undefined ? pm[4] : (pm[5] || ''));
         if (!val) continue;
         if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
-        if (/[$`]/.test(val)) {                 // computed, not a literal
+        // A single-quoted value is already literal text -- neither shell expands there --
+        // so it must not go through alias resolution. `Y='$X'` names a file called $X, and
+        // resolving it to X's value hard-denied a read the shell would never make.
+        if (pm[4] === undefined && /[$`]/.test(val)) {   // computed, not a literal
           const alias = resolveAlias(val, varEnv, true);
           if (alias === undefined) continue;
           varEnv.set(varKey(pm[1] || pm[2], true), alias);
@@ -907,7 +910,10 @@ function expandSegments(segments, cwd, isPosh) {
       // the expansion. Record it: padding past the limits then reads through a wrapper
       // would otherwise be a silent allow rather than a prompt.
       if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
-      if (/[$`]/.test(val)) {                 // computed, not a literal
+      // A single-quoted value is already literal text -- neither shell expands there --
+      // so it must not go through alias resolution. `Y='$X'` names a file called $X, and
+      // resolving it to X's value hard-denied a read the shell would never make.
+      if (m[3] === undefined && /[$`]/.test(val)) {   // computed, not a literal
         const alias = resolveAlias(val, varEnv, false);
         if (alias === undefined) continue;
         varEnv.set(varKey(m[1], false), alias);
@@ -1972,7 +1978,7 @@ function hasUnresolvedRead(seg, idx) {
     if (NUMERIC_VALUE_FLAG.test(t)) { i++; continue; }   // its value is a count, not a path
     if (t.startsWith('-')) continue;
     if (skipProgramArg) { skipProgramArg = false; continue; }
-    if (tokenHasOpaqueExpansion(t, known)) return true;
+    if (tokenHasOpaqueExpansion(t, known, false)) return true;
   }
   return false;
 }
@@ -2019,7 +2025,7 @@ function tokenHasOpaqueExpansion(t, known, isPosh) {
       // `$using:PATH` and `$env:HOME` are unrelated to a local `$using` / `$env`.
       // Treating them as the same name spliced `.env` into `Get-Content $using:PATH`
       // and produced an unappealable false deny.
-      if (rest[m[0].length] === ':') return isPosh ? true : false;
+      if (isPosh && rest[m[0].length] === ':') return true;
       if (!known.has(varKey(m[1], isPosh))) return true;
       i += m[0].length - 1;
       continue;

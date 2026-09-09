@@ -74,3 +74,6 @@ Every line here exists because it went wrong at least once.
 - A `:` after a PowerShell variable name means a namespace (`$env:`, `$using:`), not that variable. Expanding it splices the local value in and hard-denies a safe command.
 - Treat an embedded NUL in otherwise-printable text as obfuscation, not as a binary. `. script` and `cat script | bash` execute straight past it.
 - UTF-16 is ~50% NUL by construction, so any printable-ratio binary test skips every UTF-16 file. Windows PowerShell writes UTF-16LE from Out-File by default - decode before classifying.
+- Never use a bare string as the replacement in String.replace here: a `$` followed by a backtick means "everything before the match" and splices the file into itself. Use a function replacement. This corrupted SECURITY-REVIEW.md and check-bash.js once each.
+- When adding a parameter that changes behaviour, update EVERY call site. An omitted third argument read as undefined and turned a PowerShell-only carve-out into a bash auto-approve.
+- Classify binary-vs-text by where the NULs sit, not by a printable ratio or amount. A ratio is diluted by appending filler; an amount flags every binary carrying strings.

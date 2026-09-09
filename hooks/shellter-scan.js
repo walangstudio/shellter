@@ -25,6 +25,9 @@ const MAX_FILES = 2000;
 // made "pad the file past the limit" a one-line way to go uninspected.
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_DEPTH = 12;
+// NULs tolerated inside otherwise-clean text before it is judged a real binary. A planted
+// NUL is a handful; a binary scatters them throughout.
+const MAX_PLANTED_NULS = 8;
 // Only dependency, VCS and cache trees are skipped. `dist`, `build`, `target` and `vendor`
 // are deliberately NOT here: for a pre-install audit those hold the shipped code that will
 // actually run, so skipping them is the linter convention applied to the wrong question.
@@ -120,14 +123,25 @@ function readText(file) {
     const wide = utf16Decode(buf);
     if (wide !== null) return { text: wide };
     let nul = 0;
-    let printable = 0;
-    for (let i = 0; i < buf.length; i++) {
-      const b = buf[i];
-      if (b === 0) { nul++; continue; }
-      if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127) || b >= 160) printable++;
-    }
+    for (let i = 0; i < buf.length; i++) if (buf[i] === 0) nul++;
     if (!nul) return { text: buf.toString('utf8') };
-    if (!buf.length || printable / buf.length < 0.8) return { skip: null };   // real binary
+
+    // Neither a printable RATIO nor a printable AMOUNT works here. A ratio is diluted by
+    // appending filler; an amount flags every real binary that happens to carry strings.
+    // The actual difference is WHERE the NULs are: a binary scatters them throughout, while
+    // padding is a block at the end and a planted NUL is a handful in otherwise clean text.
+    // So drop any trailing NUL run first, then judge what remains.
+    let end = buf.length;
+    while (end > 0 && buf[end - 1] === 0) end--;
+    let coreNul = 0;
+    let corePrintable = 0;
+    for (let i = 0; i < end; i++) {
+      const b = buf[i];
+      if (b === 0) { coreNul++; continue; }
+      if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127)) corePrintable++;
+    }
+    const isText = end > 0 && coreNul <= MAX_PLANTED_NULS && corePrintable / end >= 0.9;
+    if (!isText) return { skip: null };                          // genuinely binary
     return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul };
   } catch (e) { return { skip: 'unreadable (' + ((e && e.code) || 'error') + ')' }; }
 }

@@ -261,12 +261,34 @@ simply false, plus a one-byte way to blind the bundle scanner:
   the BOM-less form (NULs sitting on one parity of byte offsets) are now decoded and scanned.
   A genuine binary is still a silent skip.
 
+A sixth review round, on the round-five fixes themselves:
+
+- *The namespace carve-out fired on bash.* The `$env:`/`$using:` exception added last round
+  took an `isPosh` argument the bash call site never passed, so it read as `undefined` and
+  treated any bash `$NAME:` as resolved regardless of whether the name was known:
+  `cat $UNKNOWNVAR:foo` returned **allow**. Bash has no namespace concept, so the carve-out
+  must never fire there at all.
+- *Aliasing through a single-quoted value hard-denied a safe read.* Neither shell expands in
+  single quotes, so `X=.env; Y='$X'; cat $Y` opens a file literally named `$X` -- resolving
+  the alias to X's value denied a read the shell would never make.
+- *The NUL classifier was gameable by padding.* A whole-file printable ratio is diluted by
+  appending filler, so ~26% trailing NULs pushed a live script back under the threshold and
+  into a silent skip. Switching to a printable AMOUNT then flagged every real binary carrying
+  strings. Neither number is the right question: what separates them is WHERE the NULs sit.
+  A trailing run is padding and is dropped before judging; a binary scatters NULs throughout
+  and still skips silently. No magic size threshold either way.
+
+Known and left, both landing on a prompt rather than an auto-approval: the PowerShell floor
+does not split pipelines, so a read embedded behind an approved leading verb
+(`Write-Output 1 | %{ Get-Content $x }`) is not caught, and the `:` carve-out is not scoped
+to literal `env`/`using`, which costs a deny on `$SECRET:decoy` rather than granting one.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-730 tests.
+738 tests.
 
 ## [0.7.1] - 2026-07-29
 
