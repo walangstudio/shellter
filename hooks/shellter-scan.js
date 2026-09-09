@@ -70,13 +70,28 @@ function walk(root) {
 // Returns { text } when readable, or { skip } naming why. Oversize is NOT the same as
 // binary: padding a SKILL.md past the cap would otherwise be a one-line evasion reported
 // as an ordinary binary skip.
+// A NUL byte was the one skip that recorded no coverage gap, so a single planted NUL made a
+// live script invisible AND kept `--strict` at exit 0. `bash setup.sh` refuses such a file,
+// but `. setup.sh` and `cat setup.sh | bash` run straight past the NUL -- and those are the
+// shapes a hooks.json command or an install step uses. So classify by how text-like the
+// bytes are, not by the mere presence of a NUL: mostly-printable content is a script with
+// NULs planted in it, which we strip and scan; genuinely binary content is skipped as
+// before, silently, because a .png is not a coverage gap.
 function readText(file) {
   try {
     const st = fs.statSync(file);
     if (st.size > MAX_FILE_BYTES) return { skip: 'over size cap (' + Math.round(st.size / 1024) + 'KB)' };
     const buf = fs.readFileSync(file);
-    for (let i = 0; i < buf.length; i++) if (buf[i] === 0) return { skip: null };   // binary
-    return { text: buf.toString('utf8') };
+    let nul = 0;
+    let printable = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const b = buf[i];
+      if (b === 0) { nul++; continue; }
+      if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127) || b >= 160) printable++;
+    }
+    if (!nul) return { text: buf.toString('utf8') };
+    if (!buf.length || printable / buf.length < 0.8) return { skip: null };   // real binary
+    return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul };
   } catch (e) { return { skip: 'unreadable (' + ((e && e.code) || 'error') + ')' }; }
 }
 
@@ -284,6 +299,11 @@ function scanBundle(root) {
     }
     const text = r.text;
     inspected++;
+    if (r.planted) {
+      // Nothing legitimate embeds NULs in otherwise-plain text. Say so, and scan anyway.
+      add({ rule: 'OBF', severity: 'medium', file: rel,
+            detail: r.planted + ' NUL byte(s) embedded in text content (scanned with them stripped)' });
+    }
 
     // A bundle is untrusted by definition, so BOTH injection tiers are reported here.
     // The agent-instruction-file gate the write path uses does not apply: every file in a

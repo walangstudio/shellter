@@ -69,3 +69,7 @@ Every line here exists because it went wrong at least once.
 - `#!/usr/bin/env node` is not a shell script. Listing `env` in a shebang alternation matches every Node CLI and scans it with shell rules.
 - Bound every regex repetition that can match attacker-controlled text. Unbounded `{2,}` in the var-composed rule was quadratic: 24KB stalled the hook 22 seconds.
 - Resolve a variable alias one hop only, against names already known. General re-expansion of computed values would break the invariant that expansion reveals only text the user literally typed.
+- The PowerShell branch of `checkSegmentApprove` returns before the bash floor. Any new floor must be added to BOTH paths or it is dead code on one of them.
+- Hooks are stateless but PowerShell variables persist across tool calls. A cross-segment guard proves nothing about an attacker who just sends two separate calls.
+- A `:` after a PowerShell variable name means a namespace (`$env:`, `$using:`), not that variable. Expanding it splices the local value in and hard-denies a safe command.
+- Treat an embedded NUL in otherwise-printable text as obfuscation, not as a binary. `. script` and `cat script | bash` execute straight past it.

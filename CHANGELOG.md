@@ -205,8 +205,7 @@ The two limits this release had recorded rather than fixed are now closed:
 
 - *PowerShell variable indirection.* `$X = ".env"; Get-Content $X` reached the deny rules
   with the literal nowhere in sight, because the bash assignment pattern cannot match PS
-  syntax. It fell through to a prompt rather than auto-approving, so it was never a silent
-  allow, but under a broad `PowerShell(*)` rule it passed unexamined. PS assignments now get
+  syntax. PS assignments now get
   their own pattern, names folded to lower case (PowerShell is case-insensitive), and a
   backtick as the in-string escape. Same literal-only rule as bash.
   PowerShell quoting is respected on the same terms as bash: a backtick escapes the next
@@ -228,12 +227,39 @@ a literal. A concatenation (`Y=$X$X`) or an unknown source (`Y=$UNSET`) stays un
 Known limits, all landing on a prompt rather than an auto-approval: `Set-Variable` /
 `New-Variable` assignment forms, PowerShell here-strings, and chains longer than one hop.
 
+A fifth review round found the PowerShell half of this work was resting on a claim that was
+simply false, plus a one-byte way to blind the bundle scanner:
+
+- *PowerShell had no approve floor at all.* The `isPosh` branch of `checkSegmentApprove`
+  returns before the bash floor, so `hasUnresolvedRead` was dead code on that path:
+  `Get-Content $SomeUnknownVar` matched a read-only approve pattern and returned **allow**,
+  no prompt, whatever the variable held. This release had claimed PS indirection "fell
+  through to a prompt rather than auto-approving, so it was never a silent allow" - that was
+  wrong, and verified wrong on `origin/main` too. It is pre-existing rather than a
+  regression, but it is precisely the class the PS work claimed to close. Worse, hooks are
+  stateless while PowerShell variables persist across tool calls, so no cross-segment trick
+  is needed: send the assignment in one call and a bare `Get-Content $x` in the next. PS now
+  has its own floor over the content-reading cmdlets and aliases; `Get-ChildItem`/`ls` list a
+  directory and stay approvable.
+- *`$env:`/`$using:` collided with a same-named local variable.* `$using = ".env";
+  Get-Content $using:PATH` hard-denied, because the bare-name match consumed `using` and left
+  `:PATH` dangling. A namespace prefix is not the local variable of that name, and a deny is
+  unappealable, so this was a false positive introduced by this release. A `:` after the name
+  now blocks expansion.
+- *One NUL byte made a live script invisible to `shellter scan`.* An embedded NUL was the one
+  skip that recorded no coverage gap, so a planted NUL meant no findings, no gaps, and exit 0
+  even under `--strict`. `bash setup.sh` refuses such a file, but `. setup.sh` and
+  `cat setup.sh | bash` run straight past it - and those are the shapes a hooks.json command
+  or an install step uses. Classification is now by how text-like the bytes are rather than by
+  the presence of a NUL: mostly-printable content is scanned with NULs stripped and the NULs
+  themselves reported, while a genuine binary stays a silent skip because a .png is not a gap.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-712 tests.
+725 tests.
 
 ## [0.7.1] - 2026-07-29
 

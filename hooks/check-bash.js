@@ -779,8 +779,13 @@ function expandVars(s, env, isPosh) {
       if (c === '"') { out += c; q = null; i++; continue; }
     } else if (c === "'" || c === '"') { out += c; q = c; i++; continue; }
     if (c === '$') {
-      const m = at.exec(s.slice(i));
-      if (m) {
+      const rest = s.slice(i);
+      const m = at.exec(rest);
+      // A `:` right after the name means a namespace (`$env:PATH`, `$using:PATH`), not the
+      // local variable of that name. Expanding it spliced the local value in and left the
+      // `:SUFFIX` dangling, so `$using = ".env"; Get-Content $using:PATH` hard-denied a
+      // command PowerShell never reads `.env` for.
+      if (m && !(isPosh && rest[m[0].length] === ':')) {
         const v = env.get(varKey(m[1] || m[2], isPosh));
         if (v !== undefined) { out += v; i += m[0].length; continue; }
       }
@@ -1808,6 +1813,13 @@ function checkSegmentApprove(seg, depth, isPosh, idx) {
   // PowerShell tool: only the conservative PS read-only set auto-approves.
   // The Unix approve set (incl. the bash `curl|wget` rule) never runs here.
   if (isPosh) {
+    // The PS branch returns before the bash floor below, so PS had NO floor at all:
+    // `Get-Content $SomeUnknownVar` matched a read-only approve pattern and returned
+    // `allow` with no prompt, whatever the variable held. Each hook invocation is
+    // stateless while PowerShell variables persist across tool calls, so the assignment
+    // and the read can simply be sent as two separate calls -- the second one is a bare
+    // read of a variable this process never saw. Give PS its own floor first.
+    if (hasUnresolvedPoshRead(seg, idx)) return false;
     for (const pattern of POSH_APPROVE_PATTERNS) {
       if (pattern.test(seg)) return true;
     }
@@ -1970,7 +1982,26 @@ function hasUnresolvedRead(seg, idx) {
 // `${X:0:9}` are never expanded by the deny pass, so the deny rules never see the secret --
 // but a regex that merely scraped the base name out of them called the read "resolved" and
 // auto-approved it. `${X:-nope}` is an ordinary bash idiom, not exotic obfuscation.
-function tokenHasOpaqueExpansion(t, known) {
+// PowerShell counterpart of hasUnresolvedRead. Same principle: never auto-approve a read
+// whose target we cannot see. Matches the cmdlets and aliases that read file CONTENT, which
+// is the set POSH_DENY_PATTERNS already gates; `Get-ChildItem`/`ls` only list a directory
+// and stay approvable, as they do on the bash side.
+const POSH_READ_VERB =
+  /^\s*(?:Get-Content|gc|cat|type|more|Select-String|sls|findstr|Format-Hex|Import-Csv|Import-Clixml|Get-Item(?:Property)?|Get-Random)\b/i;
+
+function hasUnresolvedPoshRead(seg, idx) {
+  if (!POSH_READ_VERB.test(seg)) return false;
+  const known = resolvableAt[idx] || NO_NAMES;
+  // Blank single-quoted spans: PowerShell does not expand there, so `Get-Content '$X'`
+  // reads a file literally named `$X` and must not be dragged to a prompt.
+  const toks = tokenizeArgs(blankSingleQuoted(seg));
+  for (let i = 1; i < toks.length; i++) {
+    if (tokenHasOpaqueExpansion(toks[i], known, true)) return true;
+  }
+  return false;
+}
+
+function tokenHasOpaqueExpansion(t, known, isPosh) {
   for (let i = 0; i < t.length; i++) {
     if (t[i] !== '$') continue;
     const rest = t.slice(i);
@@ -1984,7 +2015,12 @@ function tokenHasOpaqueExpansion(t, known) {
     if (rest.startsWith('${')) return true;                           // any operator form
     m = /^\$([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);                     // bare $NAME
     if (m) {
-      if (!known.has(m[1])) return true;
+      // A `:` after the name makes this a namespace reference, not that variable:
+      // `$using:PATH` and `$env:HOME` are unrelated to a local `$using` / `$env`.
+      // Treating them as the same name spliced `.env` into `Get-Content $using:PATH`
+      // and produced an unappealable false deny.
+      if (rest[m[0].length] === ':') return isPosh ? true : false;
+      if (!known.has(varKey(m[1], isPosh))) return true;
       i += m[0].length - 1;
       continue;
     }
