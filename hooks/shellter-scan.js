@@ -25,9 +25,6 @@ const MAX_FILES = 2000;
 // made "pad the file past the limit" a one-line way to go uninspected.
 const MAX_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_DEPTH = 12;
-// NULs tolerated inside otherwise-clean text before it is judged a real binary. A planted
-// NUL is a handful; a binary scatters them throughout.
-const MAX_PLANTED_NULS = 8;
 // Only dependency, VCS and cache trees are skipped. `dist`, `build`, `target` and `vendor`
 // are deliberately NOT here: for a pre-install audit those hold the shipped code that will
 // actually run, so skipping them is the linter convention applied to the wrong question.
@@ -126,22 +123,20 @@ function readText(file) {
     for (let i = 0; i < buf.length; i++) if (buf[i] === 0) nul++;
     if (!nul) return { text: buf.toString('utf8') };
 
-    // Neither a printable RATIO nor a printable AMOUNT works here. A ratio is diluted by
-    // appending filler; an amount flags every real binary that happens to carry strings.
-    // The actual difference is WHERE the NULs are: a binary scatters them throughout, while
-    // padding is a block at the end and a planted NUL is a handful in otherwise clean text.
-    // So drop any trailing NUL run first, then judge what remains.
-    let end = buf.length;
-    while (end > 0 && buf[end - 1] === 0) end--;
-    let coreNul = 0;
-    let corePrintable = 0;
-    for (let i = 0; i < end; i++) {
+    // Judge the file by its NON-NUL bytes only. Every earlier attempt keyed on something an
+    // attacker controls for free: a whole-file printable ratio is diluted by appending NULs,
+    // a printable amount flags every binary that carries strings, and counting or locating
+    // the NULs just moved the threshold (a leading block, one NUL past the cap, or a NUL
+    // every 32 bytes each walked through it). How many NULs there are and where they sit is
+    // exactly what padding varies, so it cannot be the question. What a real binary actually
+    // looks like is non-printable CONTENT; a script is printable content with junk in it.
+    const nonNul = buf.length - nul;
+    let printable = 0;
+    for (let i = 0; i < buf.length; i++) {
       const b = buf[i];
-      if (b === 0) { coreNul++; continue; }
-      if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127)) corePrintable++;
+      if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127)) printable++;
     }
-    const isText = end > 0 && coreNul <= MAX_PLANTED_NULS && corePrintable / end >= 0.9;
-    if (!isText) return { skip: null };                          // genuinely binary
+    if (!nonNul || printable / nonNul < 0.9) return { skip: null };   // genuinely binary
     return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul };
   } catch (e) { return { skip: 'unreadable (' + ((e && e.code) || 'error') + ')' }; }
 }

@@ -283,12 +283,21 @@ does not split pipelines, so a read embedded behind an approved leading verb
 (`Write-Output 1 | %{ Get-Content $x }`) is not caught, and the `:` carve-out is not scoped
 to literal `env`/`using`, which costs a deny on `$SECRET:decoy` rather than granting one.
 
+*NUL placement is not the question.* The round-six rule dropped a trailing NUL run and then
+allowed up to eight interior NULs. That is still a threshold, and three shapes walked
+straight through it: a LEADING NUL block, one NUL past the cap, and one NUL every 32 bytes.
+How many NULs there are and where they sit is exactly what an attacker varies for free, so it
+cannot be the discriminator. Classification is now the printable ratio of the NON-NUL bytes:
+a real binary is non-printable content whatever its NULs do, and a script is printable
+content with junk in it. All eight placement variants are caught, real binaries stay a silent
+skip, and false positives across the installed plugins remain zero.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-738 tests.
+744 tests.
 
 ## [0.7.1] - 2026-07-29
 
