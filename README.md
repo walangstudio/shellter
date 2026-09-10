@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.7.1-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-598%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-754%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -38,7 +38,7 @@ Unix parsing, PowerShell gets PS parsing and the PowerShell/cmd rule sets.
 - Prompt-injection detection in written content is **two-tier** (see [Injection-on-write](#injection-on-write)):
   - **Always blocked** (near-zero legitimate use): steganographic Unicode (invisible / tag-char / bidi-override / variation-selector smuggling, U+FE00–FE0F / U+E0100–E01EF, interleaved-surrogate re-forming), an override phrase co-located with an exfil target, MCP tool-poisoning `<IMPORTANT>` blocks, Policy-Puppetry config tags, encoded eval/exec, polyglot shell substitution in data files, markdown `javascript:`/`data:text/html` URLs, ANSI escapes in source
   - **Blocked only when written to an agent-instruction file** (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.clinerules`, `.windsurfrules`, `copilot-instructions.md`, `.mcp.json`, `.claude/**`), since the same text is legitimate in docs, tests, and AI-app source anywhere else: a bare instruction-override / jailbreak / role-hijack phrase, role markers (ChatML / Llama / Mistral), fake tool-call tags, line-start fake transcripts, homoglyph/mixed-script tokens, a lone HTML-comment action
-- Bounded base64/hex decode-one-layer rescan applies to both tiers
+- Both tiers are rescanned across extra views, each behind a cheap prefilter so plain-ASCII content pays nothing: a bounded **two-round** base64/hex decode sharing one token budget (double-encoded payloads no longer evade), an NFKC + confusable fold (a keyword written in fullwidth or Cyrillic/Greek lookalikes folds to ASCII), and **declared-marker reconstruction** — text that says "remove the `%%` markers below" then hides `i%%gn%%ore prev%%ious in%%structions` is reassembled and rescanned
 - Blocks grep patterns that extract a concrete secret token shape (AWS keys, GitHub/Slack tokens, JWTs, Bearer) on any path; a `keyword=value` credential search is blocked only across a broad off-project path (`/home`, `~`, a system root) — a self-audit inside your own repo is allowed
 
 ## Installation
@@ -213,9 +213,69 @@ Does not protect against: TOCTOU symlink races, kernel-level attacks or processe
 running as you, tools other than Bash/Read/Write/Edit/Glob/Grep, brand-new patterns not
 yet in the deny list.
 
+**shellter fails open.** If `node` is not on the PATH Claude Code launches hooks with, the
+hook exits 127 and Claude Code treats that as non-blocking — the tool call runs unchecked.
+Two consequences worth knowing:
+
+- A broad allow rule turns that into silence. With `Read(*)` / `Write(*)` / `Bash(*)` in
+  `permissions.allow`, or `defaultMode` set to auto-accept, any verdict shellter does *not*
+  produce is an automatic allow rather than a prompt. Grant narrow rules, not wildcards.
+  Through 0.7.1 the manual installer added exactly those wildcards for the file tools. As
+  of 0.8.0 it does not, and it no longer overwrites your existing allow list — but **it
+  cannot clean up an install you already have.** If you ran an older manual installer,
+  those seven entries are still in your `settings.json`; re-running `merge-settings.js`
+  now warns about them and names the file, and you remove the ones you did not add
+  yourself. Plugin installs were never affected.
+- When shellter cannot fully analyze a command — an undecodable script, a parse failure —
+  it now returns `ask` rather than staying silent, so an unexamined command still stops at
+  a prompt. A ceiling is a safety boundary, not evidence the part it skipped was clean.
+
 A compound command auto-approves only when every subcommand matches an APPROVE pattern
 (env-var prefixes stripped). Python heredocs auto-approve only with no dangerous imports,
 no `os.system|popen|exec*`, no dynamic eval, and `open()` on literal safe relative paths.
+
+## Bundle audit (`shellter scan`)
+
+The two hooks guard what the agent *emits*. Nothing guarded what the agent is *given*: a
+plugin's `SKILL.md` is loaded straight into context, its `hooks.json` runs on lifecycle
+events before any tool call, and its `.mcp.json` points at a server whose tool descriptions
+the model reads as instructions. None of that passes through a PreToolUse hook.
+
+```
+npm run scan -- path/to/plugin          # or: node hooks/shellter-scan.js <path> [--json]
+```
+
+Exits 1 on any high-severity finding, so it drops into a pre-install check or CI. `--strict`
+also exits 1 when anything went uninspected: a skipped dependency tree, a symlink, an
+oversize file, a depth or file limit. Those are always listed under NOT INSPECTED, because
+a clean result over an unwalked subtree is not evidence of anything.
+
+| rule | what it looks for |
+|---|---|
+| `BH1` | bundle ships hooks; ambient matchers (`*`, empty) rank higher |
+| `BH2` | a shipped hook command posts to a non-loopback URL, or contains shell malice |
+| `BH3` | shipped `settings.json` with blanket `permissions.allow` or a bypassing `defaultMode` |
+| `LP2` | `allowed-tools` granting every tool, a tool unrestricted, or scoping to an interpreter that runs arbitrary code |
+| `AS1` | bundle reads `.claude/`, `mcp.json`, another agent's config, or a peer skill's `SKILL.md` |
+| `SC1` / `SC2` | MCP server launched from an unpinned package, or over plaintext `http` |
+| `INJ` / `SH` | the full injection and shell-malice scanners over the bundle's own files, including `secret-read-uploaded` (a script that reads a secret and posts it out) |
+
+A bundle is untrusted by definition, so **both** injection tiers are reported here - the
+agent-instruction-file gate used on the write path does not apply, because every file in a
+skill bundle is in effect an instruction file.
+
+It is deliberately a CLI, not a hook: the result only changes at install time, so paying a
+directory walk on every session start would be latency for nothing.
+
+**Scope.** This is triage - what a zero-dependency file walker does well. No AST, no taint
+analysis, no YARA, no vulnerability database, and it cannot read the tool descriptions a
+running MCP server serves. For that depth use NVIDIA's
+[SkillSpector](https://github.com/NVIDIA/skillspector), which is built for it.
+
+Scanning a security tool with a security tool lights up: shellter's own detector source
+contains the literal patterns it matches, and its test corpus contains attack strings by
+design. That is expected. shellter does **not** exempt its own files - a self-exemption was
+tried once and reverted as a confirmed security regression.
 
 ## Troubleshooting
 
@@ -230,7 +290,10 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.7.1 — two false-positive fixes: `git config <key>`
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.8.0 — closes a cross-segment variable-indirection
+bypass that auto-approved secret reads (`X=.env; cat $X`), adds a coverage gate so a command
+the engine could not fully analyze degrades to `ask` instead of falling through, and stops the
+manual installer granting blanket file-tool permissions. Previously 0.7.1 — two false-positive fixes: `git config <key>`
 reads (auditing a hooks-path backdoor is not setting one) and `jq`/`rg`/`sed` filter arguments
 (a `.key` selector is not a private key). Previously 0.7.0 — false-positive reduction + correctness
 hardening: injection-on-write now denies only agent-instruction files or exfil-carrying
