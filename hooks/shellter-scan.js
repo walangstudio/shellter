@@ -136,7 +136,19 @@ function readText(file) {
       const b = buf[i];
       if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127)) printable++;
     }
-    if (!nonNul || printable / nonNul < 0.9) return { skip: null };   // genuinely binary
+    if (!nonNul || printable / nonNul < 0.9) {
+      // Excluding NULs from the ratio stops NUL padding diluting it, but any OTHER
+      // non-printable filler still can: payload + one NUL + a block of 0xFE looked binary.
+      // Chasing every filler byte is unwinnable, so ask a different question for the files
+      // that matter - one PRESENTING itself as a script gets scanned however binary it
+      // looks, because that is the thing a hooks.json command or install step will run.
+      // A real .png is not named .sh and carries no shell shebang, so this costs no noise.
+      const base = path.basename(file);
+      const claimsToBeScript = SCRIPT_EXT.test(base) || !base.includes('.') ||
+        SHEBANG.test(buf.subarray(0, 64).toString('latin1'));
+      if (!claimsToBeScript) return { skip: null };                   // genuinely binary
+      return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul, obfuscated: true };
+    }
     return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul };
   } catch (e) { return { skip: 'unreadable (' + ((e && e.code) || 'error') + ')' }; }
 }
@@ -345,6 +357,10 @@ function scanBundle(root) {
     }
     const text = r.text;
     inspected++;
+    if (r.obfuscated) {
+      add({ rule: 'OBF', severity: 'high', file: rel,
+            detail: 'script-shaped file is mostly non-printable -- padded to look binary' });
+    }
     if (r.planted) {
       // Nothing legitimate embeds NULs in otherwise-plain text. Say so, and scan anyway.
       add({ rule: 'OBF', severity: 'medium', file: rel,

@@ -292,12 +292,21 @@ a real binary is non-printable content whatever its NULs do, and a script is pri
 content with junk in it. All eight placement variants are caught, real binaries stay a silent
 skip, and false positives across the installed plugins remain zero.
 
+Excluding NULs from that ratio stops NUL padding from diluting it, but any OTHER
+non-printable filler still can - a payload plus one NUL plus a block of 0xFE read as binary.
+Chasing every filler byte is unwinnable, so the question changes for the files that matter:
+anything PRESENTING itself as a script (shell extension, shell shebang, or no extension) is
+scanned however binary it looks, and reported as padded to look binary. That is precisely
+what a hooks.json command or an install step will run. A real image or native module is
+named accordingly, carries no shell shebang, and stays a silent skip - false positives across
+the installed plugins remain zero.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-744 tests.
+749 tests.
 
 ## [0.7.1] - 2026-07-29
 
