@@ -301,12 +301,23 @@ what a hooks.json command or an install step will run. A real image or native mo
 named accordingly, carries no shell shebang, and stays a silent skip - false positives across
 the installed plugins remain zero.
 
+*Non-ASCII text is text.* Tightening the printable-byte test to ASCII introduced a coverage
+regression worth more than the evasion it closed: an ASCII-only range test cannot tell text
+from binary outside Latin script. `café`, `résumé` and `你好` are ordinary documentation whose
+bytes all sit above 0x7E, so ONE NUL in an accented or CJK file dropped it under the ratio
+and buried it silently - in `.md`, `.py`, `.json`, precisely the files the injection scanner
+exists to read. An injection payload padded with a little accented filler went from caught to
+invisible. Classification is now UTF-8 DECODABILITY: valid UTF-8 is text whatever script it
+is written in, and a real binary produces replacement characters almost immediately. A file
+whose extension asserts it is text is rescued even when padded with bytes no interpreter
+would accept, because an agent READS those and the payload still reaches context.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-749 tests.
+754 tests.
 
 ## [0.7.1] - 2026-07-29
 

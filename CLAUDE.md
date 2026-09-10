@@ -78,3 +78,5 @@ Every line here exists because it went wrong at least once.
 - When adding a parameter that changes behaviour, update EVERY call site. An omitted third argument read as undefined and turned a PowerShell-only carve-out into a bash auto-approve.
 - Classify binary-vs-text by the printable ratio of the NON-NUL bytes. Every rule keyed on the NULs themselves is gameable: a whole-file ratio is diluted by padding, an absolute amount flags binaries carrying strings, and counting or locating them just moves the threshold (a leading block, one past the cap, or one every 32 bytes each walked through it).
 - A file presenting itself as a script (shell extension, shell shebang, no extension) must be scanned however binary it looks. Any ratio test is dilutable by non-printable filler; what a script CLAIMS to be is not.
+- Never use a printable-BYTE-RANGE test to tell text from binary. It cannot see any script but Latin: one NUL in an accented or CJK file buried it. Test UTF-8 decodability instead.
+- Do not commit while a review agent is running against the branch. HEAD moving mid-review cost a round of confusion about which tree was audited.

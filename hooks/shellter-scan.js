@@ -123,20 +123,20 @@ function readText(file) {
     for (let i = 0; i < buf.length; i++) if (buf[i] === 0) nul++;
     if (!nul) return { text: buf.toString('utf8') };
 
-    // Judge the file by its NON-NUL bytes only. Every earlier attempt keyed on something an
-    // attacker controls for free: a whole-file printable ratio is diluted by appending NULs,
-    // a printable amount flags every binary that carries strings, and counting or locating
-    // the NULs just moved the threshold (a leading block, one NUL past the cap, or a NUL
-    // every 32 bytes each walked through it). How many NULs there are and where they sit is
-    // exactly what padding varies, so it cannot be the question. What a real binary actually
-    // looks like is non-printable CONTENT; a script is printable content with junk in it.
-    const nonNul = buf.length - nul;
-    let printable = 0;
-    for (let i = 0; i < buf.length; i++) {
-      const b = buf[i];
-      if (b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127)) printable++;
-    }
-    if (!nonNul || printable / nonNul < 0.9) {
+    // Judge the file by its NON-NUL content. Every attempt keyed on the NULs themselves was
+    // gameable: a whole-file ratio is diluted by appending them, an absolute count flags
+    // binaries carrying strings, and counting or locating them just moved the threshold.
+    //
+    // The test is UTF-8 DECODABILITY, not a byte range. An ASCII-only range test cannot tell
+    // text from binary outside Latin script: `café`, `résumé` and `你好` are ordinary
+    // documentation whose bytes all sit above 0x7E, so one NUL in an accented or CJK file
+    // dropped it under any ASCII ratio and buried it silently -- in `.md`, `.py`, `.json`,
+    // everything the injection scanner exists to read. Valid UTF-8 is text whatever script
+    // it is written in; a real binary produces replacement characters almost immediately.
+    const text = buf.toString('utf8').replace(/\0/g, '');
+    let undecodable = 0;
+    for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 0xFFFD) undecodable++;
+    if (!text.length || undecodable / text.length > 0.01) {
       // Excluding NULs from the ratio stops NUL padding diluting it, but any OTHER
       // non-printable filler still can: payload + one NUL + a block of 0xFE looked binary.
       // Chasing every filler byte is unwinnable, so ask a different question for the files
@@ -144,9 +144,9 @@ function readText(file) {
       // looks, because that is the thing a hooks.json command or install step will run.
       // A real .png is not named .sh and carries no shell shebang, so this costs no noise.
       const base = path.basename(file);
-      const claimsToBeScript = SCRIPT_EXT.test(base) || !base.includes('.') ||
-        SHEBANG.test(buf.subarray(0, 64).toString('latin1'));
-      if (!claimsToBeScript) return { skip: null };                   // genuinely binary
+      const claimsToBeText = SCRIPT_EXT.test(base) || TEXTY_EXT.test(base) ||
+        !base.includes('.') || SHEBANG.test(buf.subarray(0, 64).toString('latin1'));
+      if (!claimsToBeText) return { skip: null };                     // genuinely binary
       return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul, obfuscated: true };
     }
     return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul };
@@ -154,6 +154,9 @@ function readText(file) {
 }
 
 const SCRIPT_EXT = /\.(sh|bash|zsh|ksh|fish|ps1|psm1|cmd|bat)$/i;
+// Extensions that assert the file is text. An agent READS these, so an injection payload
+// in one still lands in context even when padded with bytes no interpreter would accept.
+const TEXTY_EXT = /.(md|markdown|txt|rst|json|ya?ml|toml|ini|cfg|conf|xml|html?|csv|py|rb|pl|lua|js|mjs|cjs|ts|tsx|jsx|go|rs|java|c|h|cpp|hpp|cs|php|sql)$/i;
 // The interpreter after an optional `env` must itself be a shell. Listing `env` as an
 // alternative made `#!/usr/bin/env node` match, so every Node CLI in a bundle was scanned
 // with shell rules and lit up on its own string literals.
