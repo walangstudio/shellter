@@ -312,12 +312,31 @@ is written in, and a real binary produces replacement characters almost immediat
 whose extension asserts it is text is rescued even when padded with bytes no interpreter
 would accept, because an agent READS those and the payload still reaches context.
 
+A ninth round reviewed the text-classification commit and audited the branch for bloat. Two
+bugs in the extension matching, and a clean bill on the rest:
+
+- *The leading dot in the text-extension list was an unescaped wildcard.* `/.(md|...|c|h|...)$/`
+  matched any name ending in a single-letter alternative, so `module.pyc` and `resume.doc`
+  were treated as text and drew an unconditional HIGH "padded to look binary". A bundle
+  shipping a `__pycache__` would have failed `--strict` on nothing. One character.
+- *Dotfiles fell between two branches.* A dotfile's whole name follows the leading dot, so it
+  has no extension to match and does not qualify as "no extension" either. A payload in
+  `.env`, `.editorconfig` or `.gitattributes` skipped silently with `--strict` still green.
+  `.npmrc` survived only by accidentally hitting the wildcard bug above.
+- Removed three exports with no caller outside their own module (`decodeLayers`,
+  `foldConfusables`, `walk`). `foldConfusables` was exported with a comment saying the bundle
+  scanner needed it; it never did.
+
+The bloat audit found nothing else: no dead code, no remnants of the four classifier
+rewrites, no redundant comments, and the added tests were spot-checked by reverting three
+fixes and confirming the matching test fails without them.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-754 tests.
+762 tests.
 
 ## [0.7.1] - 2026-07-29
 

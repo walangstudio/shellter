@@ -564,7 +564,6 @@ function highest(findings) {
 }
 
 module.exports = {
-  SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer, decodeLayers,
-  foldConfusables,
+  SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
   scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile,
 };

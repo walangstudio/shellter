@@ -145,7 +145,8 @@ function readText(file) {
       // A real .png is not named .sh and carries no shell shebang, so this costs no noise.
       const base = path.basename(file);
       const claimsToBeText = SCRIPT_EXT.test(base) || TEXTY_EXT.test(base) ||
-        !base.includes('.') || SHEBANG.test(buf.subarray(0, 64).toString('latin1'));
+        DOTFILE.test(base) || !base.includes('.') ||
+        SHEBANG.test(buf.subarray(0, 64).toString('latin1'));
       if (!claimsToBeText) return { skip: null };                     // genuinely binary
       return { text: buf.toString('utf8').replace(/\0/g, ''), planted: nul, obfuscated: true };
     }
@@ -156,7 +157,11 @@ function readText(file) {
 const SCRIPT_EXT = /\.(sh|bash|zsh|ksh|fish|ps1|psm1|cmd|bat)$/i;
 // Extensions that assert the file is text. An agent READS these, so an injection payload
 // in one still lands in context even when padded with bytes no interpreter would accept.
-const TEXTY_EXT = /.(md|markdown|txt|rst|json|ya?ml|toml|ini|cfg|conf|xml|html?|csv|py|rb|pl|lua|js|mjs|cjs|ts|tsx|jsx|go|rs|java|c|h|cpp|hpp|cs|php|sql)$/i;
+const TEXTY_EXT = /\.(md|markdown|txt|rst|json|ya?ml|toml|ini|cfg|conf|xml|html?|csv|py|rb|pl|lua|js|mjs|cjs|ts|tsx|jsx|go|rs|java|c|h|cpp|hpp|cs|php|sql)$/i;
+// A dotfile carries its whole name after the leading dot, so it has no extension to match
+// and does not qualify as "no extension" either. `.env`, `.npmrc` and friends are config the
+// agent reads; they must not fall between those two branches.
+const DOTFILE = /^\.[A-Za-z0-9_-]+$/;
 // The interpreter after an optional `env` must itself be a shell. Listing `env` as an
 // alternative made `#!/usr/bin/env node` match, so every Node CLI in a bundle was scanned
 // with shell rules and lit up on its own string literals.
@@ -411,7 +416,7 @@ function scanBundle(root) {
   return { findings, inspected, skipped, gaps, total: files.length };
 }
 
-module.exports = { scanBundle, walk, remoteUrls };
+module.exports = { scanBundle, remoteUrls };
 
 // ---- CLI ---------------------------------------------------------------------
 

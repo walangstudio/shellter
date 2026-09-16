@@ -80,3 +80,6 @@ Every line here exists because it went wrong at least once.
 - A file presenting itself as a script (shell extension, shell shebang, no extension) must be scanned however binary it looks. Any ratio test is dilutable by non-printable filler; what a script CLAIMS to be is not.
 - Never use a printable-BYTE-RANGE test to tell text from binary. It cannot see any script but Latin: one NUL in an accented or CJK file buried it. Test UTF-8 decodability instead.
 - Do not commit while a review agent is running against the branch. HEAD moving mid-review cost a round of confusion about which tree was audited.
+- Escape the leading dot in an extension regex. `/.(md|c|h)$/` matches any name ending in a single-letter alternative, so `module.pyc` read as text.
+- A dotfile has no extension AND is not extensionless. `.env` fell between both branches and skipped silently.
+- JS drops the backslash in an unknown escape, so a generator script writing `.` into source emits `.`. Check the regex literal in the file, not the generator.
