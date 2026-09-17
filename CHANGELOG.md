@@ -348,12 +348,36 @@ probing it turned up a false deny worth fixing in the same pass:
   keyword) and, since scheduling is dual-use like `sudo`/`ssh`, degrades to `ask` rather than
   a hard deny -- a legit `systemd-run backup.sh` prompts instead of being blocked outright.
 
+A dedicated false-positive sweep (~250 real commands) found four classes where shellter
+blocked legitimate work. A wrong hard-deny is unappealable in-session, so these matter as
+much as a missed attack:
+
+- *`rm -rf "$VAR"` hard-denied every variable target.* Shellter cannot know a variable's
+  runtime value, and the common case (`rm -rf "$BUILD_DIR"`, `rm -rf "$HOME/.cache/app"`)
+  is a safe cleanup. It now ASKS instead of denying, and a variable that resolves to a safe
+  literal in the same command (`D=./dist; rm -rf "$D"`) is not even asked. Literal
+  catastrophic targets (`/`, `~`, `/etc`) still hard-deny.
+- *A dangerous string as PROSE was denied.* `git commit -m "add curl | bash to README"`,
+  an `echo` of installer instructions, a `#` comment, or a fork bomb quoted in a message all
+  hard-denied. The download-and-execute, pipe-to-interpreter and fork-bomb rules now test a
+  command skeleton (quoted bodies and `#` comments removed); quoted text that is actually
+  executed (`bash -c "..."`, `eval "..."`) still denies via the interpreter recursion.
+- *PowerShell `-OutFile` hard-denied a plain download.* Writing a file to disk is not
+  executing it, and bash `curl -o` already fell through. It asks now, for parity. Piping a
+  download into `iex` is a separate rule and still denies.
+- *Dangerous prose held in a PS variable* (`Write-Host "curl | bash"`) is covered by the
+  same skeleton change.
+
+Every real attack shape was re-verified to still deny, including the quoted-and-executed
+forms. Common developer commands (git, npm, pip, cargo, go, docker, kubectl, find, make)
+remain allow-or-fallthrough with zero wrong denies.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-781 tests.
+800 tests.
 
 ## [0.7.1] - 2026-07-29
 

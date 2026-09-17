@@ -55,6 +55,50 @@ function normalizeObfuscation(s) {
   return s.replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, ' ').replace(/''|""/g, '');
 }
 
+// A "command skeleton": the segment with single/double-quoted BODIES removed and any
+// trailing `#` comment cut. A few deny rules (download-and-execute pipe, fork bomb) match
+// raw text, which fired on the same string appearing as PROSE -- a commit message, an echo,
+// a doc heredoc, a `#` comment (`git commit -m "add curl | bash to README"`). Quoted text is
+// an argument, not a live pipeline; a comment never runs. When quoted text IS executed
+// (`bash -c "curl x | bash"`, `eval "..."`), shellter already recurses into that interpreter
+// and re-runs the deny pass on the inner content, so those still deny -- the skeleton only
+// removes the FALSE match on inert prose. A `#` mid-token (`http://x#frag`, `%h#%s`) is not a
+// comment, so it is kept.
+function commandSkeleton(s) {
+  if (typeof s !== 'string') return '';
+  let out = '';
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      if (q === '"' && c === '\\' && i + 1 < s.length) { i++; continue; }
+      if (c === q) { q = null; out += ' '; }
+      continue;
+    }
+    if (c === "'" || c === '"') { q = c; continue; }
+    if (c === '#' && (i === 0 || /\s/.test(s[i - 1]))) break;   // unquoted comment to EOL
+    out += c;
+  }
+  return out;
+}
+
+const DL_EXEC_RE = /\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i;
+function downloadExecDanger(s) {
+  return DL_EXEC_RE.test(commandSkeleton(s)) ? 'Download-and-execute pipe blocked -- inspect script first' : null;
+}
+const FORK_BOMB_RE = /([:\w]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
+function forkBombDanger(s) {
+  return FORK_BOMB_RE.test(commandSkeleton(s)) ? 'Fork bomb blocked' : null;
+}
+const PIPE_BARE_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i;
+const PIPE_FLAG_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i;
+function pipeToInterpDanger(s) {
+  const sk = commandSkeleton(s);
+  if (PIPE_BARE_RE.test(sk)) return 'Pipe to bare shell/interpreter blocked';
+  if (PIPE_FLAG_RE.test(sk)) return 'Pipe to interpreter with -c/-i/-s blocked';
+  return null;
+}
+
 // Split an argument string into tokens, honoring single/double quotes and
 // stripping them (so `"/"` -> `/`). Good enough for flag/target extraction, not a
 // full shell parser.
@@ -82,7 +126,11 @@ const RM_SYSTEM_PREFIX = /^(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev
 
 function rmTargetDanger(t) {
   if (!t) return null;
-  if (/^\$\{?[A-Za-z_]/.test(t) || t.includes('{}')) return 'variable/placeholder target';
+  // A variable/placeholder target used to hard-deny here. But shellter cannot know a
+  // variable's runtime value, and the overwhelmingly common case (`rm -rf "$BUILD_DIR"`,
+  // `rm -rf "$HOME/.cache/app"`) is a safe cleanup -- an unappealable deny bricked it. That
+  // case is handled at ask-tier by rmVarTargetAsk (which also skips vars that resolve to a
+  // safe literal in the same command). Only LITERAL catastrophic targets deny below.
   if (t === '/' || /^\/(?![A-Za-z0-9])/.test(t)) return 'filesystem root';   // /, //, /*, /.
   if (/^~/.test(t)) return 'home directory';   // ~, ~/x, ~+, ~-, ~user
   if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
@@ -99,7 +147,7 @@ function rmTargetDanger(t) {
 // Given the tokens AFTER an `rm` command word, return a reason if it recursively
 // AND forcibly removes a protected target. Flag parsing is order-independent
 // (`rm -r -f`), handles long flags (`--recursive`/`--force`) and `--`.
-function evalRmArgs(argToks) {
+function parseRmArgs(argToks) {
   let recursive = false, force = false, sawDashDash = false;
   const targets = [];
   for (const tok of argToks) {
@@ -117,8 +165,35 @@ function evalRmArgs(argToks) {
     }
     targets.push(tok);
   }
+  return { recursive, force, targets };
+}
+
+function evalRmArgs(argToks) {
+  const { recursive, force, targets } = parseRmArgs(argToks);
   if (!recursive || !force) return null;
   for (const t of targets) { const d = rmTargetDanger(t); if (d) return 'Destructive rm (' + d + ') blocked'; }
+  return null;
+}
+
+// Ask-tier: `rm -rf <variable>` / `rm -rf {}` where the target is not a resolvable literal.
+// Shellter cannot see the runtime value, so it asks rather than allowing the footgun or
+// hard-denying the common safe case. A variable that resolves to a safe literal in the same
+// command is not asked (the expanded variant already went through the deny pass); one that
+// resolves to a dangerous literal was already hard-denied there.
+function rmVarTargetAsk(seg) {
+  for (const stage of splitPipeStages(seg)) {
+    const toks = tokenizeArgs(stage);
+    for (let i = 0; i < toks.length; i++) {
+      if (toks[i].replace(/^\\/, '').replace(/^.*[\\/]/, '') !== 'rm') continue;
+      const { recursive, force, targets } = parseRmArgs(toks.slice(i + 1));
+      if (!recursive || !force) continue;
+      for (const t of targets) {
+        const m = /^\$\{?([A-Za-z_]\w*)/.exec(t);
+        if (m) { if (!varEnv.has(m[1])) return 'rm -rf of an unresolved variable target -- confirm it is not / or your home directory'; }
+        else if (t.includes('{}')) return 'rm -rf of a placeholder target -- confirm what it expands to';
+      }
+    }
+  }
   return null;
 }
 
@@ -1085,13 +1160,12 @@ const DENY_PATTERNS = [
   // Download-and-execute / pipe-to-interpreter (incl. absolute paths). The `-m`
   // exemption lets `curl … | python -m json.tool` (stdin is DATA to a module, not a
   // script to execute) through; a bare interpreter or `-c`/`-e` still denies.
-  [/\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i,
-    'Download-and-execute pipe blocked -- inspect script first'],
-  // Generic pipe-to-interpreter: end-of-segment or -c/-i/-s flag (no script arg).
-  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i,
-    'Pipe to bare shell/interpreter blocked'],
-  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i,
-    'Pipe to interpreter with -c/-i/-s blocked'],
+  [downloadExecDanger, null],
+  // Generic pipe-to-interpreter: end-of-segment or -c/-i/-s flag (no script arg). Tested on
+  // the command skeleton so a commit message or comment discussing "pipe x | sh" is not a
+  // false deny; a real `echo x | sh` (no quotes) still matches, and a quoted-and-executed
+  // `bash -c "x | sh"` is caught by the interpreter recursion.
+  [pipeToInterpDanger, null],
   // `source <(curl ...)` / `. <(wget ...)` executes downloaded output in the current
   // shell -> deny. `source <(kubectl completion bash)` and other local generators are a
   // routine idiom, so only a network/decode process-sub is blocked here (a dangerous
@@ -1290,6 +1364,7 @@ const DENY_PATTERNS = [
   // `rm -r -f /`, `rm -rf "/"`, `rm -rf --no-preserve-root /`, `rm -r -f ~`, and
   // /opt-root/traversal all hard-block (deep /opt paths stay allowed).
   [rmDanger, null],
+  [rmVarTargetAsk, null, 'ask'],
 
   // SQL destructive
   // Require a SQL client/migration tool in the segment so a `drop table` inside a git
@@ -1302,7 +1377,7 @@ const DENY_PATTERNS = [
   // background) rather than the whole `};name` invocation, since the chain splitter cuts
   // the `;` -- the definition alone is the bomb and has no benign use. Backreference keeps
   // it specific to `f|f`, so `f | grep &` does not match.
-  [/([:\w]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/, 'Fork bomb blocked'],
+  [forkBombDanger, null],
   // Shell history tampering (hiding tracks) -> ask.
   [/\bunset\s+HISTFILE\b|\bHISTFILE\s*=\s*\/dev\/null\b|\bhistory\s+-c\b|\bset\s+\+o\s+history\b|\b(?:rm|shred)\b[^|;]*[\/.]bash_history\b/i,
     'Shell history tampering -- approve only if intended', 'ask'],
@@ -1351,8 +1426,11 @@ const POSH_DENY_PATTERNS = [
   // Download-and-execute and web data upload.
   [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|curl|wget)\b[^;|]*\|\s*iex\b/i,
     'Download piped to Invoke-Expression blocked'],
+  // Downloading a file to disk is not executing it, and the bash equivalent (`curl -o`,
+  // `wget -O`) already falls through -- so this asks rather than hard-denying, for parity.
+  // Piping a download straight into `iex` is a separate rule and still denies.
   [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|curl|wget)\b[^;|]*-OutFile\b/i,
-    'PowerShell web download (-OutFile) blocked -- inspect first'],
+    'PowerShell web download (-OutFile) -- inspect the downloaded file before running it', 'ask'],
   [/\.(DownloadString|DownloadFile|DownloadData)\s*\(/i, 'Net.WebClient download blocked'],
   [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^;|]*-(Method\s+(POST|PUT)|Body|InFile)\b/i,
     'PowerShell web upload blocked -- review manually'],

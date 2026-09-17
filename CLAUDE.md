@@ -85,3 +85,5 @@ Every line here exists because it went wrong at least once.
 - JS drops the backslash in an unknown escape, so a generator script writing `.` into source emits `.`. Check the regex literal in the file, not the generator.
 - Model brace expansion. `{r,}m` runs `rm` while literal matchers see only `{r,}m`; it is shell grammar, not character obfuscation, so no normaliser catches it.
 - `at`/`batch` are English words. Any rule matching them at segment start needs a scheduling-shaped-argument guard or it hard-denies prose like `at most`.
+- A wrong hard-deny is unappealable, so a dual-use or uncertain shape (rm of a variable target, scheduling, a download-to-disk) should ASK, not deny. Reserve deny for literal near-unambiguous malice.
+- A dangerous string can appear as PROSE (commit message, echo, # comment). Match pipeline/exec rules against a command skeleton with quoted bodies and comments stripped; the interpreter recursion still catches quoted code that is actually executed.
