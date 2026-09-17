@@ -331,12 +331,29 @@ The bloat audit found nothing else: no dead code, no remnants of the four classi
 rewrites, no redundant comments, and the added tests were spot-checked by reverting three
 fixes and confirming the matching test fails without them.
 
+A red-team pass (black-box, told to avoid the classes already closed) found a new one, and
+probing it turned up a false deny worth fixing in the same pass:
+
+- *Bash brace expansion was modelled nowhere.* `{r,}m -rf ~` expands to `rm m -rf ~`, which
+  really deletes, while every literal matcher saw only `{r,}m` -- so `{r,}m`, `c{a,}t <secret>`
+  and `c{u,}rl <exfil>` turned hard denies into silent fallthrough, in the command hook AND
+  in `shellter scan --strict`. This is a shell-grammar gap, not character obfuscation, so no
+  existing normaliser touched it. A bounded expander now reconstructs the real command word
+  (one alternative at a time, capped, no cross product) and feeds the existing rules. Legit
+  brace use (`mkdir -p out/{a,b}`, `cp f.{yml,yml.bak}`) is unaffected, and a scary word
+  merely quoted inside braces stays allowed because the command word is still the outer verb.
+- *`at`/`batch` scheduling was an unappealable false deny on prose.* The rule was anchored to
+  a segment start with no argument check, so `echo hi; at most 3 retries` hard-denied on the
+  English word `at`. It now requires a scheduling-shaped argument (a flag, a digit, or a time
+  keyword) and, since scheduling is dual-use like `sudo`/`ssh`, degrades to `ask` rather than
+  a hard deny -- a legit `systemd-run backup.sh` prompts instead of being blocked outright.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-762 tests.
+781 tests.
 
 ## [0.7.1] - 2026-07-29
 

@@ -83,3 +83,5 @@ Every line here exists because it went wrong at least once.
 - Escape the leading dot in an extension regex. `/.(md|c|h)$/` matches any name ending in a single-letter alternative, so `module.pyc` read as text.
 - A dotfile has no extension AND is not extensionless. `.env` fell between both branches and skipped silently.
 - JS drops the backslash in an unknown escape, so a generator script writing `.` into source emits `.`. Check the regex literal in the file, not the generator.
+- Model brace expansion. `{r,}m` runs `rm` while literal matchers see only `{r,}m`; it is shell grammar, not character obfuscation, so no normaliser catches it.
+- `at`/`batch` are English words. Any rule matching them at segment start needs a scheduling-shaped-argument guard or it hard-denies prose like `at most`.

@@ -1135,7 +1135,12 @@ const DENY_PATTERNS = [
     'Loader-injection environment variable (LD_PRELOAD/DYLD_INSERT_LIBRARIES) blocked'],
   [/\b(LD_LIBRARY_PATH|DYLD_LIBRARY_PATH)\s*=\S/i,
     'Setting a library search path -- approve only if intended', 'ask'],
-  [/^\s*(at|batch|systemd-run)\s/, 'Alternative scheduling (at/batch/systemd-run) blocked'],
+  // Scheduling is dual-use like sudo/ssh, so it ASKS rather than hard-denies. And `at`/`batch`
+  // are ordinary English words, so a match requires a scheduling-shaped argument (a flag, a
+  // time, or a time keyword) -- otherwise `echo hi; at most 3 retries` was an unappealable
+  // false deny on prose. `systemd-run` is not an English word, so it needs no such guard.
+  [/^\s*(?:(?:at|batch)\s+(?:-|\d|now\b|noon\b|midnight\b|teatime\b|today\b|tomorrow\b|next\b)|systemd-run\b)/i,
+    'Scheduling a task (at/batch/systemd-run) -- approve only if intended', 'ask'],
   [/\b(strace|ltrace|gdb)\s+.*-p\s+\d/i, 'Attaching debugger/tracer to running process blocked'],
 
   // Identity / git backdoor
@@ -1757,6 +1762,11 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
     variants.push(extraVariant);
     const xs = extraVariant.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
     if (xs !== extraVariant && !variants.includes(xs)) variants.push(xs);
+  }
+  // Brace expansion reconstitutes the real command word (`{r,}m` -> `rm`), so every
+  // variant built so far needs its expansions tested too. Shared with the bundle scanner.
+  for (const base of variants.slice()) {
+    for (const b of scan.expandBraces(base)) if (!variants.includes(b)) variants.push(b);
   }
 
   // PowerShell + cmd deny patterns are anchored to their own syntax, so they are
