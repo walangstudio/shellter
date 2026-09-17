@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Merges hook configuration into ~/.claude/settings.json. Idempotent --
-// overwrites only "permissions" and "hooks" keys.
+// overwrites only the "hooks" key. It no longer touches "permissions": through
+// 0.7.1 it replaced that key wholesale with file-tool wildcards, which both
+// destroyed the user's own allow list and undermined the hooks it was installing.
 //
 // Usage: node merge-settings.js [path-to-settings.json]
 // Default: ~/.claude/settings.json
@@ -50,11 +52,41 @@ if (fs.existsSync(targetPath)) {
   console.log('No existing settings found, creating new file');
 }
 
-existing.permissions = fixedTemplate.permissions;
+// The template no longer carries a `permissions` block. It used to grant
+// Read/Edit/Write/MultiEdit/NotebookEdit/Glob/Grep wildcards -- the exact tools
+// these hooks gate -- so a hook that failed to run (node not on PATH, a crash)
+// left unprompted file access behind, and every fallthrough verdict became a
+// silent allow. The plugin install path never granted it, so it was pure
+// asymmetric risk. This assignment also used to REPLACE the user's whole allow
+// list; never touch their permissions.
+if (fixedTemplate.permissions) existing.permissions = fixedTemplate.permissions;
 existing.hooks = fixedTemplate.hooks;
 
+// Removing the block from the template does nothing for anyone who already ran an
+// older installer -- those wildcards are sitting in their settings.json right now,
+// written there by shellter. Detect that and say so; do not edit it silently, since
+// the user may have added entries of their own to the same list.
+const LEGACY_WILDCARDS = ['Read(*)', 'Edit(*)', 'Write(*)', 'MultiEdit(*)',
+                          'NotebookEdit(*)', 'Glob(*)', 'Grep(*)'];
+const allowNow = (existing.permissions && Array.isArray(existing.permissions.allow))
+  ? existing.permissions.allow : [];
+const stale = LEGACY_WILDCARDS.filter((r) => allowNow.includes(r));
+
 fs.writeFileSync(targetPath, JSON.stringify(existing, null, 2) + '\n');
-console.log('Merged permissions and hooks into', targetPath);
+console.log('Merged hooks into', targetPath);
+
+// Warn on even ONE leftover. The earlier `>= 3` threshold meant a partially cleaned
+// settings.json went quiet while still blanket-approving a tool these hooks gate, which is
+// the exact state someone lands in halfway through removing them.
+if (stale.length) {
+  console.warn('');
+  console.warn('WARNING: your settings.json still allows ' + stale.join(' '));
+  console.warn('  An older shellter installer (<= 0.7.1) wrote these. They blanket-approve');
+  console.warn('  the exact tools these hooks gate, so if a hook ever fails to run (node not');
+  console.warn('  on PATH, a crash) those file operations proceed with no prompt at all.');
+  console.warn('  Remove the entries you did not add yourself from permissions.allow in:');
+  console.warn('  ' + targetPath);
+}
 console.log('Hook paths set to:', homeDir + '/.claude/hooks/');
 
 const hooksDir = path.join(homeDir, '.claude', 'hooks');
