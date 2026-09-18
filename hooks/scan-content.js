@@ -370,6 +370,17 @@ const BRACE_MAX_VARIANTS = 12;
 function expandBraces(s) {
   if (s.indexOf('{') === -1) return [];
   const seen = new Set([s]);
+  // One-pass "join" variant: replace EVERY group with its first non-empty alternative,
+  // repeatedly, until no braces remain. A word split into adjacent singleton groups --
+  // `{b,}{a,}{s,}{h,}` or `{,b}{,a}{,s}{,h}` -- reconstructs to `bash` in one shot here,
+  // regardless of how many groups it was split into. Without this, the round loop below
+  // (bounded, so it cannot chase an arbitrary group count) let a 4+-group split slip past.
+  let joined = s;
+  for (let i = 0; i < 200 && BRACE_GROUP.test(joined); i++) {
+    joined = joined.replace(new RegExp(BRACE_GROUP.source, 'g'),
+      (m, g) => g.split(',').find((a) => a !== '') || '');
+  }
+  if (joined !== s) seen.add(joined);
   let frontier = [s];
   for (let round = 0; round < 3; round++) {
     const next = [];

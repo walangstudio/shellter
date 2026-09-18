@@ -389,12 +389,37 @@ tool then runs UNPROTECTED. These fail safe now:
   release fixed for `permissions`. It now merges: other plugins' hooks are preserved,
   shellter's are refreshed idempotently (re-running does not duplicate them).
 
+A review of the FP/robustness fixes above found that three of them had each opened a hole,
+plus two more gaps -- all fixed here. The through-line: a relaxation must reproduce exactly
+what the real expander/recursion does, or it relaxes further than intended.
+
+- *The command skeleton stripped quotes unconditionally.* `$SHELL -c "curl | bash"`,
+  `command bash -c "..."`, `find -exec sh -c "..."` and `xargs sh -c "..."` all execute
+  their quoted argument, but the skeleton removed it and the recursion parsers do not cover a
+  variable-named or wrapped interpreter. The skeleton is now applied only when NOTHING in the
+  segment could execute the quotes (no interpreter `-c`/`-e`, `eval`, `find -exec`, `xargs`,
+  `$()` or backtick -- and the interpreter may be a `$var`); otherwise the raw text is kept,
+  as before. `git -c ... commit -m "curl | bash"` still relaxes (config, not exec).
+- *`rm -rf ${VAR:-x}` bypassed both deny and ask.* The new ask-tier check scraped the name
+  out of any `${...}` form and treated it as resolved, but expandVars never expands a modifier
+  form -- so the value was never seen. It now mirrors VAR_AT exactly: only a bare `$NAME` or
+  exact `${NAME}` can be resolved; a modifier form always asks.
+- *Brace expansion missed a word split into 4+ singleton groups.* `curl x | {b,}{a,}{s,}{h,}`
+  needed more rounds than the bounded loop allows. A one-pass join variant (every group ->
+  its first non-empty alternative) now reconstructs the word in one step, regardless of group
+  count, with no blowup on hostile input.
+- *The installer silently no-op'd on `"hooks": []`.* An array passed the object guard, and
+  JSON.stringify drops string keys set on an array, so shellter's hooks never installed (with
+  a false "Merged" message). Arrays now reset to `{}` like other malformed shapes.
+- *`batch <<< payload` regressed from deny to fallthrough.* `at`/`batch` with no
+  command-shaped argument read the job from stdin; that stdin form now asks.
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-812 tests.
+840 tests.
 
 ## [0.7.1] - 2026-07-29
 

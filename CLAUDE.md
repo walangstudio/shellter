@@ -89,3 +89,6 @@ Every line here exists because it went wrong at least once.
 - A dangerous string can appear as PROSE (commit message, echo, # comment). Match pipeline/exec rules against a command skeleton with quoted bodies and comments stripped; the interpreter recursion still catches quoted code that is actually executed.
 - A hook that crashes or hangs fails OPEN (Claude Code treats nonzero/no exit as non-blocking). Validate input types and bound every quantifier: a non-string tool_input field or a huge command must fail safe, not throw or spin.
 - merge-settings must MERGE hooks, not replace the key. Replacing deletes other plugins hooks silently; filter out stale shellter entries then append (idempotent).
+- A relaxation (skeleton, resolvable-var skip, brace cap) must mirror EXACTLY what the real expander/recursion does. Looser = a bypass. The skeleton strip, rmVarTargetAsk, and the brace round-cap each opened one.
+- The interpreter before -c may be a $variable ($SHELL -c). Keying exec-detection on a literal name list misses it.
+- typeof [] === object and JSON.stringify drops string keys on an array. Guard Array.isArray before treating a value as a plain object.

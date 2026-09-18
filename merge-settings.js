@@ -68,7 +68,12 @@ if (fixedTemplate.permissions) existing.permissions = fixedTemplate.permissions;
 const isShellterGroup = (g) => g && Array.isArray(g.hooks) &&
   g.hooks.some((h) => h && typeof h.command === 'string' &&
     /check-bash\.js|check-sensitive-files\.js/.test(h.command));
-if (!existing.hooks || typeof existing.hooks !== 'object') existing.hooks = {};
+// `typeof [] === 'object'`, so a stray `"hooks": []` would slip through a plain object
+// check; the per-event assignment then sets a string key on an array, which JSON.stringify
+// drops -- shellter's hooks silently never install. Reset arrays (and null) to {} too.
+if (!existing.hooks || typeof existing.hooks !== 'object' || Array.isArray(existing.hooks)) {
+  existing.hooks = {};
+}
 for (const [event, groups] of Object.entries(fixedTemplate.hooks || {})) {
   const prior = Array.isArray(existing.hooks[event])
     ? existing.hooks[event].filter((g) => !isShellterGroup(g)) : [];

@@ -64,6 +64,22 @@ function normalizeObfuscation(s) {
 // and re-runs the deny pass on the inner content, so those still deny -- the skeleton only
 // removes the FALSE match on inert prose. A `#` mid-token (`http://x#frag`, `%h#%s`) is not a
 // comment, so it is kept.
+// The skeleton is only safe to apply when nothing in the segment could EXECUTE the quoted
+// text: an interpreter `-c`/`-e`, `eval`, `find -exec`, `xargs`, or a command substitution
+// all turn a quoted string into code, so there the quotes must stay and the raw text is
+// tested (as before). Absent all of those, a quoted string is an inert data argument
+// (`git commit -m "curl | bash"`, `echo "..."`) and can be stripped. Erring toward "treat
+// as code" keeps every real executed pipeline caught and only relaxes the clearly-inert set.
+// The interpreter before a `-c`/`-e` exec flag may be a VARIABLE (`$SHELL -c "..."`), not a
+// literal name -- parseShellCInvocation won't recurse into that, so the raw text must be kept
+// or the quoted payload is lost. Matching a `$var`/`${var}` command word here does that,
+// without matching a literal non-interpreter like `git -c ... commit` (config, not exec),
+// which must still relax so a `curl | bash` in its commit message is not a false deny.
+const INTERP_EXEC_RE = /\beval\b|\s-(?:exec|execdir|ok|okdir)\b|\bxargs\b|\$\(|`|(?:\b(?:bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b|\$\{?[A-Za-z_]\w*\}?)\S*\s+-[A-Za-z]*[ceErsi]\b/i;
+function analysisText(s) {
+  return (typeof s === 'string' && INTERP_EXEC_RE.test(s)) ? s : commandSkeleton(s);
+}
+
 function commandSkeleton(s) {
   if (typeof s !== 'string') return '';
   let out = '';
@@ -84,19 +100,19 @@ function commandSkeleton(s) {
 
 const DL_EXEC_RE = /\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i;
 function downloadExecDanger(s) {
-  return DL_EXEC_RE.test(commandSkeleton(s)) ? 'Download-and-execute pipe blocked -- inspect script first' : null;
+  return DL_EXEC_RE.test(analysisText(s)) ? 'Download-and-execute pipe blocked -- inspect script first' : null;
 }
 // `[:\w]{1,64}` not `[:\w]+`: the unbounded form backtracks catastrophically on a long
 // word-run (a 50KB `echo xxxx...` took ~3s per variant, hanging the hook). A fork-bomb
 // function name is a handful of chars, so 64 is generous and kills the quadratic.
 const FORK_BOMB_RE = /([:\w]{1,64})\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
 function forkBombDanger(s) {
-  return FORK_BOMB_RE.test(commandSkeleton(s)) ? 'Fork bomb blocked' : null;
+  return FORK_BOMB_RE.test(analysisText(s)) ? 'Fork bomb blocked' : null;
 }
 const PIPE_BARE_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i;
 const PIPE_FLAG_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i;
 function pipeToInterpDanger(s) {
-  const sk = commandSkeleton(s);
+  const sk = analysisText(s);
   if (PIPE_BARE_RE.test(sk)) return 'Pipe to bare shell/interpreter blocked';
   if (PIPE_FLAG_RE.test(sk)) return 'Pipe to interpreter with -c/-i/-s blocked';
   return null;
@@ -191,9 +207,16 @@ function rmVarTargetAsk(seg) {
       const { recursive, force, targets } = parseRmArgs(toks.slice(i + 1));
       if (!recursive || !force) continue;
       for (const t of targets) {
-        const m = /^\$\{?([A-Za-z_]\w*)/.exec(t);
-        if (m) { if (!varEnv.has(m[1])) return 'rm -rf of an unresolved variable target -- confirm it is not / or your home directory'; }
-        else if (t.includes('{}')) return 'rm -rf of a placeholder target -- confirm what it expands to';
+        if (t[0] === '$') {
+          // Mirror VAR_AT exactly: only a bare $NAME or an exact ${NAME} is ever expanded
+          // by expandVars, so only those can be "resolved" to a safe literal here. A modifier
+          // form (${VAR:-x}, ${VAR#p}, ${VAR:0:5}) is NOT expanded -- the deny pass never saw
+          // its value -- so it must always ask, never be treated as resolved. (This is the
+          // same VAR_AT invariant the failure log warns about; rmVarTargetAsk broke it.)
+          const at = /^\$\{([A-Za-z_]\w*)\}/.exec(t) || /^\$([A-Za-z_]\w*)/.exec(t);
+          if (at) { if (!varEnv.has(at[1])) return 'rm -rf of an unresolved variable target -- confirm it is not / or your home directory'; }
+          else return 'rm -rf through an unexpanded variable expression -- confirm the target';
+        } else if (t.includes('{}')) return 'rm -rf of a placeholder target -- confirm what it expands to';
       }
     }
   }
@@ -1218,6 +1241,12 @@ const DENY_PATTERNS = [
   // false deny on prose. `systemd-run` is not an English word, so it needs no such guard.
   [/^\s*(?:(?:at|batch)\s+(?:-|\d|now\b|noon\b|midnight\b|teatime\b|today\b|tomorrow\b|next\b)|systemd-run\b)/i,
     'Scheduling a task (at/batch/systemd-run) -- approve only if intended', 'ask'],
+  // `at`/`batch` with no command-shaped argument read the job from stdin (`batch <<< "..."`,
+  // `at < job`, bare `batch`). That is the same scheduler, so it asks too. A following redirect
+  // or a segment/pipe boundary marks the no-argument form; prose like `batch process the files`
+  // has a word argument and is not matched.
+  [/^\s*(?:at|batch)\s*(?:<|$|[;&|])/i,
+    'Scheduling a task from stdin (at/batch) -- approve only if intended', 'ask'],
   [/\b(strace|ltrace|gdb)\s+.*-p\s+\d/i, 'Attaching debugger/tracer to running process blocked'],
 
   // Identity / git backdoor
