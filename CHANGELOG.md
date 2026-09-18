@@ -372,12 +372,29 @@ Every real attack shape was re-verified to still deny, including the quoted-and-
 forms. Common developer commands (git, npm, pip, cargo, go, docker, kubectl, find, make)
 remain allow-or-fallthrough with zero wrong denies.
 
+An install / robustness audit found three ship-blockers, all fixed. A hook that crashes or
+hangs is not just ugly -- Claude Code treats a nonzero/absent exit as non-blocking, so the
+tool then runs UNPROTECTED. These fail safe now:
+
+- *Crash on a non-string `tool_input` field.* A host passing `command`, `file_path` or
+  `content` as a number or array threw (exit 1 -> unprotected). Now: an array `command` is
+  joined and analysed (so `["rm","-rf","/"]` is correctly denied instead of crashing
+  past the hook), and any other non-string exits 0 (fallthrough to the normal prompt).
+- *Hang on a large command.* The fork-bomb regex used an unbounded `[:w]+` that backtracks
+  quadratically on a long word-run: a 50KB `echo xxxx` took 6s, 200KB+ never returned and
+  blocked the hook indefinitely. Bounded to `{1,64}` (a fork-bomb name is a few chars); 50KB
+  is now 0.75s and 1MB is under 2s. This was pre-existing, not from this branch.
+- *Installer clobbered other plugins' hooks.* `merge-settings.js` replaced the whole `hooks`
+  key, silently deleting any other plugin's (or the user's own) hooks -- the same bug this
+  release fixed for `permissions`. It now merges: other plugins' hooks are preserved,
+  shellter's are refreshed idempotently (re-running does not duplicate them).
+
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-800 tests.
+812 tests.
 
 ## [0.7.1] - 2026-07-29
 

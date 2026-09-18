@@ -86,7 +86,10 @@ const DL_EXEC_RE = /\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|
 function downloadExecDanger(s) {
   return DL_EXEC_RE.test(commandSkeleton(s)) ? 'Download-and-execute pipe blocked -- inspect script first' : null;
 }
-const FORK_BOMB_RE = /([:\w]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
+// `[:\w]{1,64}` not `[:\w]+`: the unbounded form backtracks catastrophically on a long
+// word-run (a 50KB `echo xxxx...` took ~3s per variant, hanging the hook). A fork-bomb
+// function name is a handful of chars, so 64 is generous and kills the quadratic.
+const FORK_BOMB_RE = /([:\w]{1,64})\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
 function forkBombDanger(s) {
   return FORK_BOMB_RE.test(commandSkeleton(s)) ? 'Fork bomb blocked' : null;
 }
@@ -2308,8 +2311,14 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
 
-  const rawCmd = input?.tool_input?.command;
-  if (!rawCmd) process.exit(0);
+  let rawCmd = input?.tool_input?.command;
+  // Some hosts pass the command as an argv array (`["rm","-rf","/"]`); join it so it is
+  // analysed as one command line. Anything else non-string cannot be analysed -- exit 0
+  // (fallthrough to the normal permission prompt) rather than crashing. A crash exits
+  // nonzero, which Claude Code treats as non-blocking, so the tool would run UNPROTECTED:
+  // a bad-typed payload must fail safe, not open.
+  if (Array.isArray(rawCmd)) rawCmd = rawCmd.map((x) => (typeof x === 'string' ? x : '')).join(' ');
+  if (typeof rawCmd !== 'string' || !rawCmd) process.exit(0);
 
   const isPosh = input?.tool_name === 'PowerShell';
   const cwd = input?.cwd || process.cwd();

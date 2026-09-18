@@ -49,7 +49,10 @@ function deny(reason, snippet) {
 // Resolve symlinks for the deepest existing ancestor and re-append the
 // missing tail. Avoids `ln -s ~/.env /tmp/x; Read /tmp/x` bypass.
 function safeRealpath(p) {
-  if (!p) return p;
+  // A non-string path (a host passing file_path as a number/array) would throw in
+  // path.resolve; a crash exits nonzero and Claude Code then runs the tool UNPROTECTED, so
+  // fail safe to '' (which matches nothing) instead.
+  if (typeof p !== 'string' || !p) return '';
   const abs = path.resolve(p);
   const parts = abs.split(path.sep);
   for (let i = parts.length; i > 0; i--) {
@@ -188,13 +191,16 @@ process.stdin.on('end', () => {
 
   // ---- content checks for Write / Edit / MultiEdit / NotebookEdit ----
   if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+    // `x || ''` keeps a non-string truthy value (a number), which then throws in the string
+    // scanners -> nonzero exit -> Claude Code runs the tool UNPROTECTED. Only keep strings.
+    const str = (v) => (typeof v === 'string' ? v : '');
     let content = '';
-    if (tool === 'Write') content = input?.tool_input?.content || '';
-    else if (tool === 'Edit') content = input?.tool_input?.new_string || '';
-    else if (tool === 'NotebookEdit') content = input?.tool_input?.new_source || '';
+    if (tool === 'Write') content = str(input?.tool_input?.content);
+    else if (tool === 'Edit') content = str(input?.tool_input?.new_string);
+    else if (tool === 'NotebookEdit') content = str(input?.tool_input?.new_source);
     else if (tool === 'MultiEdit') {
       const edits = input?.tool_input?.edits;
-      content = Array.isArray(edits) ? edits.map(e => (e && e.new_string) || '').join('\n') : '';
+      content = Array.isArray(edits) ? edits.map(e => str(e && e.new_string)).join('\n') : '';
     }
     const filePath = tool === 'NotebookEdit'
       ? (input?.tool_input?.notebook_path || input?.tool_input?.file_path || '')

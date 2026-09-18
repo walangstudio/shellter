@@ -87,3 +87,5 @@ Every line here exists because it went wrong at least once.
 - `at`/`batch` are English words. Any rule matching them at segment start needs a scheduling-shaped-argument guard or it hard-denies prose like `at most`.
 - A wrong hard-deny is unappealable, so a dual-use or uncertain shape (rm of a variable target, scheduling, a download-to-disk) should ASK, not deny. Reserve deny for literal near-unambiguous malice.
 - A dangerous string can appear as PROSE (commit message, echo, # comment). Match pipeline/exec rules against a command skeleton with quoted bodies and comments stripped; the interpreter recursion still catches quoted code that is actually executed.
+- A hook that crashes or hangs fails OPEN (Claude Code treats nonzero/no exit as non-blocking). Validate input types and bound every quantifier: a non-string tool_input field or a huge command must fail safe, not throw or spin.
+- merge-settings must MERGE hooks, not replace the key. Replacing deletes other plugins hooks silently; filter out stale shellter entries then append (idempotent).

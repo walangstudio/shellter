@@ -60,7 +60,20 @@ if (fs.existsSync(targetPath)) {
 // asymmetric risk. This assignment also used to REPLACE the user's whole allow
 // list; never touch their permissions.
 if (fixedTemplate.permissions) existing.permissions = fixedTemplate.permissions;
-existing.hooks = fixedTemplate.hooks;
+
+// Merge, don't clobber. `existing.hooks = fixedTemplate.hooks` wholesale-replaced the key,
+// silently deleting any OTHER plugin's (or the user's own) hooks -- the exact bug this
+// release fixed for `permissions`. Preserve everything that isn't shellter's, drop stale
+// shellter entries (so re-running the installer doesn't duplicate them), then append fresh.
+const isShellterGroup = (g) => g && Array.isArray(g.hooks) &&
+  g.hooks.some((h) => h && typeof h.command === 'string' &&
+    /check-bash\.js|check-sensitive-files\.js/.test(h.command));
+if (!existing.hooks || typeof existing.hooks !== 'object') existing.hooks = {};
+for (const [event, groups] of Object.entries(fixedTemplate.hooks || {})) {
+  const prior = Array.isArray(existing.hooks[event])
+    ? existing.hooks[event].filter((g) => !isShellterGroup(g)) : [];
+  existing.hooks[event] = prior.concat(groups);
+}
 
 // Removing the block from the template does nothing for anyone who already ran an
 // older installer -- those wildcards are sitting in their settings.json right now,
