@@ -2176,6 +2176,11 @@ testBash('rm home: $HOME trailing slash denies', 'rm -rf $HOME/', 'deny');
 testBash('rm home: quoted "$HOME" denies', 'rm -rf "$HOME"', 'deny');
 // code-review: a literal quoted home path (backslashes now survive tokenizeArgs) denies too.
 { const h = require('os').homedir(); testBash('rm home: literal quoted homedir denies', 'rm -rf "' + h + '"', 'deny'); }
+// code-review (Linux CI): a subdir of your OWN home is a routine cleanup, not a system dir --
+// on Linux $HOME sits under /home (or /root), which RM_SYSTEM_PREFIX would otherwise deny at
+// any depth. Build the path from os.homedir() so this exercises the real home on every platform.
+{ const h = require('os').homedir(); testBash('rm home: own-home cache subdir is fine', 'rm -rf "' + h + '/.cache/app"', 'fallthrough'); }
+{ const h = require('os').homedir(); testBash('rm home: own-home node_modules is fine', 'rm -rf "' + h + '/project/node_modules"', 'fallthrough'); }
 testBash('rm home: /root denies', 'rm -rf /root', 'deny');
 testBash('rm home: /root subpath denies', 'rm -rf /root/.ssh', 'deny');
 testBash('fp rm home: $HOME/.config subdir is fine', 'rm -rf $HOME/.config/app', 'fallthrough');

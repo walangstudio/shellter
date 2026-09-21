@@ -181,17 +181,23 @@ function rmTargetDanger(t) {
   // safe literal in the same command). Only LITERAL catastrophic targets deny below.
   if (t === '/' || /^\/(?![A-Za-z0-9])/.test(t)) return 'filesystem root';   // /, //, /*, /.
   if (/^~/.test(t)) return 'home directory';   // ~, ~/x, ~+, ~-, ~user
-  // The home directory ITSELF (what a seeded $HOME/$USERPROFILE expands to) is `~` by
-  // another name -- wiping it is as catastrophic as `rm -rf ~`. Exact match only, so a
-  // subdir cleanup (`$HOME/.cache/app`) stays safe. This is what catches a Windows home
-  // (`C:\Users\me`) or `/root`, which the Unix RM_SYSTEM_PREFIX list does not.
-  const home = os.homedir();
-  if (home && normRmPath(t) === normRmPath(home)) return 'home directory';
-  if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
-  // Any absolute path with a `..` traversal component can escape upward to a
-  // system dir (`/opt.bak/../../etc`, `/opt/../etc`); block conservatively. A `..`
-  // inside a filename (report.v1..v2) or a dir named ..cache is NOT a component.
+  // Any absolute path with a `..` traversal component can escape upward to a system dir
+  // (`/opt.bak/../../etc`, `/opt/../etc`, `$HOME/../../etc`); block conservatively BEFORE the
+  // own-home carve-out below so a `..` can't launder its way back out. A `..` inside a filename
+  // (report.v1..v2) or a dir named ..cache is NOT a component.
   if (/^[\/~]/.test(t) && /(?:^|\/)\.\.(?:\/|$)/.test(t)) return 'path traversal';
+  // The home directory ITSELF (what a seeded $HOME/$USERPROFILE expands to) is `~` by another
+  // name -- wiping it is as catastrophic as `rm -rf ~`. But a path UNDER your own home is a
+  // routine cleanup (`rm -rf ~/.cache/app`, `rm -rf ~/project/node_modules`) and must NOT be
+  // denied -- on Linux `$HOME` sits under `/home` (or `/root`), which RM_SYSTEM_PREFIX would
+  // otherwise treat as a system dir at any depth. The `..` guard above keeps this from escaping.
+  const home = os.homedir();
+  if (home) {
+    const nt = normRmPath(t), nh = normRmPath(home);
+    if (nt === nh) return 'home directory';
+    if (!/(?:^|\/)\.\.(?:\/|$)/.test(nt) && (nt + '/').startsWith(nh + '/')) return null;
+  }
+  if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
   // /opt ROOT (slash/dot/star-only tail). Deep specific /opt paths stay allowed
   // (this tree lives under /opt/projs).
   if (/^\/opt(?:[\/.*]*)$/.test(t)) return '/opt root';
