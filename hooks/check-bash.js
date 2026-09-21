@@ -76,6 +76,13 @@ function normalizeObfuscation(s) {
 // without matching a literal non-interpreter like `git -c ... commit` (config, not exec),
 // which must still relax so a `curl | bash` in its commit message is not a false deny.
 const INTERP_EXEC_RE = /\beval\b|\s-(?:exec|execdir|ok|okdir)\b|\bxargs\b|\$\(|`|(?:\b(?:bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b|\$\{?[A-Za-z_]\w*\}?)\S*\s+-[A-Za-z]*[ceErsi]\b/i;
+// Gate on the RAW string: if anything COULD execute quoted content, keep the raw text so the
+// payload is not hidden; otherwise strip quoted prose. Tested against the raw string, not the
+// skeleton, on purpose -- a quoted interpreter word still executes (`"$SHELL" -c "..."`,
+// `"bash" -c`), and its indicator only survives on the raw text. The cost is a KNOWN, narrow
+// false-deny: a message that quotes BOTH an interpreter `-c` AND a `curl | bash` pipe
+// (`git commit -m "run sh -c ... curl x | bash"`) is hard-denied. A quote-context-aware gate
+// that split the two would need a real parser; not worth the risk to the exec-detection path.
 function analysisText(s) {
   return (typeof s === 'string' && INTERP_EXEC_RE.test(s)) ? s : commandSkeleton(s);
 }
@@ -98,14 +105,20 @@ function commandSkeleton(s) {
   return out;
 }
 
+// Interpreter anchored right after `|` (bare pipe-to-shell, and the `interp -c "payload"`
+// substring case). A pipe THROUGH a command wrapper (`| sudo -u root bash`, `| timeout 5 bash`,
+// `| command bash`, `| "bash"`) is handled tokenized in pipeToWrappedInterpDanger, which reuses
+// the CMD_WRAPPERS + WRAPPER_VALUE_FLAGS flag-arity model -- a regex wrapper prefix could not
+// model a flag whose value is a separate token (`-u root`) and auto-approved the wrapped RCE.
 const DL_EXEC_RE = /\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i;
 function downloadExecDanger(s) {
   return DL_EXEC_RE.test(analysisText(s)) ? 'Download-and-execute pipe blocked -- inspect script first' : null;
 }
-// `[:\w]{1,64}` not `[:\w]+`: the unbounded form backtracks catastrophically on a long
-// word-run (a 50KB `echo xxxx...` took ~3s per variant, hanging the hook). A fork-bomb
-// function name is a handful of chars, so 64 is generous and kills the quadratic.
-const FORK_BOMB_RE = /([:\w]{1,64})\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
+// `[:\w]{1,256}` not `[:\w]+`: the unbounded form backtracks catastrophically on a long
+// word-run (a 50KB `echo xxxx...` took ~3s per variant, hanging the hook). The bound keeps
+// it linear; 256 is well past any realistic fork-bomb function name (was 64, which a
+// deliberately long name could step over to evade the deny).
+const FORK_BOMB_RE = /([:\w]{1,256})\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
 function forkBombDanger(s) {
   return FORK_BOMB_RE.test(analysisText(s)) ? 'Fork bomb blocked' : null;
 }
@@ -128,7 +141,16 @@ function tokenizeArgs(s) {
     const c = s[i];
     if (q === "'") { if (c === "'") q = null; else cur += c; has = true; continue; }
     if (q === '"') {
-      if (c === '\\' && i + 1 < s.length) { cur += s[++i]; has = true; continue; }
+      // Inside double quotes bash treats `\` as an escape ONLY before $ ` " \ or newline;
+      // any other backslash is literal. The old "always drop the backslash" ate the separators
+      // in a quoted Windows path (`"C:\Users\me"` -> `C:Usersme`), so the exact-home rm guard
+      // and secret-path checks never matched it. Keep the backslash literal otherwise.
+      if (c === '\\' && i + 1 < s.length) {
+        const n = s[i + 1];
+        if (n === '"' || n === '\\' || n === '$' || n === '`' || n === '\n') { cur += n; i++; }
+        else cur += c;
+        has = true; continue;
+      }
       if (c === '"') q = null; else cur += c;
       has = true; continue;
     }
@@ -141,7 +163,14 @@ function tokenizeArgs(s) {
 }
 
 // System dirs that must never be recursively force-removed (any depth).
-const RM_SYSTEM_PREFIX = /^(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)(?:\/|$)/;
+// `/root` is the root user's home -- as catastrophic as any /home wipe.
+const RM_SYSTEM_PREFIX = /^(?:\/home|\/root|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)(?:\/|$)/;
+// Trailing-separator- and (on Windows) case-insensitive path compare for the exact
+// home-directory match below.
+const normRmPath = (s) => {
+  const x = s.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+  return process.platform === 'win32' ? x.toLowerCase() : x;
+};
 
 function rmTargetDanger(t) {
   if (!t) return null;
@@ -152,6 +181,12 @@ function rmTargetDanger(t) {
   // safe literal in the same command). Only LITERAL catastrophic targets deny below.
   if (t === '/' || /^\/(?![A-Za-z0-9])/.test(t)) return 'filesystem root';   // /, //, /*, /.
   if (/^~/.test(t)) return 'home directory';   // ~, ~/x, ~+, ~-, ~user
+  // The home directory ITSELF (what a seeded $HOME/$USERPROFILE expands to) is `~` by
+  // another name -- wiping it is as catastrophic as `rm -rf ~`. Exact match only, so a
+  // subdir cleanup (`$HOME/.cache/app`) stays safe. This is what catches a Windows home
+  // (`C:\Users\me`) or `/root`, which the Unix RM_SYSTEM_PREFIX list does not.
+  const home = os.homedir();
+  if (home && normRmPath(t) === normRmPath(home)) return 'home directory';
   if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
   // Any absolute path with a `..` traversal component can escape upward to a
   // system dir (`/opt.bak/../../etc`, `/opt/../etc`); block conservatively. A `..`
@@ -214,7 +249,19 @@ function rmVarTargetAsk(seg) {
           // its value -- so it must always ask, never be treated as resolved. (This is the
           // same VAR_AT invariant the failure log warns about; rmVarTargetAsk broke it.)
           const at = /^\$\{([A-Za-z_]\w*)\}/.exec(t) || /^\$([A-Za-z_]\w*)/.exec(t);
-          if (at) { if (!varEnv.has(at[1])) return 'rm -rf of an unresolved variable target -- confirm it is not / or your home directory'; }
+          if (at) {
+            // varEnv keys bash names as-is and PowerShell names lowercased (varKey). This
+            // function has no isPosh flag, so resolve against both -- otherwise a PowerShell
+            // `$Dir=...; rm -rf $Dir` misses its own (lowercased) key and asks spuriously.
+            const known = varEnv.has(at[1]) ? at[1] : (varEnv.has(at[1].toLowerCase()) ? at[1].toLowerCase() : null);
+            if (!known) return 'rm -rf of an unresolved variable target -- confirm it is not / or your home directory';
+            // A bare whole-token var that RESOLVES to a protected dir (home, /root, a
+            // system path) is a home/system wipe by indirection. The hard-deny pass catches
+            // most forms via the expanded literal, but a double-quoted Windows path loses its
+            // backslashes in tokenization and slips it -- so ask here as a floor. A suffixed
+            // target (`$HOME/.cache`) is not the whole token, so it stays a safe cleanup.
+            if (at[0] === t && rmTargetDanger(varEnv.get(known))) return 'rm -rf of ' + t + ' which resolves to a protected directory -- confirm the target';
+          }
           else return 'rm -rf through an unexpanded variable expression -- confirm the target';
         } else if (t.includes('{}')) return 'rm -rf of a placeholder target -- confirm what it expands to';
       }
@@ -753,6 +800,11 @@ const SECRET_TOKENS = '(?:' + [
   '[\\\\/]credentials(?![\\w./])', 'credentials\\.(?:json|ya?ml|toml|ini|txt|xml|env|conf|cfg|properties|store)\\b', '\\.git-credentials\\b',
   '\\.ssh\\b', '\\.gnupg\\b', '\\.aws\\b', '\\.gcloud\\b', '\\.azure\\b',
   '\\.docker[\\\\/]config', '\\.gitconfig\\b',
+  // Unix credential stores: password hashes and the sudoers policy. Anchored to
+  // `/etc/` so the bare word "shadow" (box-shadow, shadow DOM, a game asset) never
+  // matches; `master.passwd` is the BSD/macOS shadow file. `/etc/passwd` is NOT here
+  // -- it is world-readable and holds no secret.
+  '[\\\\/]etc[\\\\/](?:g?shadow|sudoers|master\\.passwd)\\b',
 ].join('|') + ')';
 
 // Persistence / credential WRITE targets. Writing INTO these (redirect, tee,
@@ -1051,10 +1103,11 @@ const ATTACHED_FILE_FLAG = /^-[A-Za-z]*f\S/;
 // Command wrappers the read verb can hide behind. The substring rule used to catch these
 // for free (it matched the verb anywhere in the segment); the tokenized rule looks at the
 // command word, so it has to step over them itself.
-const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'timeout']);
+const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'timeout', 'exec', 'builtin']);
 // Wrapper flags that take a SEPARATE value token (`sudo -u root grep …`). Without these the
 // value ('root') is mistaken for the command word and the read verb behind it is never seen.
 const WRAPPER_VALUE_FLAGS = {
+  exec: /^(?:-a|--argv0)$/,
   sudo: /^(?:-u|--user|-U|--other-user|-g|--group|-p|--prompt|-r|--role|-t|--type|-C|--close-from|-D|--chdir|-R|--chroot)$/,
   doas: /^(?:-u|-C)$/,
   env: /^(?:-u|--unset|-C|--chdir|-S|--split-string)$/,
@@ -1075,31 +1128,134 @@ const READ_VERBS_PATH = READ_VERBS.split('|').filter(v => !PROGRAM_ARG_VERBS.has
 // read verb reaching a secret token survives intra-word quote splitting (`cat ".e"nv`,
 // `c"a"t .env`) that a raw-substring regex can't see. Predicate form for the deny
 // loop; returns a reason or null.
+// Step over leading command wrappers (`sudo -u root <cmd>`, `env FOO=1 <cmd>`, `timeout 5 <cmd>`,
+// stacked `command timeout 5 <cmd>`) and the flags / VAR=val / durations they take, returning
+// the index of the effective command word. `protect` is a Set of basenames a wrapper flag must
+// never swallow as its value: if the arity table is wrong about a flag, the token it would eat
+// is the real command word, so stop and treat the flag as boolean (one extra token checked,
+// never a missed command). Shared by the sensitive-read AND pipe-to-interpreter deny paths so
+// the wrapper/flag model has ONE source (a hand-rolled second copy auto-approved `| sudo -u root
+// bash` -- a flag with a separate-token value the regex grammar could not model).
+function stepWrappers(toks, at, protect) {
+  while (at < toks.length && CMD_WRAPPERS.has(toks[at].replace(/^.*[\\/]/, ''))) {
+    const valueFlag = WRAPPER_VALUE_FLAGS[toks[at].replace(/^.*[\\/]/, '')];
+    at++;
+    while (at < toks.length) {
+      const t = toks[at];
+      if (valueFlag && valueFlag.test(t) &&
+          !protect.has((toks[at + 1] || '').replace(/^.*[\\/]/, ''))) { at += 2; continue; }
+      if (t.startsWith('-') || /^[A-Za-z_]\w*=/.test(t) || /^\d+(?:\.\d+)?[smhd]?$/.test(t)) { at++; continue; }
+      break;
+    }
+  }
+  return at;
+}
+
+// Interpreters that execute piped stdin (bare) or an inline `-c`/`-i`/`-s` argument.
+const INTERP_SET = new Set(
+  'bash sh zsh dash ash ksh fish python python2 python3 perl ruby node deno bun php lua tclsh'.split(' '));
+const SHELL_SET = new Set('bash sh zsh dash ash ksh fish'.split(' '));
+
+// A shell reading a process substitution (`bash <(curl ...)`) runs the downloaded output as its
+// script. Tokenized + wrapper-stepping so `timeout 5 bash <(curl ...)` / `command bash <(...)`
+// is caught too -- the old regex was anchored at the command word and a leading wrapper walked
+// past it, laundering a silent RCE through the wrapper-keyword approve rule.
+function shellProcSubDanger(seg) {
+  const toks = tokenizeArgs(seg.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, ''));
+  if (!toks.length) return null;
+  const at = stepWrappers(toks, 0, SHELL_SET);
+  const word = toks[at] || '';
+  // Glued form `bash<(curl ...)`: tokenizeArgs splits only on whitespace, so the shell and the
+  // process substitution are one token, but bash still parses `<` as a metacharacter starting it.
+  if (/^(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish)<\(/i.test(word)) return 'Shell with process-substitution input blocked';
+  if (!SHELL_SET.has(word.replace(/^.*[\\/]/, ''))) return null;
+  if (toks.slice(at + 1).some((t) => t.startsWith('<('))) return 'Shell with process-substitution input blocked';
+  return null;
+}
+// Tokenized pipe-to-interpreter deny. A pipe TARGET whose effective command word (after leading
+// assignments and wrappers) is an interpreter, run bare (reads the piped data) or with -c/-i/-s,
+// is a download-and-execute. Tokenized (not regex) so a wrapper flag with a separate-token value
+// (`sudo -u root bash`) is stepped correctly, and a quoted interpreter (`| "bash"`, `| b"a"sh`)
+// is de-quoted by tokenizeArgs. splitPipeStages is quote-aware, so a `|` inside a quoted commit
+// message is not a stage and stays prose.
+// Cut an unquoted `#`-to-EOL comment, PRESERVING quotes (unlike commandSkeleton, which also
+// strips quoted bodies -- here a quoted interpreter `| "bash"` must survive). Mirrors
+// commandSkeleton's comment rule so `true # curl x | sh` is not read as a real pipe.
+function stripUnquotedComment(s) {
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (q === '"' && c === '\\' && i + 1 < s.length) { i++; continue; } if (c === q) q = null; continue; }
+    if (c === "'" || c === '"') { q = c; continue; }
+    if (c === '#' && (i === 0 || /\s/.test(s[i - 1]))) return s.slice(0, i);
+  }
+  return s;
+}
+
+function pipeToWrappedInterpDanger(seg) {
+  const stages = splitPipeStages(stripUnquotedComment(seg));
+  for (let si = 1; si < stages.length; si++) {
+    const s = stages[si].replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
+    const toks = tokenizeArgs(s);
+    if (!toks.length) continue;
+    const at = stepWrappers(toks, 0, INTERP_SET);
+    const cmd = (toks[at] || '').replace(/^.*[\\/]/, '');
+    if (!INTERP_SET.has(cmd)) continue;
+    // Scan ALL option tokens after the interpreter, not just the first -- an interpreter takes
+    // several separate flags before the exec flag (`bash -eu -c ...`, `ruby -w -e ...`,
+    // `python -O -c ...`), and checking only toks[at+1] let that whole class slip (auto-allowed
+    // via a timeout/command wrapper). A positional (script file) ends option parsing and runs
+    // the script, not the piped data; `python -m module` runs a module, not stdin -> stop without
+    // denying. If only flags follow (no script), the interpreter reads the piped data -> bare deny.
+    // Exec flags are interpreter-specific: -c/-i/-s for all; -e/-E (and --eval) only for the
+    // scripting langs whose -e is inline code (NOT shell `-e` errexit, NOT python `-E` ignore-env);
+    // php -r. This keeps `bash -e script.sh` and `python -E script.py` out of a false deny.
+    const isPython = /^python[23]?$/.test(cmd);
+    const evalE = /^(?:perl|ruby|node|deno|bun|lua)$/.test(cmd);
+    const jsEval = /^(?:node|deno|bun)$/.test(cmd);
+    // A script positional that names stdin (`bash /dev/stdin`, `/dev/fd/0`) runs the PIPED
+    // data as the script -- that IS download-and-execute, not a local script file.
+    const STDIN_REF = /^(?:\/dev\/stdin|\/dev\/fd\/\d+|\/proc\/self\/fd\/\d+)$/;
+    // deno/bun take a SUBCOMMAND before the script (`deno run /dev/stdin`, `bun run -`); the
+    // subcommand is a non-flag token, so without this it would be mistaken for the script and
+    // end the scan before the real stdin-ref/script is seen. Skip ONE subcommand and remember it.
+    const denoSub = /^(?:deno|bun)$/.test(cmd);
+    let subName = null;
+    let sawScript = false;
+    for (const t of toks.slice(at + 1)) {
+      if (isPython && /^-[A-Za-z]*m/.test(t)) { sawScript = true; break; }  // -m or attached -mMODULE
+      // ponytail: a lone `-` almost always means "read stdin" for an interpreter, so deny it.
+      // Soft spot: a flag whose separate-token VALUE is `-` (e.g. a hypothetical `--out -`) would
+      // also trip this; no real deno/bun/shell flag documents `-` as a value, so no repro found.
+      if (t === '-') return 'Pipe to interpreter reading stdin blocked';
+      if (/^(?:-[A-Za-z]*c|-i|-s)$/.test(t)) return 'Pipe to interpreter with -c/-i/-s blocked';
+      if (evalE && /^(?:-[A-Za-z]*[eE]|--eval)$/.test(t)) return 'Pipe to interpreter inline-eval blocked';
+      if (jsEval && /^(?:-[A-Za-z]*p|--print)$/.test(t)) return 'Pipe to interpreter inline-eval blocked';
+      if (cmd === 'php' && /^-[A-Za-z]*r$/.test(t)) return 'Pipe to interpreter inline-eval blocked';
+      if (!t.startsWith('-')) {
+        if (STDIN_REF.test(t)) return 'Pipe to interpreter reading stdin blocked';
+        if (denoSub && subName === null && /^(?:run|eval|test|repl|bundle|compile|serve|x)$/.test(t)) { subName = t; continue; }
+        sawScript = true; break;   // a real script file runs the file, not the piped data
+      }
+    }
+    // Only-flags-then-end means the interpreter reads the piped data (bare `bash`, `bash -eu`).
+    // For deno/bun a NON-repl subcommand (test/run/bundle/...) does not read stdin -- only bare
+    // (no subcommand) or `repl` does -- so don't bare-deny those (`deno test` is routine CI).
+    if (!sawScript && !(denoSub && subName !== null && subName !== 'repl'))
+      return 'Pipe to bare shell/interpreter blocked';
+  }
+  return null;
+}
+
 function tokenizedSensitiveRead(seg) {
   for (const stage of splitPipeStages(seg)) {
     const s = stage.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
     const toks = tokenizeArgs(s);
     if (!toks.length) continue;
-    // Step over command wrappers (`sudo grep …`, `env FOO=1 sed …`, `time cat …`) and the
-    // flags / VAR=val / durations they take, so the read verb behind one is still seen.
-    let at = 0;
-    let wrapped = false;
-    while (at < toks.length && CMD_WRAPPERS.has(toks[at].replace(/^.*[\\/]/, ''))) {
-      const valueFlag = WRAPPER_VALUE_FLAGS[toks[at].replace(/^.*[\\/]/, '')];
-      wrapped = true;
-      at++;
-      while (at < toks.length) {
-        const t = toks[at];
-        // Never let a supposed flag value swallow a read verb: if this table entry is wrong
-        // about the flag's arity (a boolean flag listed as value-taking), the token it eats
-        // is the real command word, and the whole check goes blind. Treat the flag as
-        // boolean in that case -- the cost is one extra token checked, never a missed read.
-        if (valueFlag && valueFlag.test(t) &&
-            !READ_VERB_SET.has((toks[at + 1] || '').replace(/^.*[\\/]/, ''))) { at += 2; continue; }
-        if (t.startsWith('-') || /^[A-Za-z_]\w*=/.test(t) || /^\d+(?:\.\d+)?[smhd]?$/.test(t)) { at++; continue; }
-        break;
-      }
-    }
+    // Step over command wrappers (`sudo grep …`, `env FOO=1 sed …`, `time cat …`) so the read
+    // verb behind one is still seen. Shared stepper; protect read verbs from a wrong-arity flag.
+    let at = stepWrappers(toks, 0, READ_VERB_SET);
+    const wrapped = at > 0;
     // A wrapper flag we don't know the arity of would leave `at` on its value instead of the
     // command word, which would hide the read entirely -- so fall back to the first read verb
     // anywhere in a wrapped stage. Only wrapped stages, to keep this off ordinary commands.
@@ -1192,13 +1348,16 @@ const DENY_PATTERNS = [
   // false deny; a real `echo x | sh` (no quotes) still matches, and a quoted-and-executed
   // `bash -c "x | sh"` is caught by the interpreter recursion.
   [pipeToInterpDanger, null],
+  // Pipe THROUGH a wrapper to an interpreter (`| sudo -u root bash`, `| timeout 5 bash`,
+  // `| command sh`, `| "bash"`). Tokenized, reusing the flag-arity model so a separate-token
+  // flag value (`-u root`) is stepped and a quoted interpreter is de-quoted.
+  [pipeToWrappedInterpDanger, null],
   // `source <(curl ...)` / `. <(wget ...)` executes downloaded output in the current
   // shell -> deny. `source <(kubectl completion bash)` and other local generators are a
   // routine idiom, so only a network/decode process-sub is blocked here (a dangerous
   // local command inside `<(...)` is still caught by the process-sub recursion).
   [/\b(source|\.)\s+<\((?=[^)]*\b(?:curl|wget|fetch|base64|xxd)\b)/i, 'source/. of a downloaded/decoded process substitution blocked'],
-  [/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\s+<\(/i,
-    'Shell with process-substitution input blocked'],
+  [shellProcSubDanger, null],
 
   // Persistence. `crontab -l` (list) is read-only, so it is exempt; any other crontab
   // form (install/edit/remove) still denies.
@@ -1628,6 +1787,14 @@ const APPROVE_PATTERNS = [
   /^\s*fi\s*$/,
   // `source` / `.` removed here: routed through the script-content scanner so a
   // sourced local script is inspected, not blanket-approved.
+  // KNOWN LIMIT (defense-in-depth, tracked): `command`/`timeout`/`time`/`builtin` here approve
+  // the wrapper without examining what it wraps, so `timeout 5 sh /tmp/y` auto-approves although
+  // bare `sh /tmp/y` only prompts. This ALSO amplifies any deny rule that is not wrapper-aware
+  // into a silent allow: the pipe-to-interpreter and process-substitution denies are tokenized
+  // through stepWrappers precisely so this can't launder them, but a future `^`-anchored deny
+  // added without the same treatment would be laundered here. The robust fix is a wrapper-aware
+  // approve pass (recurse into the wrapped command) that still preserves `command -v X` and
+  // `timeout <legit-cmd>`; deferred to its own change so it can be reviewed on its own.
   /^\s*(export|set|type|command|hash|builtin|timeout|time|trap|read|local|declare|readonly|unset)\s/,
   /^\s*command\s+-v\s/,
   /^\s*type\s+-[apt]/,

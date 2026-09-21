@@ -146,6 +146,12 @@ const MACOS_KEYCHAIN = /(^|\/)(Library\/Keychains\/|login\.keychain(-db)?$|Syste
 // registry `config\` path context so a repo file named `SECURITY` or a module `SYSTEM`
 // is not flagged; NTUSER.DAT and the AppData credential stores stay matched anywhere.
 const WINDOWS_SECRETS = /(^|[\/\\])NTUSER\.DAT$|[\/\\]config[\/\\](SAM|SYSTEM|SECURITY|SOFTWARE|DEFAULT)$|AppData[\/\\]Roaming[\/\\]Microsoft[\/\\](Credentials|Vault|Protect)([\/\\]|$)/i;
+// Unix credential stores: password hashes and the sudoers policy. Anchored to `/etc/`
+// so a repo file named `shadow` is not flagged; `master.passwd` is the BSD/macOS shadow
+// file. `/etc/passwd` is intentionally absent -- world-readable, holds no secret.
+// Trailing `-?` catches the backup shadow files (`/etc/shadow-`, `/etc/gshadow-`) that
+// hold the same password hashes; `/etc/shadowfoo` still does not match.
+const UNIX_SHADOW = /(^|\/)etc\/(g?shadow|sudoers(?:\.d)?|master\.passwd)-?(\/|$)/i;
 
 // Concrete secret-token SHAPES -- blocked on any path (grepping for a live key value is
 // harvesting regardless of where you look).
@@ -173,6 +179,7 @@ function pathMatchesAnySensitive(p) {
   if (BROWSER_DATA_PATTERN.test(p)) return 'browser cookie/login database';
   if (MACOS_KEYCHAIN.test(p)) return 'macOS Keychain database';
   if (WINDOWS_SECRETS.test(p)) return 'Windows credential / registry hive';
+  if (UNIX_SHADOW.test(p)) return 'Unix password-hash / sudoers file';
   return null;
 }
 
