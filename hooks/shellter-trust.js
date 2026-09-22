@@ -130,7 +130,11 @@ function claudeAllowRules(cwd, toolName) {
     if (parent === dir) break;
     dir = parent;
   }
-  collectAllow(path.join(os.homedir(), '.claude', 'settings.json'), toolName, rules);
+  // os.homedir() THROWS with no resolvable home (container uid w/o passwd entry); this runs on the
+  // hook hot path (commandAllowed), so an unguarded throw would crash the hook and FAIL OPEN.
+  let homeDir = '';
+  try { homeDir = os.homedir(); } catch (_) { /* no resolvable home -> skip the user-global allow list */ }
+  if (homeDir) collectAllow(path.join(homeDir, '.claude', 'settings.json'), toolName, rules);
   _allowCache = { cwd, tool: toolName, rules };
   return rules;
 }
