@@ -445,12 +445,21 @@ what the real expander/recursion does, or it relaxes further than intended.
   on Windows (and for the Linux root user) the home-wipe silently fell through, a regression from
   0.7.1's blanket `$VAR` deny. `rm -rf` now treats the home directory itself (any OS) and `/root`
   as protected, so `$HOME`/`${HOME}`/`"$HOME"`/`$HOME/`, a literal quoted home path, and `/root`
-  all hard-deny like `~`. A subdir cleanup of your OWN home (`rm -rf ~/.cache/app`,
-  `~/project/node_modules`) still falls through -- on Linux `$HOME` lives under `/home`
+  all hard-deny like `~`. A subdir cleanup of your OWN home (`rm -rf "$HOME/.cache/app"`,
+  `"$HOME/project/node_modules"`) still falls through -- on Linux `$HOME` lives under `/home`
   (or `/root`), which `RM_SYSTEM_PREFIX` would otherwise deny at any depth, so the user's own
   home subtree is carved out (`..`-guarded so it can't climb back out to a system dir). (Reaching
   the quoted forms also required fixing `tokenizeArgs` to match bash's double-quote escaping -- it
-  was dropping the backslashes in `"C:\Users\me"`, so the path never matched.)
+  was dropping the backslashes in `"C:\Users\me"`, so the path never matched. A literal `~/subpath`
+  stays denied by design, matching the pre-existing `~/Documents` behavior.)
+- *The own-home carve-out disabled every rm deny on a degenerate home, and could crash the hook.*
+  A follow-up review caught two flaws in the carve-out above. First, `os.homedir()` of `/` (a root
+  or minimal-container box with `HOME=/`) normalizes to `` -- an empty prefix, and `"".startsWith`
+  logic matched EVERY absolute path, so `rm -rf /etc` was carved out to a silent allow. The prefix
+  boundary is now guarded on a non-empty home. Second, `os.homedir()` and `os.userInfo()` THROW
+  when there is no resolvable home/user (a container uid with no `/etc/passwd` entry) -- an
+  unguarded throw crashes a PreToolUse hook, which fails OPEN. Both are now wrapped so a missing
+  home degrades to `` and never throws.
 - *A long-named fork bomb slipped the deny.* The ReDoS bound on the fork-bomb name was 64 chars,
   which a deliberately long function name stepped over; raised to 256 (still linear-time).
 - *A PowerShell `rm -rf $Var` asked spuriously.* `rmVarTargetAsk` looked `$Dir` up in the var
@@ -462,7 +471,7 @@ marker on an ordinary file to deny; 0.7.0 made that Class B (destination-gated),
 fixtures now target an agent-instruction file and a new assertion pins the gate itself.
 First CI: GitHub Actions on ubuntu (node 18/20/22) and windows (node 20).
 
-924 tests.
+925 tests.
 
 ## [0.7.1] - 2026-07-29
 

@@ -172,6 +172,15 @@ const normRmPath = (s) => {
   return process.platform === 'win32' ? x.toLowerCase() : x;
 };
 
+// os.homedir() THROWS (SystemError/ENOENT) when the process has no resolvable home -- e.g. a
+// container running as a uid with no /etc/passwd entry and $HOME unset (routine under
+// Kubernetes/CI). A PreToolUse hook that throws FAILS OPEN (Claude Code runs the tool
+// unprotected), so this must never escape. '' degrades every caller safely: the rm carve-out is
+// guarded on a non-empty home, and `~` expansion falls back to a relative join.
+function safeHomedir() {
+  try { return os.homedir() || ''; } catch (_) { return ''; }
+}
+
 function rmTargetDanger(t) {
   if (!t) return null;
   // A variable/placeholder target used to hard-deny here. But shellter cannot know a
@@ -188,14 +197,19 @@ function rmTargetDanger(t) {
   if (/^[\/~]/.test(t) && /(?:^|\/)\.\.(?:\/|$)/.test(t)) return 'path traversal';
   // The home directory ITSELF (what a seeded $HOME/$USERPROFILE expands to) is `~` by another
   // name -- wiping it is as catastrophic as `rm -rf ~`. But a path UNDER your own home is a
-  // routine cleanup (`rm -rf ~/.cache/app`, `rm -rf ~/project/node_modules`) and must NOT be
-  // denied -- on Linux `$HOME` sits under `/home` (or `/root`), which RM_SYSTEM_PREFIX would
+  // routine cleanup (`rm -rf "$HOME/.cache/app"`, `rm -rf "$HOME/project/node_modules"`) and must
+  // NOT be denied -- on Linux `$HOME` sits under `/home` (or `/root`), which RM_SYSTEM_PREFIX would
   // otherwise treat as a system dir at any depth. The `..` guard above keeps this from escaping.
-  const home = os.homedir();
+  // (Literal `~/subpath` is handled by the unconditional `~` catch-all above, by design.)
+  // `nh` MUST be non-empty before it is used as a prefix boundary: a degenerate home (`HOME=/` on a
+  // root or minimal-container Linux) normalizes to ``, and an empty prefix's `('' + '/')` matches
+  // EVERY absolute path -- carving out the whole filesystem and disabling every deny below. Guard
+  // `nh` so such a home falls through to the RM_SYSTEM_PREFIX deny instead.
+  const home = safeHomedir();
   if (home) {
     const nt = normRmPath(t), nh = normRmPath(home);
-    if (nt === nh) return 'home directory';
-    if (!/(?:^|\/)\.\.(?:\/|$)/.test(nt) && (nt + '/').startsWith(nh + '/')) return null;
+    if (nh && nt === nh) return 'home directory';
+    if (nh && !/(?:^|\/)\.\.(?:\/|$)/.test(nt) && (nt + '/').startsWith(nh + '/')) return null;
   }
   if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
   // /opt ROOT (slash/dot/star-only tail). Deep specific /opt paths stay allowed
@@ -1004,10 +1018,16 @@ function expandSegments(segments, cwd, isPosh) {
   // Pre-seed unambiguous host variables at their real values. Two-way win: an ordinary
   // `cat $HOME/notes.txt` resolves and keeps auto-approving, and `cat $HOME/.ssh/id_rsa`
   // expands into a literal the deny rules can read.
-  for (const [name, val] of [['HOME', os.homedir()], ['PWD', cwd || process.cwd()],
-                             ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username]]) {
-    if (typeof val === 'string' && val && val.length <= VAR_VALUE_MAX) varEnv.set(varKey(name, isPosh), val);
-  }
+  // os.homedir()/os.userInfo() THROW when there is no resolvable home/user (container uid with no
+  // passwd entry); process.cwd() throws if the cwd was unlinked. Any throw here would crash the
+  // hook and FAIL OPEN, so seed on a best-effort basis and skip silently on failure -- literal
+  // deny rules and assignment-based indirection do not depend on host-var seeding.
+  try {
+    for (const [name, val] of [['HOME', safeHomedir()], ['PWD', cwd || process.cwd()],
+                               ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username]]) {
+      if (typeof val === 'string' && val && val.length <= VAR_VALUE_MAX) varEnv.set(varKey(name, isPosh), val);
+    }
+  } catch (_) { /* no resolvable home/user/cwd: skip host-var seeding, never crash */ }
   if (segments.length > VAR_SEGMENT_MAX) { noteGap('var-segment-limit'); return out; }
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
@@ -2397,7 +2417,7 @@ function resolveScriptPath(token, cwd) {
   if (/[*?]/.test(t)) return null;            // glob -> normal flow
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return null; // URL
   if (t === '-') return null;                  // stdin
-  if (t[0] === '~') t = path.join(os.homedir(), t.slice(1));
+  if (t[0] === '~') t = path.join(safeHomedir(), t.slice(1));
   try {
     return path.isAbsolute(t) ? path.normalize(t) : path.resolve(cwd || process.cwd(), t);
   } catch {
