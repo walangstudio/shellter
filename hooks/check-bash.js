@@ -55,6 +55,82 @@ function normalizeObfuscation(s) {
   return s.replace(/\$\{IFS\}|\$IFS(?![A-Za-z0-9_])/g, ' ').replace(/''|""/g, '');
 }
 
+// A "command skeleton": the segment with single/double-quoted BODIES removed and any
+// trailing `#` comment cut. A few deny rules (download-and-execute pipe, fork bomb) match
+// raw text, which fired on the same string appearing as PROSE -- a commit message, an echo,
+// a doc heredoc, a `#` comment (`git commit -m "add curl | bash to README"`). Quoted text is
+// an argument, not a live pipeline; a comment never runs. When quoted text IS executed
+// (`bash -c "curl x | bash"`, `eval "..."`), shellter already recurses into that interpreter
+// and re-runs the deny pass on the inner content, so those still deny -- the skeleton only
+// removes the FALSE match on inert prose. A `#` mid-token (`http://x#frag`, `%h#%s`) is not a
+// comment, so it is kept.
+// The skeleton is only safe to apply when nothing in the segment could EXECUTE the quoted
+// text: an interpreter `-c`/`-e`, `eval`, `find -exec`, `xargs`, or a command substitution
+// all turn a quoted string into code, so there the quotes must stay and the raw text is
+// tested (as before). Absent all of those, a quoted string is an inert data argument
+// (`git commit -m "curl | bash"`, `echo "..."`) and can be stripped. Erring toward "treat
+// as code" keeps every real executed pipeline caught and only relaxes the clearly-inert set.
+// The interpreter before a `-c`/`-e` exec flag may be a VARIABLE (`$SHELL -c "..."`), not a
+// literal name -- parseShellCInvocation won't recurse into that, so the raw text must be kept
+// or the quoted payload is lost. Matching a `$var`/`${var}` command word here does that,
+// without matching a literal non-interpreter like `git -c ... commit` (config, not exec),
+// which must still relax so a `curl | bash` in its commit message is not a false deny.
+const INTERP_EXEC_RE = /\beval\b|\s-(?:exec|execdir|ok|okdir)\b|\bxargs\b|\$\(|`|(?:\b(?:bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b|\$\{?[A-Za-z_]\w*\}?)\S*\s+-[A-Za-z]*[ceErsi]\b/i;
+// Gate on the RAW string: if anything COULD execute quoted content, keep the raw text so the
+// payload is not hidden; otherwise strip quoted prose. Tested against the raw string, not the
+// skeleton, on purpose -- a quoted interpreter word still executes (`"$SHELL" -c "..."`,
+// `"bash" -c`), and its indicator only survives on the raw text. The cost is a KNOWN, narrow
+// false-deny: a message that quotes BOTH an interpreter `-c` AND a `curl | bash` pipe
+// (`git commit -m "run sh -c ... curl x | bash"`) is hard-denied. A quote-context-aware gate
+// that split the two would need a real parser; not worth the risk to the exec-detection path.
+function analysisText(s) {
+  return (typeof s === 'string' && INTERP_EXEC_RE.test(s)) ? s : commandSkeleton(s);
+}
+
+function commandSkeleton(s) {
+  if (typeof s !== 'string') return '';
+  let out = '';
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      if (q === '"' && c === '\\' && i + 1 < s.length) { i++; continue; }
+      if (c === q) { q = null; out += ' '; }
+      continue;
+    }
+    if (c === "'" || c === '"') { q = c; continue; }
+    if (c === '#' && (i === 0 || /\s/.test(s[i - 1]))) break;   // unquoted comment to EOL
+    out += c;
+  }
+  return out;
+}
+
+// Interpreter anchored right after `|` (bare pipe-to-shell, and the `interp -c "payload"`
+// substring case). A pipe THROUGH a command wrapper (`| sudo -u root bash`, `| timeout 5 bash`,
+// `| command bash`, `| "bash"`) is handled tokenized in pipeToWrappedInterpDanger, which reuses
+// the CMD_WRAPPERS + WRAPPER_VALUE_FLAGS flag-arity model -- a regex wrapper prefix could not
+// model a flag whose value is a separate token (`-u root`) and auto-approved the wrapped RCE.
+const DL_EXEC_RE = /\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i;
+function downloadExecDanger(s) {
+  return DL_EXEC_RE.test(analysisText(s)) ? 'Download-and-execute pipe blocked -- inspect script first' : null;
+}
+// `[:\w]{1,256}` not `[:\w]+`: the unbounded form backtracks catastrophically on a long
+// word-run (a 50KB `echo xxxx...` took ~3s per variant, hanging the hook). The bound keeps
+// it linear; 256 is well past any realistic fork-bomb function name (was 64, which a
+// deliberately long name could step over to evade the deny).
+const FORK_BOMB_RE = /([:\w]{1,256})\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
+function forkBombDanger(s) {
+  return FORK_BOMB_RE.test(analysisText(s)) ? 'Fork bomb blocked' : null;
+}
+const PIPE_BARE_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i;
+const PIPE_FLAG_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i;
+function pipeToInterpDanger(s) {
+  const sk = analysisText(s);
+  if (PIPE_BARE_RE.test(sk)) return 'Pipe to bare shell/interpreter blocked';
+  if (PIPE_FLAG_RE.test(sk)) return 'Pipe to interpreter with -c/-i/-s blocked';
+  return null;
+}
+
 // Split an argument string into tokens, honoring single/double quotes and
 // stripping them (so `"/"` -> `/`). Good enough for flag/target extraction, not a
 // full shell parser.
@@ -65,7 +141,16 @@ function tokenizeArgs(s) {
     const c = s[i];
     if (q === "'") { if (c === "'") q = null; else cur += c; has = true; continue; }
     if (q === '"') {
-      if (c === '\\' && i + 1 < s.length) { cur += s[++i]; has = true; continue; }
+      // Inside double quotes bash treats `\` as an escape ONLY before $ ` " \ or newline;
+      // any other backslash is literal. The old "always drop the backslash" ate the separators
+      // in a quoted Windows path (`"C:\Users\me"` -> `C:Usersme`), so the exact-home rm guard
+      // and secret-path checks never matched it. Keep the backslash literal otherwise.
+      if (c === '\\' && i + 1 < s.length) {
+        const n = s[i + 1];
+        if (n === '"' || n === '\\' || n === '$' || n === '`' || n === '\n') { cur += n; i++; }
+        else cur += c;
+        has = true; continue;
+      }
       if (c === '"') q = null; else cur += c;
       has = true; continue;
     }
@@ -78,18 +163,55 @@ function tokenizeArgs(s) {
 }
 
 // System dirs that must never be recursively force-removed (any depth).
-const RM_SYSTEM_PREFIX = /^(?:\/home|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)(?:\/|$)/;
+// `/root` is the root user's home -- as catastrophic as any /home wipe.
+const RM_SYSTEM_PREFIX = /^(?:\/home|\/root|\/etc|\/usr|\/var|\/boot|\/sys|\/proc|\/dev|\/lib|\/bin|\/sbin|\/System|\/Library|\/Applications|\/Users|\/Volumes|\/private|\/cores)(?:\/|$)/;
+// Trailing-separator- and (on Windows) case-insensitive path compare for the exact
+// home-directory match below.
+const normRmPath = (s) => {
+  const x = s.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+  return process.platform === 'win32' ? x.toLowerCase() : x;
+};
+
+// os.homedir() THROWS (SystemError/ENOENT) when the process has no resolvable home -- e.g. a
+// container running as a uid with no /etc/passwd entry and $HOME unset (routine under
+// Kubernetes/CI). A PreToolUse hook that throws FAILS OPEN (Claude Code runs the tool
+// unprotected), so this must never escape. '' degrades every caller safely: the rm carve-out is
+// guarded on a non-empty home, and `~` expansion falls back to a relative join.
+function safeHomedir() {
+  try { return os.homedir() || ''; } catch (_) { return ''; }
+}
 
 function rmTargetDanger(t) {
   if (!t) return null;
-  if (/^\$\{?[A-Za-z_]/.test(t) || t.includes('{}')) return 'variable/placeholder target';
+  // A variable/placeholder target used to hard-deny here. But shellter cannot know a
+  // variable's runtime value, and the overwhelmingly common case (`rm -rf "$BUILD_DIR"`,
+  // `rm -rf "$HOME/.cache/app"`) is a safe cleanup -- an unappealable deny bricked it. That
+  // case is handled at ask-tier by rmVarTargetAsk (which also skips vars that resolve to a
+  // safe literal in the same command). Only LITERAL catastrophic targets deny below.
   if (t === '/' || /^\/(?![A-Za-z0-9])/.test(t)) return 'filesystem root';   // /, //, /*, /.
   if (/^~/.test(t)) return 'home directory';   // ~, ~/x, ~+, ~-, ~user
-  if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
-  // Any absolute path with a `..` traversal component can escape upward to a
-  // system dir (`/opt.bak/../../etc`, `/opt/../etc`); block conservatively. A `..`
-  // inside a filename (report.v1..v2) or a dir named ..cache is NOT a component.
+  // Any absolute path with a `..` traversal component can escape upward to a system dir
+  // (`/opt.bak/../../etc`, `/opt/../etc`, `$HOME/../../etc`); block conservatively BEFORE the
+  // own-home carve-out below so a `..` can't launder its way back out. A `..` inside a filename
+  // (report.v1..v2) or a dir named ..cache is NOT a component.
   if (/^[\/~]/.test(t) && /(?:^|\/)\.\.(?:\/|$)/.test(t)) return 'path traversal';
+  // The home directory ITSELF (what a seeded $HOME/$USERPROFILE expands to) is `~` by another
+  // name -- wiping it is as catastrophic as `rm -rf ~`. But a path UNDER your own home is a
+  // routine cleanup (`rm -rf "$HOME/.cache/app"`, `rm -rf "$HOME/project/node_modules"`) and must
+  // NOT be denied -- on Linux `$HOME` sits under `/home` (or `/root`), which RM_SYSTEM_PREFIX would
+  // otherwise treat as a system dir at any depth. The `..` guard above keeps this from escaping.
+  // (Literal `~/subpath` is handled by the unconditional `~` catch-all above, by design.)
+  // `nh` MUST be non-empty before it is used as a prefix boundary: a degenerate home (`HOME=/` on a
+  // root or minimal-container Linux) normalizes to ``, and an empty prefix's `('' + '/')` matches
+  // EVERY absolute path -- carving out the whole filesystem and disabling every deny below. Guard
+  // `nh` so such a home falls through to the RM_SYSTEM_PREFIX deny instead.
+  const home = safeHomedir();
+  if (home) {
+    const nt = normRmPath(t), nh = normRmPath(home);
+    if (nh && nt === nh) return 'home directory';
+    if (nh && !/(?:^|\/)\.\.(?:\/|$)/.test(nt) && (nt + '/').startsWith(nh + '/')) return null;
+  }
+  if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
   // /opt ROOT (slash/dot/star-only tail). Deep specific /opt paths stay allowed
   // (this tree lives under /opt/projs).
   if (/^\/opt(?:[\/.*]*)$/.test(t)) return '/opt root';
@@ -99,7 +221,7 @@ function rmTargetDanger(t) {
 // Given the tokens AFTER an `rm` command word, return a reason if it recursively
 // AND forcibly removes a protected target. Flag parsing is order-independent
 // (`rm -r -f`), handles long flags (`--recursive`/`--force`) and `--`.
-function evalRmArgs(argToks) {
+function parseRmArgs(argToks) {
   let recursive = false, force = false, sawDashDash = false;
   const targets = [];
   for (const tok of argToks) {
@@ -117,8 +239,54 @@ function evalRmArgs(argToks) {
     }
     targets.push(tok);
   }
+  return { recursive, force, targets };
+}
+
+function evalRmArgs(argToks) {
+  const { recursive, force, targets } = parseRmArgs(argToks);
   if (!recursive || !force) return null;
   for (const t of targets) { const d = rmTargetDanger(t); if (d) return 'Destructive rm (' + d + ') blocked'; }
+  return null;
+}
+
+// Ask-tier: `rm -rf <variable>` / `rm -rf {}` where the target is not a resolvable literal.
+// Shellter cannot see the runtime value, so it asks rather than allowing the footgun or
+// hard-denying the common safe case. A variable that resolves to a safe literal in the same
+// command is not asked (the expanded variant already went through the deny pass); one that
+// resolves to a dangerous literal was already hard-denied there.
+function rmVarTargetAsk(seg) {
+  for (const stage of splitPipeStages(seg)) {
+    const toks = tokenizeArgs(stage);
+    for (let i = 0; i < toks.length; i++) {
+      if (toks[i].replace(/^\\/, '').replace(/^.*[\\/]/, '') !== 'rm') continue;
+      const { recursive, force, targets } = parseRmArgs(toks.slice(i + 1));
+      if (!recursive || !force) continue;
+      for (const t of targets) {
+        if (t[0] === '$') {
+          // Mirror VAR_AT exactly: only a bare $NAME or an exact ${NAME} is ever expanded
+          // by expandVars, so only those can be "resolved" to a safe literal here. A modifier
+          // form (${VAR:-x}, ${VAR#p}, ${VAR:0:5}) is NOT expanded -- the deny pass never saw
+          // its value -- so it must always ask, never be treated as resolved. (This is the
+          // same VAR_AT invariant the failure log warns about; rmVarTargetAsk broke it.)
+          const at = /^\$\{([A-Za-z_]\w*)\}/.exec(t) || /^\$([A-Za-z_]\w*)/.exec(t);
+          if (at) {
+            // varEnv keys bash names as-is and PowerShell names lowercased (varKey). This
+            // function has no isPosh flag, so resolve against both -- otherwise a PowerShell
+            // `$Dir=...; rm -rf $Dir` misses its own (lowercased) key and asks spuriously.
+            const known = varEnv.has(at[1]) ? at[1] : (varEnv.has(at[1].toLowerCase()) ? at[1].toLowerCase() : null);
+            if (!known) return 'rm -rf of an unresolved variable target -- confirm it is not / or your home directory';
+            // A bare whole-token var that RESOLVES to a protected dir (home, /root, a
+            // system path) is a home/system wipe by indirection. The hard-deny pass catches
+            // most forms via the expanded literal, but a double-quoted Windows path loses its
+            // backslashes in tokenization and slips it -- so ask here as a floor. A suffixed
+            // target (`$HOME/.cache`) is not the whole token, so it stays a safe cleanup.
+            if (at[0] === t && rmTargetDanger(varEnv.get(known))) return 'rm -rf of ' + t + ' which resolves to a protected directory -- confirm the target';
+          }
+          else return 'rm -rf through an unexpanded variable expression -- confirm the target';
+        } else if (t.includes('{}')) return 'rm -rf of a placeholder target -- confirm what it expands to';
+      }
+    }
+  }
   return null;
 }
 
@@ -652,6 +820,11 @@ const SECRET_TOKENS = '(?:' + [
   '[\\\\/]credentials(?![\\w./])', 'credentials\\.(?:json|ya?ml|toml|ini|txt|xml|env|conf|cfg|properties|store)\\b', '\\.git-credentials\\b',
   '\\.ssh\\b', '\\.gnupg\\b', '\\.aws\\b', '\\.gcloud\\b', '\\.azure\\b',
   '\\.docker[\\\\/]config', '\\.gitconfig\\b',
+  // Unix credential stores: password hashes and the sudoers policy. Anchored to
+  // `/etc/` so the bare word "shadow" (box-shadow, shadow DOM, a game asset) never
+  // matches; `master.passwd` is the BSD/macOS shadow file. `/etc/passwd` is NOT here
+  // -- it is world-readable and holds no secret.
+  '[\\\\/]etc[\\\\/](?:g?shadow|sudoers|master\\.passwd)\\b',
 ].join('|') + ')';
 
 // Persistence / credential WRITE targets. Writing INTO these (redirect, tee,
@@ -691,6 +864,246 @@ const READ_VERBS =
 const READ_VERB_SET = new Set(READ_VERBS.split('|'));
 const SECRET_TOKENS_RE = new RegExp(SECRET_TOKENS, 'i');
 
+// ---- cross-segment variable indirection -------------------------------------
+// `X=.env; cat $X` puts the payload in one chain segment and the use in another,
+// so no single segment ever contains the literal and every deny rule is blind to
+// it -- while `cat $X` still matches a plain-read approve rule. That combination
+// auto-APPROVED a secret read with no prompt (not merely fell through).
+//
+// Fix: collect literal assignments in command order and expand them into one more
+// match variant, reusing the same variants[] mechanism as ${IFS}/empty-quote
+// de-obfuscation. No new deny rules -- the existing ones simply get a string they
+// can read, so an indirect read now behaves exactly like its direct form.
+//
+// "Literal" means the value contains no `$` and no backtick. A computed value is
+// never expanded, so expansion can only ever reveal text the user literally typed.
+const VAR_MAX = 32;           // assignments tracked per command
+const VAR_VALUE_MAX = 256;    // chars per value
+const VAR_SEGMENT_MAX = 200;  // segment count past which we do not bother
+
+// Populated by expandSegments() once per invocation. `resolvableAt[i]` is the set of
+// names that already had a literal value when segment i runs -- the approve floor must
+// use that, not the final map, or a TRAILING assignment (`cat $X; X=.env`) would
+// retroactively mark $X resolvable and suppress the floor.
+let varEnv = new Map();
+let resolvableAt = [];
+const NO_NAMES = new Set();
+
+// ---- coverage ledger --------------------------------------------------------
+// A ceiling is a safety boundary, not evidence that the part we skipped was clean.
+// Every place the engine gives up on analysing something used to end in a silent
+// fallthrough, which under a broad allow-rule or auto-accept mode reads as ALLOW.
+// Record the gap instead and, after every deny pass has had its say, degrade to
+// `ask` rather than letting the approve pass launder it into an auto-approval.
+const coverageGaps = [];
+function noteGap(kind) {
+  if (coverageGaps.length < 8 && !coverageGaps.includes(kind)) coverageGaps.push(kind);
+}
+
+const ASSIGN_RE = /(?:^|[;&|(\s])([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"$`]*)"|'([^']*)'|([^\s;&|)]*))/g;
+// PowerShell writes `$X = "value"`, which the bash pattern above cannot match, so the PS
+// path had no expansion at all: `$X = ".env"; Get-Content $X` reached the deny rules with
+// the literal nowhere in sight. It fell through to a prompt rather than auto-approving
+// (the PS approve set is conservative), so it was never a silent allow -- but under a broad
+// `PowerShell(*)` allow rule it passed unexamined. Names are case-insensitive in PS.
+// Scope prefixes (`$script:X`, `$global:X`) name the same variable for a single command
+// line, so they are stripped. `env:` and `using:` are deliberately NOT in the list: they are
+// separate namespaces, and folding `$env:X` into `$X` would be a false expansion.
+const PS_SCOPE = '(?:(?:script|global|local|private):)?';
+const PS_ASSIGN_RE = new RegExp(
+  '\\$(?:\\{' + PS_SCOPE + '([A-Za-z_]\\w*)\\}|' + PS_SCOPE + '([A-Za-z_]\\w*))\\s*=\\s*' +
+  '(?:"([^"`]*)"|\'([^\']*)\'|([^\\s;|&]+))', 'g');
+const PS_VAR_AT = new RegExp(
+  '^\\$\\{' + PS_SCOPE + '([A-Za-z_]\\w*)\\}|^\\$' + PS_SCOPE + '([A-Za-z_]\\w*)');
+
+// Bash does not expand inside single quotes, so expanding there manufactures a HARD deny
+// for a command that would never read the secret (`X=.env; cat '$X'` reads a file literally
+// named `$X`). A deny is unappealable in-session, unlike the `ask` used for uncertain
+// analysis, so single-quoted spans are left alone. Double-quoted spans DO expand.
+//
+// This MUST track both quote characters. Scanning for a bare `'` treats the apostrophe in
+// `cat "it's" $X` as opening a single-quoted span, which swallows the rest of the segment
+// and leaves `$X` unexpanded -- reopening the auto-approved secret read this whole pass
+// exists to close. One apostrophe was enough.
+const VAR_AT = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}|^\$([A-Za-z_][A-Za-z0-9_]*)/;
+
+function expandVars(s, env, isPosh) {
+  const at = isPosh ? PS_VAR_AT : VAR_AT;
+  let out = '';
+  let q = null;
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    // In PowerShell the backtick escapes the NEXT character everywhere, not only inside a
+    // double-quoted string. `` Get-Content `$X `` reads a file literally named `$X`, so
+    // expanding there manufactured a hard deny for a command PS would never run that way --
+    // and a deny cannot be overridden in-session.
+    if (isPosh && c === '`' && q !== "'" && i + 1 < s.length) {
+      out += c + s[i + 1];
+      i += 2;
+      continue;
+    }
+    // PowerShell does not expand inside single quotes either, and its escape character
+    // inside a double-quoted string is a backtick, not a backslash.
+    if (q === "'") { out += c; if (c === "'") q = null; i++; continue; }
+    if (q === '"') {
+      const esc = isPosh ? '`' : '\\';
+      if (c === esc && i + 1 < s.length) { out += c + s[i + 1]; i += 2; continue; }
+      if (c === '"') { out += c; q = null; i++; continue; }
+    } else if (c === "'" || c === '"') { out += c; q = c; i++; continue; }
+    if (c === '$') {
+      const rest = s.slice(i);
+      const m = at.exec(rest);
+      // A `:` right after the name means a namespace (`$env:PATH`, `$using:PATH`), not the
+      // local variable of that name. Expanding it spliced the local value in and left the
+      // `:SUFFIX` dangling, so `$using = ".env"; Get-Content $using:PATH` hard-denied a
+      // command PowerShell never reads `.env` for.
+      if (m && !(isPosh && rest[m[0].length] === ':')) {
+        const v = env.get(varKey(m[1] || m[2], isPosh));
+        if (v !== undefined) { out += v; i += m[0].length; continue; }
+      }
+    }
+    out += c;
+    i++;
+  }
+  if (q) noteGap('quote-parse');   // unterminated quote: we cannot say what expands
+  return out;
+}
+
+// PowerShell variable names are case-insensitive; bash's are not.
+function varKey(name, isPosh) { return isPosh ? name.toLowerCase() : name; }
+
+// A value that is EXACTLY one already-known variable reference is an alias, so resolve it:
+// `X=.env; Y=$X; cat $Y` is the obvious next move once single-hop indirection is closed, and
+// both shells were leaving it to a prompt. One hop only, resolved against names already in
+// the map, so this cannot recurse or cycle -- and it keeps the invariant that expansion only
+// ever reveals text the user literally typed, since the alias target was itself a literal.
+const ALIAS_ONLY = /^(?:\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*))$/;
+
+function resolveAlias(val, env, isPosh) {
+  const bare = val.replace(/^(["'])([\s\S]*)\1$/, '$2');
+  const m = ALIAS_ONLY.exec(bare.trim());
+  if (!m) return undefined;
+  return env.get(varKey(m[1] || m[2], isPosh));
+}
+
+// Blank out single-quoted spans (same quote-state rules) so callers can reason about the
+// parts bash would actually expand. Length-preserving, so offsets stay valid.
+function blankSingleQuoted(s) {
+  let out = '';
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { out += (c === "'" ? c : ' '); if (c === "'") q = null; continue; }
+    if (q === '"') {
+      if (c === '\\' && i + 1 < s.length) { out += c + s[++i]; continue; }
+      if (c === '"') q = null;
+      out += c; continue;
+    }
+    if (c === "'" || c === '"') { q = c; out += c; continue; }
+    out += c;
+  }
+  return out;
+}
+
+// Returns an array parallel to `segments`: the expanded form, or null when the
+// segment has no resolvable expansion. Assignments are recorded AFTER the segment
+// is expanded, matching shell order -- `X=a; echo $X` expands in segment 1, and
+// `X=a echo $X` (env-prefix form) correctly does not, because bash expands $X
+// before the assignment takes effect there.
+function expandSegments(segments, cwd, isPosh) {
+  const out = new Array(segments.length).fill(null);
+  varEnv = new Map();
+  resolvableAt = new Array(segments.length).fill(NO_NAMES);
+  // Pre-seed unambiguous host variables at their real values. Two-way win: an ordinary
+  // `cat $HOME/notes.txt` resolves and keeps auto-approving, and `cat $HOME/.ssh/id_rsa`
+  // expands into a literal the deny rules can read.
+  // os.homedir()/os.userInfo() THROW when there is no resolvable home/user (container uid with no
+  // passwd entry); process.cwd() throws if the cwd was unlinked. Any throw here would crash the
+  // hook and FAIL OPEN, so seed on a best-effort basis and skip silently on failure -- literal
+  // deny rules and assignment-based indirection do not depend on host-var seeding.
+  try {
+    for (const [name, val] of [['HOME', safeHomedir()], ['PWD', cwd || process.cwd()],
+                               ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username]]) {
+      if (typeof val === 'string' && val && val.length <= VAR_VALUE_MAX) varEnv.set(varKey(name, isPosh), val);
+    }
+  } catch (_) { /* no resolvable home/user/cwd: skip host-var seeding, never crash */ }
+  if (segments.length > VAR_SEGMENT_MAX) { noteGap('var-segment-limit'); return out; }
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    resolvableAt[i] = varEnv.size ? new Set(varEnv.keys()) : NO_NAMES;
+    if (varEnv.size) {
+      const e = expandVars(seg, varEnv, isPosh);
+      if (e !== seg) out[i] = e;
+    }
+    // `unset X` drops the value, so a later $X is unresolved again -- without this,
+    // `X=.env; unset X; cat $X` produced a hard deny for a read bash would never make.
+    const un = /(?:^|[;&|(\s])unset\s+((?:[A-Za-z_]\w*\s*)+)/.exec(seg);
+    if (un) for (const n of un[1].trim().split(/\s+/)) varEnv.delete(n);
+
+    // An assignment only PERSISTS when the segment is assignments and nothing else
+    // (optionally behind export/declare/...). `X=.env cat notes.txt` is a prefix scoped to
+    // that one command: bash runs `cat` with an empty argument and reads nothing, so
+    // carrying X forward produced an unappealable false deny on a later `cat $X`.
+    // A leading `{` is stripped but a leading `(` is not: a brace group runs in the current
+    // shell so its assignments persist, while a subshell's do not (`( X=.env ); cat $X`
+    // reads nothing). Keeping the paren in the body makes the test below fail, which is
+    // exactly the wanted behaviour.
+    if (isPosh) {
+      // PowerShell has no env-prefix form, so an assignment anywhere in the segment
+      // persists. Same literal-only rule: a value containing `$` or a backtick is computed,
+      // and expanding it could only ever invent text the user did not write.
+      PS_ASSIGN_RE.lastIndex = 0;
+      let pm;
+      while ((pm = PS_ASSIGN_RE.exec(seg))) {
+        if (varEnv.size >= VAR_MAX) { noteGap('var-count-limit'); break; }
+        const val = pm[3] !== undefined ? pm[3] : (pm[4] !== undefined ? pm[4] : (pm[5] || ''));
+        if (!val) continue;
+        if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
+        // A single-quoted value is already literal text -- neither shell expands there --
+        // so it must not go through alias resolution. `Y='$X'` names a file called $X, and
+        // resolving it to X's value hard-denied a read the shell would never make.
+        if (pm[4] === undefined && /[$`]/.test(val)) {   // computed, not a literal
+          const alias = resolveAlias(val, varEnv, true);
+          if (alias === undefined) continue;
+          varEnv.set(varKey(pm[1] || pm[2], true), alias);
+          continue;
+        }
+        varEnv.set(varKey(pm[1] || pm[2], true), val);
+      }
+      continue;
+    }
+
+    let body = seg.replace(/^\s*\{\s*/, '');
+    body = body.replace(/^\s*(?:export|declare|typeset|readonly|local)\s+/, '');
+    const persists = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|)]*)\s*)+$/.test(body);
+    if (!persists) continue;
+
+    ASSIGN_RE.lastIndex = 0;
+    let m;
+    while ((m = ASSIGN_RE.exec(seg))) {
+      if (varEnv.size >= VAR_MAX) { noteGap('var-count-limit'); break; }
+      const val = m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : (m[4] || ''));
+      if (!val) continue;
+      // A ceiling here means an assignment went unanalysed, so the deny pass never sees
+      // the expansion. Record it: padding past the limits then reads through a wrapper
+      // would otherwise be a silent allow rather than a prompt.
+      if (val.length > VAR_VALUE_MAX) { noteGap('var-value-limit'); continue; }
+      // A single-quoted value is already literal text -- neither shell expands there --
+      // so it must not go through alias resolution. `Y='$X'` names a file called $X, and
+      // resolving it to X's value hard-denied a read the shell would never make.
+      if (m[3] === undefined && /[$`]/.test(val)) {   // computed, not a literal
+        const alias = resolveAlias(val, varEnv, false);
+        if (alias === undefined) continue;
+        varEnv.set(varKey(m[1], false), alias);
+        continue;
+      }
+      varEnv.set(m[1], val);
+    }
+  }
+  return out;
+}
+
 // Verbs whose FIRST positional is a program/pattern, not a path: `jq '.key' out.json`,
 // `rg '\.pem' src/`, `sed 's/.env/x/' f`. Matching that argument against SECRET_TOKENS
 // is a false positive, so these are checked ONLY by the tokenized rule (which skips
@@ -716,10 +1129,11 @@ const ATTACHED_FILE_FLAG = /^-[A-Za-z]*f\S/;
 // Command wrappers the read verb can hide behind. The substring rule used to catch these
 // for free (it matched the verb anywhere in the segment); the tokenized rule looks at the
 // command word, so it has to step over them itself.
-const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'timeout']);
+const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'timeout', 'exec', 'builtin']);
 // Wrapper flags that take a SEPARATE value token (`sudo -u root grep …`). Without these the
 // value ('root') is mistaken for the command word and the read verb behind it is never seen.
 const WRAPPER_VALUE_FLAGS = {
+  exec: /^(?:-a|--argv0)$/,
   sudo: /^(?:-u|--user|-U|--other-user|-g|--group|-p|--prompt|-r|--role|-t|--type|-C|--close-from|-D|--chdir|-R|--chroot)$/,
   doas: /^(?:-u|-C)$/,
   env: /^(?:-u|--unset|-C|--chdir|-S|--split-string)$/,
@@ -740,31 +1154,134 @@ const READ_VERBS_PATH = READ_VERBS.split('|').filter(v => !PROGRAM_ARG_VERBS.has
 // read verb reaching a secret token survives intra-word quote splitting (`cat ".e"nv`,
 // `c"a"t .env`) that a raw-substring regex can't see. Predicate form for the deny
 // loop; returns a reason or null.
+// Step over leading command wrappers (`sudo -u root <cmd>`, `env FOO=1 <cmd>`, `timeout 5 <cmd>`,
+// stacked `command timeout 5 <cmd>`) and the flags / VAR=val / durations they take, returning
+// the index of the effective command word. `protect` is a Set of basenames a wrapper flag must
+// never swallow as its value: if the arity table is wrong about a flag, the token it would eat
+// is the real command word, so stop and treat the flag as boolean (one extra token checked,
+// never a missed command). Shared by the sensitive-read AND pipe-to-interpreter deny paths so
+// the wrapper/flag model has ONE source (a hand-rolled second copy auto-approved `| sudo -u root
+// bash` -- a flag with a separate-token value the regex grammar could not model).
+function stepWrappers(toks, at, protect) {
+  while (at < toks.length && CMD_WRAPPERS.has(toks[at].replace(/^.*[\\/]/, ''))) {
+    const valueFlag = WRAPPER_VALUE_FLAGS[toks[at].replace(/^.*[\\/]/, '')];
+    at++;
+    while (at < toks.length) {
+      const t = toks[at];
+      if (valueFlag && valueFlag.test(t) &&
+          !protect.has((toks[at + 1] || '').replace(/^.*[\\/]/, ''))) { at += 2; continue; }
+      if (t.startsWith('-') || /^[A-Za-z_]\w*=/.test(t) || /^\d+(?:\.\d+)?[smhd]?$/.test(t)) { at++; continue; }
+      break;
+    }
+  }
+  return at;
+}
+
+// Interpreters that execute piped stdin (bare) or an inline `-c`/`-i`/`-s` argument.
+const INTERP_SET = new Set(
+  'bash sh zsh dash ash ksh fish python python2 python3 perl ruby node deno bun php lua tclsh'.split(' '));
+const SHELL_SET = new Set('bash sh zsh dash ash ksh fish'.split(' '));
+
+// A shell reading a process substitution (`bash <(curl ...)`) runs the downloaded output as its
+// script. Tokenized + wrapper-stepping so `timeout 5 bash <(curl ...)` / `command bash <(...)`
+// is caught too -- the old regex was anchored at the command word and a leading wrapper walked
+// past it, laundering a silent RCE through the wrapper-keyword approve rule.
+function shellProcSubDanger(seg) {
+  const toks = tokenizeArgs(seg.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, ''));
+  if (!toks.length) return null;
+  const at = stepWrappers(toks, 0, SHELL_SET);
+  const word = toks[at] || '';
+  // Glued form `bash<(curl ...)`: tokenizeArgs splits only on whitespace, so the shell and the
+  // process substitution are one token, but bash still parses `<` as a metacharacter starting it.
+  if (/^(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish)<\(/i.test(word)) return 'Shell with process-substitution input blocked';
+  if (!SHELL_SET.has(word.replace(/^.*[\\/]/, ''))) return null;
+  if (toks.slice(at + 1).some((t) => t.startsWith('<('))) return 'Shell with process-substitution input blocked';
+  return null;
+}
+// Tokenized pipe-to-interpreter deny. A pipe TARGET whose effective command word (after leading
+// assignments and wrappers) is an interpreter, run bare (reads the piped data) or with -c/-i/-s,
+// is a download-and-execute. Tokenized (not regex) so a wrapper flag with a separate-token value
+// (`sudo -u root bash`) is stepped correctly, and a quoted interpreter (`| "bash"`, `| b"a"sh`)
+// is de-quoted by tokenizeArgs. splitPipeStages is quote-aware, so a `|` inside a quoted commit
+// message is not a stage and stays prose.
+// Cut an unquoted `#`-to-EOL comment, PRESERVING quotes (unlike commandSkeleton, which also
+// strips quoted bodies -- here a quoted interpreter `| "bash"` must survive). Mirrors
+// commandSkeleton's comment rule so `true # curl x | sh` is not read as a real pipe.
+function stripUnquotedComment(s) {
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (q === '"' && c === '\\' && i + 1 < s.length) { i++; continue; } if (c === q) q = null; continue; }
+    if (c === "'" || c === '"') { q = c; continue; }
+    if (c === '#' && (i === 0 || /\s/.test(s[i - 1]))) return s.slice(0, i);
+  }
+  return s;
+}
+
+function pipeToWrappedInterpDanger(seg) {
+  const stages = splitPipeStages(stripUnquotedComment(seg));
+  for (let si = 1; si < stages.length; si++) {
+    const s = stages[si].replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
+    const toks = tokenizeArgs(s);
+    if (!toks.length) continue;
+    const at = stepWrappers(toks, 0, INTERP_SET);
+    const cmd = (toks[at] || '').replace(/^.*[\\/]/, '');
+    if (!INTERP_SET.has(cmd)) continue;
+    // Scan ALL option tokens after the interpreter, not just the first -- an interpreter takes
+    // several separate flags before the exec flag (`bash -eu -c ...`, `ruby -w -e ...`,
+    // `python -O -c ...`), and checking only toks[at+1] let that whole class slip (auto-allowed
+    // via a timeout/command wrapper). A positional (script file) ends option parsing and runs
+    // the script, not the piped data; `python -m module` runs a module, not stdin -> stop without
+    // denying. If only flags follow (no script), the interpreter reads the piped data -> bare deny.
+    // Exec flags are interpreter-specific: -c/-i/-s for all; -e/-E (and --eval) only for the
+    // scripting langs whose -e is inline code (NOT shell `-e` errexit, NOT python `-E` ignore-env);
+    // php -r. This keeps `bash -e script.sh` and `python -E script.py` out of a false deny.
+    const isPython = /^python[23]?$/.test(cmd);
+    const evalE = /^(?:perl|ruby|node|deno|bun|lua)$/.test(cmd);
+    const jsEval = /^(?:node|deno|bun)$/.test(cmd);
+    // A script positional that names stdin (`bash /dev/stdin`, `/dev/fd/0`) runs the PIPED
+    // data as the script -- that IS download-and-execute, not a local script file.
+    const STDIN_REF = /^(?:\/dev\/stdin|\/dev\/fd\/\d+|\/proc\/self\/fd\/\d+)$/;
+    // deno/bun take a SUBCOMMAND before the script (`deno run /dev/stdin`, `bun run -`); the
+    // subcommand is a non-flag token, so without this it would be mistaken for the script and
+    // end the scan before the real stdin-ref/script is seen. Skip ONE subcommand and remember it.
+    const denoSub = /^(?:deno|bun)$/.test(cmd);
+    let subName = null;
+    let sawScript = false;
+    for (const t of toks.slice(at + 1)) {
+      if (isPython && /^-[A-Za-z]*m/.test(t)) { sawScript = true; break; }  // -m or attached -mMODULE
+      // ponytail: a lone `-` almost always means "read stdin" for an interpreter, so deny it.
+      // Soft spot: a flag whose separate-token VALUE is `-` (e.g. a hypothetical `--out -`) would
+      // also trip this; no real deno/bun/shell flag documents `-` as a value, so no repro found.
+      if (t === '-') return 'Pipe to interpreter reading stdin blocked';
+      if (/^(?:-[A-Za-z]*c|-i|-s)$/.test(t)) return 'Pipe to interpreter with -c/-i/-s blocked';
+      if (evalE && /^(?:-[A-Za-z]*[eE]|--eval)$/.test(t)) return 'Pipe to interpreter inline-eval blocked';
+      if (jsEval && /^(?:-[A-Za-z]*p|--print)$/.test(t)) return 'Pipe to interpreter inline-eval blocked';
+      if (cmd === 'php' && /^-[A-Za-z]*r$/.test(t)) return 'Pipe to interpreter inline-eval blocked';
+      if (!t.startsWith('-')) {
+        if (STDIN_REF.test(t)) return 'Pipe to interpreter reading stdin blocked';
+        if (denoSub && subName === null && /^(?:run|eval|test|repl|bundle|compile|serve|x)$/.test(t)) { subName = t; continue; }
+        sawScript = true; break;   // a real script file runs the file, not the piped data
+      }
+    }
+    // Only-flags-then-end means the interpreter reads the piped data (bare `bash`, `bash -eu`).
+    // For deno/bun a NON-repl subcommand (test/run/bundle/...) does not read stdin -- only bare
+    // (no subcommand) or `repl` does -- so don't bare-deny those (`deno test` is routine CI).
+    if (!sawScript && !(denoSub && subName !== null && subName !== 'repl'))
+      return 'Pipe to bare shell/interpreter blocked';
+  }
+  return null;
+}
+
 function tokenizedSensitiveRead(seg) {
   for (const stage of splitPipeStages(seg)) {
     const s = stage.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
     const toks = tokenizeArgs(s);
     if (!toks.length) continue;
-    // Step over command wrappers (`sudo grep …`, `env FOO=1 sed …`, `time cat …`) and the
-    // flags / VAR=val / durations they take, so the read verb behind one is still seen.
-    let at = 0;
-    let wrapped = false;
-    while (at < toks.length && CMD_WRAPPERS.has(toks[at].replace(/^.*[\\/]/, ''))) {
-      const valueFlag = WRAPPER_VALUE_FLAGS[toks[at].replace(/^.*[\\/]/, '')];
-      wrapped = true;
-      at++;
-      while (at < toks.length) {
-        const t = toks[at];
-        // Never let a supposed flag value swallow a read verb: if this table entry is wrong
-        // about the flag's arity (a boolean flag listed as value-taking), the token it eats
-        // is the real command word, and the whole check goes blind. Treat the flag as
-        // boolean in that case -- the cost is one extra token checked, never a missed read.
-        if (valueFlag && valueFlag.test(t) &&
-            !READ_VERB_SET.has((toks[at + 1] || '').replace(/^.*[\\/]/, ''))) { at += 2; continue; }
-        if (t.startsWith('-') || /^[A-Za-z_]\w*=/.test(t) || /^\d+(?:\.\d+)?[smhd]?$/.test(t)) { at++; continue; }
-        break;
-      }
-    }
+    // Step over command wrappers (`sudo grep …`, `env FOO=1 sed …`, `time cat …`) so the read
+    // verb behind one is still seen. Shared stepper; protect read verbs from a wrong-arity flag.
+    let at = stepWrappers(toks, 0, READ_VERB_SET);
+    const wrapped = at > 0;
     // A wrapper flag we don't know the arity of would leave `at` on its value instead of the
     // command word, which would hide the read entirely -- so fall back to the first read verb
     // anywhere in a wrapped stage. Only wrapped stages, to keep this off ordinary commands.
@@ -851,20 +1368,22 @@ const DENY_PATTERNS = [
   // Download-and-execute / pipe-to-interpreter (incl. absolute paths). The `-m`
   // exemption lets `curl … | python -m json.tool` (stdin is DATA to a module, not a
   // script to execute) through; a bare interpreter or `-c`/`-e` still denies.
-  [/\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i,
-    'Download-and-execute pipe blocked -- inspect script first'],
-  // Generic pipe-to-interpreter: end-of-segment or -c/-i/-s flag (no script arg).
-  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i,
-    'Pipe to bare shell/interpreter blocked'],
-  [/\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i,
-    'Pipe to interpreter with -c/-i/-s blocked'],
+  [downloadExecDanger, null],
+  // Generic pipe-to-interpreter: end-of-segment or -c/-i/-s flag (no script arg). Tested on
+  // the command skeleton so a commit message or comment discussing "pipe x | sh" is not a
+  // false deny; a real `echo x | sh` (no quotes) still matches, and a quoted-and-executed
+  // `bash -c "x | sh"` is caught by the interpreter recursion.
+  [pipeToInterpDanger, null],
+  // Pipe THROUGH a wrapper to an interpreter (`| sudo -u root bash`, `| timeout 5 bash`,
+  // `| command sh`, `| "bash"`). Tokenized, reusing the flag-arity model so a separate-token
+  // flag value (`-u root`) is stepped and a quoted interpreter is de-quoted.
+  [pipeToWrappedInterpDanger, null],
   // `source <(curl ...)` / `. <(wget ...)` executes downloaded output in the current
   // shell -> deny. `source <(kubectl completion bash)` and other local generators are a
   // routine idiom, so only a network/decode process-sub is blocked here (a dangerous
   // local command inside `<(...)` is still caught by the process-sub recursion).
   [/\b(source|\.)\s+<\((?=[^)]*\b(?:curl|wget|fetch|base64|xxd)\b)/i, 'source/. of a downloaded/decoded process substitution blocked'],
-  [/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\s+<\(/i,
-    'Shell with process-substitution input blocked'],
+  [shellProcSubDanger, null],
 
   // Persistence. `crontab -l` (list) is read-only, so it is exempt; any other crontab
   // form (install/edit/remove) still denies.
@@ -901,7 +1420,18 @@ const DENY_PATTERNS = [
     'Loader-injection environment variable (LD_PRELOAD/DYLD_INSERT_LIBRARIES) blocked'],
   [/\b(LD_LIBRARY_PATH|DYLD_LIBRARY_PATH)\s*=\S/i,
     'Setting a library search path -- approve only if intended', 'ask'],
-  [/^\s*(at|batch|systemd-run)\s/, 'Alternative scheduling (at/batch/systemd-run) blocked'],
+  // Scheduling is dual-use like sudo/ssh, so it ASKS rather than hard-denies. And `at`/`batch`
+  // are ordinary English words, so a match requires a scheduling-shaped argument (a flag, a
+  // time, or a time keyword) -- otherwise `echo hi; at most 3 retries` was an unappealable
+  // false deny on prose. `systemd-run` is not an English word, so it needs no such guard.
+  [/^\s*(?:(?:at|batch)\s+(?:-|\d|now\b|noon\b|midnight\b|teatime\b|today\b|tomorrow\b|next\b)|systemd-run\b)/i,
+    'Scheduling a task (at/batch/systemd-run) -- approve only if intended', 'ask'],
+  // `at`/`batch` with no command-shaped argument read the job from stdin (`batch <<< "..."`,
+  // `at < job`, bare `batch`). That is the same scheduler, so it asks too. A following redirect
+  // or a segment/pipe boundary marks the no-argument form; prose like `batch process the files`
+  // has a word argument and is not matched.
+  [/^\s*(?:at|batch)\s*(?:<|$|[;&|])/i,
+    'Scheduling a task from stdin (at/batch) -- approve only if intended', 'ask'],
   [/\b(strace|ltrace|gdb)\s+.*-p\s+\d/i, 'Attaching debugger/tracer to running process blocked'],
 
   // Identity / git backdoor
@@ -1051,6 +1581,7 @@ const DENY_PATTERNS = [
   // `rm -r -f /`, `rm -rf "/"`, `rm -rf --no-preserve-root /`, `rm -r -f ~`, and
   // /opt-root/traversal all hard-block (deep /opt paths stay allowed).
   [rmDanger, null],
+  [rmVarTargetAsk, null, 'ask'],
 
   // SQL destructive
   // Require a SQL client/migration tool in the segment so a `drop table` inside a git
@@ -1063,7 +1594,7 @@ const DENY_PATTERNS = [
   // background) rather than the whole `};name` invocation, since the chain splitter cuts
   // the `;` -- the definition alone is the bomb and has no benign use. Backreference keeps
   // it specific to `f|f`, so `f | grep &` does not match.
-  [/([:\w]+)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/, 'Fork bomb blocked'],
+  [forkBombDanger, null],
   // Shell history tampering (hiding tracks) -> ask.
   [/\bunset\s+HISTFILE\b|\bHISTFILE\s*=\s*\/dev\/null\b|\bhistory\s+-c\b|\bset\s+\+o\s+history\b|\b(?:rm|shred)\b[^|;]*[\/.]bash_history\b/i,
     'Shell history tampering -- approve only if intended', 'ask'],
@@ -1112,8 +1643,11 @@ const POSH_DENY_PATTERNS = [
   // Download-and-execute and web data upload.
   [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|curl|wget)\b[^;|]*\|\s*iex\b/i,
     'Download piped to Invoke-Expression blocked'],
+  // Downloading a file to disk is not executing it, and the bash equivalent (`curl -o`,
+  // `wget -O`) already falls through -- so this asks rather than hard-denying, for parity.
+  // Piping a download straight into `iex` is a separate rule and still denies.
   [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|curl|wget)\b[^;|]*-OutFile\b/i,
-    'PowerShell web download (-OutFile) blocked -- inspect first'],
+    'PowerShell web download (-OutFile) -- inspect the downloaded file before running it', 'ask'],
   [/\.(DownloadString|DownloadFile|DownloadData)\s*\(/i, 'Net.WebClient download blocked'],
   [/\b(Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^;|]*-(Method\s+(POST|PUT)|Body|InFile)\b/i,
     'PowerShell web upload blocked -- review manually'],
@@ -1279,6 +1813,14 @@ const APPROVE_PATTERNS = [
   /^\s*fi\s*$/,
   // `source` / `.` removed here: routed through the script-content scanner so a
   // sourced local script is inspected, not blanket-approved.
+  // KNOWN LIMIT (defense-in-depth, tracked): `command`/`timeout`/`time`/`builtin` here approve
+  // the wrapper without examining what it wraps, so `timeout 5 sh /tmp/y` auto-approves although
+  // bare `sh /tmp/y` only prompts. This ALSO amplifies any deny rule that is not wrapper-aware
+  // into a silent allow: the pipe-to-interpreter and process-substitution denies are tokenized
+  // through stepWrappers precisely so this can't launder them, but a future `^`-anchored deny
+  // added without the same treatment would be laundered here. The robust fix is a wrapper-aware
+  // approve pass (recurse into the wrapped command) that still preserves `command -v X` and
+  // `timeout <legit-cmd>`; deferred to its own change so it can be reviewed on its own.
   /^\s*(export|set|type|command|hash|builtin|timeout|time|trap|read|local|declare|readonly|unset)\s/,
   /^\s*command\s+-v\s/,
   /^\s*type\s+-[apt]/,
@@ -1486,7 +2028,9 @@ function isSafeHeredocInvocation(rawCmd) {
       // (e.g. `curl http://x | bash` after a safe heredoc body) is hard-blocked
       // here rather than silently approved by the heredoc short-circuit.
       checkSegmentDeny(seg);
-      if (!checkSegmentApprove(seg, 0, false)) return false;
+      // -1: the heredoc short-circuit runs before the chain-wide variable analysis,
+      // so nothing is known to be resolvable here. The floor stays conservative.
+      if (!checkSegmentApprove(seg, 0, false, -1)) return false;
     }
   }
   return true;
@@ -1496,10 +2040,13 @@ function isSafeHeredocInvocation(rawCmd) {
 // mode 'ask': ONLY the ask-tagged Tier-2 rules fire, via ask(). The caller runs
 // the hard pass over all segments before the ask pass, so a hard deny on any
 // segment always wins over an ask on another.
-function checkSegmentDeny(seg, depth, mode) {
+// `extraVariant` carries the cross-segment variable expansion (see expandSegments).
+// Only the top-level callers pass it: recursion works on sub-strings of the segment,
+// where the parent's expansion is not meaningful.
+function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (depth === undefined) depth = 0;
   if (mode === undefined) mode = 'hard';
-  if (depth > 6) return;
+  if (depth > 6) { noteGap('nesting-depth'); return; }
 
   const stripped = seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   const emit = mode === 'ask' ? ask : deny;
@@ -1514,6 +2061,16 @@ function checkSegmentDeny(seg, depth, mode) {
   if (deobf !== seg) variants.push(deobf);
   const deobfStripped = normalizeObfuscation(stripped);
   if (deobfStripped !== stripped && deobfStripped !== deobf) variants.push(deobfStripped);
+  if (extraVariant && !variants.includes(extraVariant)) {
+    variants.push(extraVariant);
+    const xs = extraVariant.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+    if (xs !== extraVariant && !variants.includes(xs)) variants.push(xs);
+  }
+  // Brace expansion reconstitutes the real command word (`{r,}m` -> `rm`), so every
+  // variant built so far needs its expansions tested too. Shared with the bundle scanner.
+  for (const base of variants.slice()) {
+    for (const b of scan.expandBraces(base)) if (!variants.includes(b)) variants.push(b);
+  }
 
   // PowerShell + cmd deny patterns are anchored to their own syntax, so they are
   // safe to evaluate on both tools (and catch Windows tools shelled out from bash).
@@ -1568,13 +2125,20 @@ function checkSegmentDeny(seg, depth, mode) {
   }
 }
 
-function checkSegmentApprove(seg, depth, isPosh) {
+function checkSegmentApprove(seg, depth, isPosh, idx) {
   if (depth === undefined) depth = 0;
   if (depth > 6) return false;
 
   // PowerShell tool: only the conservative PS read-only set auto-approves.
   // The Unix approve set (incl. the bash `curl|wget` rule) never runs here.
   if (isPosh) {
+    // The PS branch returns before the bash floor below, so PS had NO floor at all:
+    // `Get-Content $SomeUnknownVar` matched a read-only approve pattern and returned
+    // `allow` with no prompt, whatever the variable held. Each hook invocation is
+    // stateless while PowerShell variables persist across tool calls, so the assignment
+    // and the read can simply be sent as two separate calls -- the second one is a bare
+    // read of a variable this process never saw. Give PS its own floor first.
+    if (hasUnresolvedPoshRead(seg, idx)) return false;
     for (const pattern of POSH_APPROVE_PATTERNS) {
       if (pattern.test(seg)) return true;
     }
@@ -1586,7 +2150,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
   // alone. (Deny patterns that span a pipe, e.g. `curl | bash`, already ran.)
   const stages = splitPipeStages(seg);
   if (stages.length > 1) {
-    for (const st of stages) if (!checkSegmentApprove(st, depth + 1, false)) return false;
+    for (const st of stages) if (!checkSegmentApprove(st, depth + 1, false, idx)) return false;
     return true;
   }
 
@@ -1602,14 +2166,14 @@ function checkSegmentApprove(seg, depth, isPosh) {
     const execCmds = parseFindExec(seg);
     if (/\s-(?:exec|execdir|ok|okdir)\b/.test(seg) && !execCmds) return false;  // exec present but unparseable
     for (const c of (execCmds || [])) {
-      for (const inner of splitChainSegments(c)) if (!checkSegmentApprove(inner, depth + 1, false)) return false;
+      for (const inner of splitChainSegments(c)) if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
     }
     return true;
   }
   if (/^\s*(?:[A-Za-z_]\w*=\S*\s+)*xargs\b/.test(seg)) {
     const xargsCmd = parseXargs(seg);
     if (xargsCmd) {
-      for (const inner of splitChainSegments(xargsCmd)) if (!checkSegmentApprove(inner, depth + 1, false)) return false;
+      for (const inner of splitChainSegments(xargsCmd)) if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
     }
     return true;
   }
@@ -1620,7 +2184,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
     const innerSegs = splitChainSegments(shellC.innerCmd);
     if (innerSegs.length === 0) return false;
     for (const inner of innerSegs) {
-      if (!checkSegmentApprove(inner, depth + 1)) return false;
+      if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
     }
     return true;
   }
@@ -1636,7 +2200,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
       if (r && r.end === value.length) {
         const innerSegs = splitChainSegments(r.inner);
         for (const s of innerSegs) {
-          if (!checkSegmentApprove(s, depth + 1)) return false;
+          if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
         }
         return true;
       }
@@ -1646,7 +2210,7 @@ function checkSegmentApprove(seg, depth, isPosh) {
       if (r && r.end === value.length - 1) {
         const innerSegs = splitChainSegments(r.inner);
         for (const s of innerSegs) {
-          if (!checkSegmentApprove(s, depth + 1)) return false;
+          if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
         }
         return true;
       }
@@ -1654,17 +2218,134 @@ function checkSegmentApprove(seg, depth, isPosh) {
     if (value.startsWith('`') && value.endsWith('`') && value.length > 2) {
       const innerSegs = splitChainSegments(value.slice(1, -1));
       for (const s of innerSegs) {
-        if (!checkSegmentApprove(s, depth + 1)) return false;
+        if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
       }
       return true;
     }
   }
+
+  // Approve floor: auto-approving a read whose target we cannot see is the same
+  // hole as never checking it. `cat $X` matched a plain-read approve rule and
+  // returned `allow`. Refuse to approve a read verb whose argument still holds an
+  // expansion we could not resolve; the normal permission prompt takes over.
+  // Narrow to READ_VERB_SET and to genuinely unresolved names, so a resolvable
+  // one (`F=/t/o.txt; jq -r '.a' $F`) still approves as before.
+  if (hasUnresolvedRead(seg, idx)) return false;
 
   const stripped = seg.replace(/^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   for (const pattern of APPROVE_PATTERNS) {
     if (pattern.test(seg) || pattern.test(stripped)) {
       return true;
     }
+  }
+  return false;
+}
+
+// Shell keywords that can precede a command word inside a compound statement. Without
+// these, `for f in .env; do cat $f; done` splits into a `do cat $f` segment whose first
+// token is `do`, the read verb is never found, and the `^\s*do\s` approve rule lets it
+// through -- the same auto-approve-a-secret-read shape this floor exists to stop.
+const CMD_KEYWORDS = new Set(['do', 'then', 'else', 'elif']);
+
+// Flags whose value is a count or an offset, never a path. Without this,
+// `head -n $N file.txt` and `grep -A $N notes.md` lose auto-approval over a variable that
+// could not name a file. `-f`/`--file` deliberately absent: those DO name a file.
+const NUMERIC_VALUE_FLAG =
+  /^-(?:n|c|m|A|B|C|-lines|-bytes|-max-count|-after-context|-before-context|-context)$/;
+
+function hasUnresolvedRead(seg, idx) {
+  const known = resolvableAt[idx] || NO_NAMES;
+  // Single-quoted spans are program text, not paths, and bash never expands them --
+  // `awk '{print $NF}' access.log` and `grep -o 'v$VERSION' f` must keep approving.
+  // Same reasoning as expandVars; blanking keeps offsets intact.
+  const toks = tokenizeArgs(blankSingleQuoted(seg).replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, ''));
+  if (!toks.length) return false;
+  // Step over shell keywords and command wrappers (`timeout 5 cat $X`, `sudo -u x cat $X`,
+  // `do cat $f`) and the flags/values they take, so the read verb behind one is still seen.
+  // Checking only toks[0] left every wrapper as a way around the floor.
+  let at = 0;
+  for (let guard = 0; guard < 8 && at < toks.length; guard++) {
+    const w = toks[at].replace(/^.*[\\/]/, '');
+    if (CMD_KEYWORDS.has(w)) { at++; continue; }
+    if (!CMD_WRAPPERS.has(w)) break;
+    const valueFlag = WRAPPER_VALUE_FLAGS[w];
+    at++;
+    while (at < toks.length) {
+      const t = toks[at];
+      // Never let a flag value swallow the read verb: if this table is wrong about a
+      // flag's arity, treat it as boolean. Costs one extra token, never a missed read.
+      if (valueFlag && valueFlag.test(t) &&
+          !READ_VERB_SET.has((toks[at + 1] || '').replace(/^.*[\\/]/, ''))) { at += 2; continue; }
+      if (t.startsWith('-') || /^[A-Za-z_]\w*=/.test(t) || /^\d+(?:\.\d+)?[smhd]?$/.test(t)) { at++; continue; }
+      break;
+    }
+  }
+  if (at >= toks.length) return false;
+  const verb = toks[at].replace(/^.*[\\/]/, '');
+  if (!READ_VERB_SET.has(verb)) return false;
+  // A program/pattern verb's first positional is its program, not a path (`jq '.a' f`).
+  // The deny side already skips it; the floor must too, or `sed $EXPR f` stops approving.
+  let skipProgramArg = PROGRAM_ARG_VERBS.has(verb);
+  for (let i = at + 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (NUMERIC_VALUE_FLAG.test(t)) { i++; continue; }   // its value is a count, not a path
+    if (t.startsWith('-')) continue;
+    if (skipProgramArg) { skipProgramArg = false; continue; }
+    if (tokenHasOpaqueExpansion(t, known, false)) return true;
+  }
+  return false;
+}
+
+// This MUST mirror VAR_AT (what expandVars actually substitutes) exactly. A looser test
+// here is a bypass, not a nicety: `${X:-default}`, `${X#pat}`, `${X%pat}`, `${X/a/b}` and
+// `${X:0:9}` are never expanded by the deny pass, so the deny rules never see the secret --
+// but a regex that merely scraped the base name out of them called the read "resolved" and
+// auto-approved it. `${X:-nope}` is an ordinary bash idiom, not exotic obfuscation.
+// PowerShell counterpart of hasUnresolvedRead. Same principle: never auto-approve a read
+// whose target we cannot see. Matches the cmdlets and aliases that read file CONTENT, which
+// is the set POSH_DENY_PATTERNS already gates; `Get-ChildItem`/`ls` only list a directory
+// and stay approvable, as they do on the bash side.
+const POSH_READ_VERB =
+  /^\s*(?:Get-Content|gc|cat|type|more|Select-String|sls|findstr|Format-Hex|Import-Csv|Import-Clixml|Get-Item(?:Property)?|Get-Random)\b/i;
+
+function hasUnresolvedPoshRead(seg, idx) {
+  if (!POSH_READ_VERB.test(seg)) return false;
+  const known = resolvableAt[idx] || NO_NAMES;
+  // Blank single-quoted spans: PowerShell does not expand there, so `Get-Content '$X'`
+  // reads a file literally named `$X` and must not be dragged to a prompt.
+  const toks = tokenizeArgs(blankSingleQuoted(seg));
+  for (let i = 1; i < toks.length; i++) {
+    if (tokenHasOpaqueExpansion(toks[i], known, true)) return true;
+  }
+  return false;
+}
+
+function tokenHasOpaqueExpansion(t, known, isPosh) {
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] !== '$') continue;
+    const rest = t.slice(i);
+    if (rest.startsWith('$(') || rest.startsWith('`')) return true;   // command substitution
+    let m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}/.exec(rest);             // exact ${NAME}
+    if (m) {
+      if (!known.has(m[1])) return true;
+      i += m[0].length - 1;
+      continue;
+    }
+    if (rest.startsWith('${')) return true;                           // any operator form
+    m = /^\$([A-Za-z_][A-Za-z0-9_]*)/.exec(rest);                     // bare $NAME
+    if (m) {
+      // A `:` after the name makes this a namespace reference, not that variable:
+      // `$using:PATH` and `$env:HOME` are unrelated to a local `$using` / `$env`.
+      // Treating them as the same name spliced `.env` into `Get-Content $using:PATH`
+      // and produced an unappealable false deny.
+      if (isPosh && rest[m[0].length] === ':') return true;
+      if (!known.has(varKey(m[1], isPosh))) return true;
+      i += m[0].length - 1;
+      continue;
+    }
+    // Positional and special parameters ($1, $@, $*, $?, $$, $-) expand in bash too and
+    // are never resolved here, so a read through one is opaque.
+    if (/^\$[0-9@*?$!#-]/.test(rest)) return true;
   }
   return false;
 }
@@ -1736,7 +2417,7 @@ function resolveScriptPath(token, cwd) {
   if (/[*?]/.test(t)) return null;            // glob -> normal flow
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return null; // URL
   if (t === '-') return null;                  // stdin
-  if (t[0] === '~') t = path.join(os.homedir(), t.slice(1));
+  if (t[0] === '~') t = path.join(safeHomedir(), t.slice(1));
   try {
     return path.isAbsolute(t) ? path.normalize(t) : path.resolve(cwd || process.cwd(), t);
   } catch {
@@ -1755,10 +2436,13 @@ function readBoundedForScan(absPath) {
     const n = fs.readSync(fd, buf, 0, trust.TRUST_SCAN_BYTES, 0);
     const size = fs.fstatSync(fd).size;
     const slice = buf.subarray(0, n);
-    for (let i = 0; i < slice.length; i++) if (slice[i] === 0) return null; // binary
+    for (let i = 0; i < slice.length; i++) if (slice[i] === 0) return null;   // binary: nothing to scan, not a coverage gap
     return { buf: slice, size, truncated: size > n };
-  } catch {
-    return null;
+  } catch (e) {
+    // A script that is simply not there is not a coverage gap -- the command will
+    // fail on its own. One we are refused access to, or cannot decode, is: we were
+    // asked to vet something and could not. Only the latter degrades the verdict.
+    return (e && e.code === 'ENOENT') ? null : { opaque: (e && e.code) || 'unreadable' };
   } finally {
     if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
   }
@@ -1788,7 +2472,12 @@ function checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs) {
   const abs = resolveScriptPath(shape.token, cwd);
   if (!abs) return;
   const r = readBoundedForScan(abs);
-  if (!r) { audit('fallthrough', 'script-unreadable:' + abs, seg); return; }
+  if (!r) return;                                  // missing script: not a gap
+  if (r.opaque) {
+    noteGap('script-unreadable');
+    audit('fallthrough', 'script-unreadable:' + r.opaque + ':' + abs, seg);
+    return;
+  }
   const findings = scan.scanShell(r.buf.toString('utf8'), { decode: true });
   // Only auto-approve a clean/trusted script when it is the WHOLE segment. If the
   // segment pipes into more stages (`. ./ok.sh | node evil.js`), don't add it to
@@ -1844,8 +2533,14 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
 
-  const rawCmd = input?.tool_input?.command;
-  if (!rawCmd) process.exit(0);
+  let rawCmd = input?.tool_input?.command;
+  // Some hosts pass the command as an argv array (`["rm","-rf","/"]`); join it so it is
+  // analysed as one command line. Anything else non-string cannot be analysed -- exit 0
+  // (fallthrough to the normal permission prompt) rather than crashing. A crash exits
+  // nonzero, which Claude Code treats as non-blocking, so the tool would run UNPROTECTED:
+  // a bad-typed payload must fail safe, not open.
+  if (Array.isArray(rawCmd)) rawCmd = rawCmd.map((x) => (typeof x === 'string' ? x : '')).join(' ');
+  if (typeof rawCmd !== 'string' || !rawCmd) process.exit(0);
 
   const isPosh = input?.tool_name === 'PowerShell';
   const cwd = input?.cwd || process.cwd();
@@ -1867,6 +2562,7 @@ process.stdin.on('end', () => {
     try {
       if (isSafeHeredocInvocation(cmd)) approve(rawCmd);
     } catch (err) {
+      noteGap('heredoc-parse');
       audit('fallthrough', 'heredoc-check-threw: ' + (err && err.message), rawCmd);
     }
   }
@@ -1876,8 +2572,12 @@ process.stdin.on('end', () => {
 
   if (segments.length === 0) process.exit(0);
 
-  for (const seg of segments) {
-    checkSegmentDeny(seg, 0, 'hard');
+  // Cross-segment variable expansion, computed once and fed to both deny passes
+  // as an extra match variant. Also populates varEnv for the approve floor.
+  const expanded = expandSegments(segments, cwd, isPosh);
+
+  for (let i = 0; i < segments.length; i++) {
+    checkSegmentDeny(segments[i], 0, 'hard', expanded[i]);
   }
 
   // Injection scan for shell-redirected writes (bash-only), per pipe stage so a
@@ -1885,7 +2585,7 @@ process.stdin.on('end', () => {
   if (!isPosh) {
     for (const seg of segments) {
       for (const stage of splitPipeStages(seg)) {
-        try { scanShellRedirectInjection(stage); } catch (err) { audit('fallthrough', 'redirect-scan-threw: ' + (err && err.message), stage); }
+        try { scanShellRedirectInjection(stage); } catch (err) { noteGap('redirect-scan'); audit('fallthrough', 'redirect-scan-threw: ' + (err && err.message), stage); }
       }
     }
   }
@@ -1898,6 +2598,7 @@ process.stdin.on('end', () => {
     try {
       checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs);
     } catch (err) {
+      noteGap('script-scan');
       audit('fallthrough', 'script-scan-threw: ' + (err && err.message), seg);
     }
   }
@@ -1905,13 +2606,21 @@ process.stdin.on('end', () => {
   // Tier-2 ask pass: dev-workflow guards (sudo / git push / DROP TABLE / ...)
   // surface for in-session approval. Runs after hard deny + script scan so those
   // always take precedence; ask() exits on the first match.
-  for (const seg of segments) {
-    checkSegmentDeny(seg, 0, 'ask');
+  for (let i = 0; i < segments.length; i++) {
+    checkSegmentDeny(segments[i], 0, 'ask', expanded[i]);
+  }
+
+  // Coverage gate. Placed after every deny pass (so a hard deny still wins) and
+  // before the approve pass (so an unanalysed command can never be auto-approved).
+  if (coverageGaps.length) {
+    ask('shellter could not fully analyze this command (' + coverageGaps.join(', ') +
+        ') -- approve only if you know what it does', rawCmd);
   }
 
   let allApproved = true;
-  for (const seg of segments) {
-    if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh)) {
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh, i)) {
       allApproved = false;
       break;
     }
