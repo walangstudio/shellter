@@ -949,7 +949,24 @@ testPosh('win del: -WhatIf in an else branch does not abort the deny', join('if 
 // v0.9.0 conservative core, round-4 review (Fable): a runtime-computed target must PROMPT, not
 // hard-deny -- a quoted $var subpath (bash tokenizer drops the \ before $), a Join-Path/$()
 // subexpression, and a folder named like a verb glued after $(). $Recycle.Bin stays a literal.
-testPosh('fp win del: quoted $var subpath under home falls through', 'Remove-Item "$env:USERPROFILE\\$dir" -Recurse -Force', 'fallthrough');
+// A computed target DIRECTLY under home can be the home itself (empty var): ASK, never an
+// unappealable deny and never a silent allow. One level deeper it cannot reach home: falls through.
+testPosh('win del: computed $var directly under home asks', 'Remove-Item "$env:USERPROFILE\\$dir" -Recurse -Force', 'ask');
+testPosh('win del: ForEach over home with computed item path asks (was auto-approved)', 'Get-ChildItem $HOME -Directory | ForEach-Object { Remove-Item -Recurse -Force "$HOME\\$_" }', 'ask');
+testPosh('win del: computed $var directly under a system dir asks', 'Remove-Item -Recurse -Force "C:\\Windows\\$x"', 'ask');
+testPosh('fp win del: computed $var deeper under home falls through', 'Remove-Item -Recurse -Force "$HOME\\proj\\$x"', 'fallthrough');
+// macOS/Linux pwsh: a Unix target goes through the same classifier as bash rm (system dirs incl.
+// /System /Applications /Users, fs root), with the own-home carve-out. Plus a simulated macOS home
+// (/Users/tester) for the computed-var ask tier -- env override, so it holds on every CI OS.
+testPosh('win del (pwsh on mac): /System/Library denies', join('Remove-Item -Recurse -For', 'ce /System/Library'), 'deny');
+testPosh('win del (pwsh on unix): /etc denies', join('Remove-Item -Recurse -For', 'ce /etc'), 'deny');
+testPosh('fp win del (pwsh on unix): /tmp build dir is fine', join('Remove-Item -Recurse -For', 'ce /tmp/build'), 'fallthrough');
+{ const mac = { HOME: '/Users/tester', USERPROFILE: '/Users/tester' }; const ps = (c) => runHook(BASH_HOOK, { tool_name: 'PowerShell', tool_input: { command: c } }, mac).decision;
+  check('win del (mac home): computed $var directly under home asks', ps(join('Remove-Item -Recurse -For', 'ce "$HOME/$sub"')), 'ask');
+  check('win del (mac home): the home dir itself denies', ps(join('Remove-Item -Recurse -For', 'ce /Users/tester')), 'deny');
+  check('win del (mac home): another user profile denies', ps(join('Remove-Item -Recurse -For', 'ce /Users/bob')), 'deny');
+  check('fp win del (mac home): own-home cache cleanup is fine', ps(join('Remove-Item -Recurse -For', 'ce $HOME/.cache/app')), 'fallthrough');
+  check('fp win del (mac home): own-home project dir is fine', ps(join('Remove-Item -Recurse -For', 'ce /Users/tester/project/dist')), 'fallthrough'); }
 testPosh('fp win del: Join-Path subexpression target falls through', 'Remove-Item (Join-Path $HOME build) -Recurse', 'fallthrough');
 testPosh('fp win del: folder named del glued after $() is not the verb', 'Copy-Item "$($env:TEMP)\\del" "C:\\Program Files\\App" -Recurse', 'fallthrough');
 testPosh('win del: literal C:\\$Recycle.Bin still denies', join('Remove-Item -Recurse -For', 'ce C:\\$Recycle.Bin'), 'deny');

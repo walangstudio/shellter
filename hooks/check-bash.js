@@ -371,6 +371,11 @@ function winDeleteTargetDanger(raw, home, hasFilter) {
   if (!raw) return null;
   const r0 = String(raw).replace(/^['"]|['"]$/g, '');
   if (r0 === '*' || r0 === '*.*') return hasFilter ? null : 'wildcard';   // an -Include/-Filter scopes `*`
+  // PowerShell also runs on macOS/Linux (`pwsh`), where the target is a Unix path. Reuse the bash rm
+  // classifier for a leading-`/` target (system dirs incl. /System /Library /Applications /Users /etc,
+  // the fs root, `..` traversal, with the own-home carve-out). Additive: only a reason it returns
+  // can deny; anything it passes still goes through the Windows checks below.
+  if (/^\/(?!\/)/.test(r0)) { const u = rmTargetDanger(r0); if (u) return u; }
   // Registry hive ROOT via Remove-Item -- the `:` is REQUIRED (a relative dir named `hkcu` is not a
   // hive). Deep hive paths (`HKLM:\SOFTWARE\App`) are dual-use, left to a prompt.
   if (/^(?:HK(?:LM|CU|CR|U|CC)):\\*$/i.test(r0)) return 'registry hive';
@@ -401,11 +406,12 @@ function winDeleteTargetDanger(raw, home, hasFilter) {
   return null;
 }
 
-// Predicate for POSH_DENY_PATTERNS (runs on both tools). Fires only on a RECURSIVE delete
-// (PS -Recurse and abbrevs / cmd /s, and NOT -WhatIf) via a delete verb AT COMMAND POSITION --
-// Remove-Item and its aliases ri/del/erase/rd/rmdir (NOT `rm`, handled by rmDanger). A single-file
-// delete cannot wipe a tree, so it is left to a normal prompt to keep the FP surface minimal.
-function winDeleteDanger(seg) {
+// Shared parser for the Windows delete predicates below (both run on both tools). Finds a RECURSIVE
+// delete (PS -Recurse and abbrevs / cmd /s, and NOT -WhatIf) via a delete verb AT COMMAND POSITION --
+// Remove-Item and its aliases ri/del/erase/rd/rmdir (NOT `rm`, handled by rmDanger) -- and returns the
+// first non-null `classify(target, home, hasFilter)`. A single-file delete cannot wipe a tree, so it
+// is left to a normal prompt to keep the FP surface minimal.
+function winDeleteScan(seg, classify) {
   const home = safeHomedir();
   for (const stage of splitPipeStages(seg)) {
     const toks = tokenizeArgs(stage);
@@ -464,12 +470,50 @@ function winDeleteDanger(seg) {
       }
       if (whatif || !recursive) continue;
       for (const tg of targets) {
-        const r = winDeleteTargetDanger(tg, home, hasFilter);
-        if (r) return 'Destructive Windows/PowerShell delete (' + r + ') blocked';
+        const r = classify(tg, home, hasFilter);
+        if (r) return r;
       }
     }
   }
   return null;
+}
+
+// Hard deny: a literal catastrophic target.
+function winDeleteDanger(seg) {
+  return winDeleteScan(seg, (tg, home, hasFilter) => {
+    const r = winDeleteTargetDanger(tg, home, hasFilter);
+    return r ? 'Destructive Windows/PowerShell delete (' + r + ') blocked' : null;
+  });
+}
+
+// A computed target (`"$HOME\$sub"`, a `ForEach { … "$HOME\$_" }` item) is unknowable, so the deny
+// classifier lets it fall through -- but when the variable sits DIRECTLY under a catastrophic root
+// it can expand to that root itself (an empty `$sub` wipes the whole home). Hard-denying it
+// false-positived on routine `"$HOME\$dir"` cleanups, and falling through let the approve pass
+// auto-approve a `Get-ChildItem $HOME | ForEach-Object { … "$HOME\$_" }` home wipe that the old
+// rule denied. ASK: never an unappealable deny, never a silent allow.
+function winComputedRootTarget(raw, home) {
+  const t = winCanon(raw, home);
+  if (!t) return null;
+  const at = t.search(/\$(?!recycle\.bin(?:\\|$))/i);
+  if (at < 0) return null;
+  const preRaw = t.slice(0, at);
+  const pre = preRaw.replace(/\\+$/, '').toLowerCase();
+  if (/^[a-z]:$/.test(pre) || (pre === '' && preRaw.startsWith('\\'))) return 'a drive root';
+  if (home) {
+    const hc = winCanon(home, '').toLowerCase();
+    if (hc && !/^[a-z]:$/.test(hc) && pre === hc) return 'the home directory';
+  }
+  if (/^c:\\users$/.test(pre)) return 'the Users folder';
+  if (pre && WIN_SYSTEM_RE.test(pre)) return 'a system directory';
+  return null;
+}
+
+function winDeleteAskDanger(seg) {
+  return winDeleteScan(seg, (tg, home) => {
+    const r = winComputedRootTarget(tg, home);
+    return r ? 'Recursive delete of a computed path directly under ' + r + ' -- an empty variable would remove all of it; confirm the target' : null;
+  });
 }
 
 function splitChainSegments(cmd) {
@@ -1793,6 +1837,7 @@ const POSH_DENY_PATTERNS = [
   // regexes this replaced, which only caught the drive root / bare home and false-positived on a
   // `$env:USERPROFILE\subdir` cleanup.
   [winDeleteDanger, null],
+  [winDeleteAskDanger, null, 'ask'],
   // Invoke-Expression of dynamic/downloaded content. The `iex` arm excludes a bare
   // quote (`iex "..."`) so it does not fire on Elixir's `iex "code"` REPL on the Bash
   // tool; the real PS shapes are `iex(`, `iex $var`, `... | iex`, and full `Invoke-Expression`.

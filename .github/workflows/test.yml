@@ -22,6 +22,8 @@ jobs:
             node: 24
           - os: windows-latest
             node: 20
+          - os: macos-latest
+            node: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

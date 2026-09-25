@@ -52,12 +52,19 @@ Also: `Clear-Content` / `Clear-Item` / `Clear-RecycleBin` no longer auto-approve
 alias `clear` in the approve list matched `Clear-<Noun>` cmdlets (the `-` was a word boundary), so
 truncating a file auto-approved with no prompt; bare `clear` / `cls` / `Clear-Host` still approve.
 
-A target that is computed at runtime is prompted, never hard-denied: a still-present `$var` in the
-canonical path (a quoted `"$HOME\$sub"`, whose `\$` the tokenizer collapses), a `Join-Path`/`$()`
-subexpression argument, and a folder named like a verb glued after `$()` all fall through
-(`$Recycle.Bin` stays a literal system dir).
+A target that is computed at runtime is never hard-denied. When the variable sits **directly under**
+a catastrophic root (`"$HOME\$sub"`, `"C:\Windows\$x"`, a `Get-ChildItem $HOME | ForEach-Object {
+… "$HOME\$_" }` loop) it could expand to the root itself, so the delete is **asked** — never an
+unappealable deny, and never the silent auto-approve that falling through would hand to the approve
+pass. Deeper computed paths (`"$HOME\proj\$x"`), `Join-Path`/`$()` subexpression arguments, and a
+folder named like a verb glued after `$()` fall through (`$Recycle.Bin` stays a literal system dir).
 
-984 tests.
+PowerShell on macOS/Linux (`pwsh`) gets the same protection: a leading-`/` target goes through the
+bash `rm` classifier, so `Remove-Item -Recurse -Force /System/Library`, `/etc`, `/Users/<other>`
+and the home root deny, while your own `/Users/<you>/…` cleanups fall through. CI now also runs on
+`macos-latest`.
+
+995 tests.
 
 ## [0.8.0] - 2026-09-07
 
