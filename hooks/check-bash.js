@@ -375,7 +375,10 @@ function winDeleteTargetDanger(raw, home, hasFilter) {
   // classifier for a leading-`/` target (system dirs incl. /System /Library /Applications /Users /etc,
   // the fs root, `..` traversal, with the own-home carve-out). Additive: only a reason it returns
   // can deny; anything it passes still goes through the Windows checks below.
-  if (/^\/(?!\/)/.test(r0)) { const u = rmTargetDanger(r0); if (u) return u; }
+  // LITERAL targets only: shellter expands `$HOME` to its real value in one match variant, and on a
+  // Unix host that yields `/home/me$_` -- still computed (`$_`), so it belongs to the ask tier, not a
+  // hard deny (a Mac `"$HOME\$dir"` cleanup would otherwise be unappealable).
+  if (/^\/(?!\/)/.test(r0) && r0.indexOf('$') === -1) { const u = rmTargetDanger(r0); if (u) return u; }
   // Registry hive ROOT via Remove-Item -- the `:` is REQUIRED (a relative dir named `hkcu` is not a
   // hive). Deep hive paths (`HKLM:\SOFTWARE\App`) are dual-use, left to a prompt.
   if (/^(?:HK(?:LM|CU|CR|U|CC)):\\*$/i.test(r0)) return 'registry hive';
