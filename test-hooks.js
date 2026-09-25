@@ -971,6 +971,7 @@ testPosh('fp win del (pwsh on unix): /tmp build dir is fine', join('Remove-Item 
 // spelling of the ForEach home wipe asks instead of auto-approving (main denied it). And a drive-less
 // `/Users/<me>/…` on Windows pwsh is the own-home subtree, not a system dir.
 testPosh('win del: ForEach home loop via (Join-Path $HOME $_) asks (was auto-approved)', 'Get-ChildItem $HOME | % { Remove-Item -Recurse -Force (Join-Path $HOME $_) }', 'ask');
+testPosh('win del: glued group+block close (Join-Path $HOME $_)} still asks', 'Get-ChildItem $HOME | ForEach-Object { Remove-Item -Recurse -Force (Join-Path $HOME $_)}', 'ask');
 { const u = '/' + require('os').homedir().replace(/^[A-Za-z]:/, '').replace(/\\/g, '/').replace(/^\/+/, ''); testPosh('fp win del: drive-less own-home path is fine', join('Remove-Item -Recurse -For', 'ce ' + u + '/proj/dist'), 'fallthrough'); testPosh('win del: drive-less home root still denies', join('Remove-Item -Recurse -For', 'ce ' + u), 'deny'); }
 testPosh('fp win del: Join-Path subexpression target falls through', 'Remove-Item (Join-Path $HOME build) -Recurse', 'fallthrough');
 testPosh('fp win del: folder named del glued after $() is not the verb', 'Copy-Item "$($env:TEMP)\\del" "C:\\Program Files\\App" -Recurse', 'fallthrough');

@@ -444,11 +444,29 @@ function winDeleteScan(seg, classify) {
       const rest = [];
       let depth = 0;
       let grp = null;                                  // tokens of the depth-0 group being collected
+      // The one group we can resolve: positional `(Join-Path A B)` / `$(Join-Path A B)` is `A\B`.
+      // Treating it as inert let `ForEach { Remove-Item … (Join-Path $HOME $_) }` -- the Join-Path
+      // spelling of the "$HOME\$_" home wipe -- fall to the approve pass and auto-approve. Resolved,
+      // it reaches the same ask tier; `(Join-Path $HOME build)` is a literal own-home path (falls
+      // through). Named `-Path`/`-ChildPath` stays inert (documented bypass).
+      const resolveGrp = () => {
+        const g = grp.toks.map((x) => x.replace(/^\$?\(/, '').replace(/[)}]+$/, ''));
+        if (g.length === 3 && /^join-path$/i.test(g[0]) && g[1] && g[2] && g[1][0] !== '-' && g[2][0] !== '-') {
+          rest[grp.at] = g[1].replace(/^['"]|['"]$/g, '') + '\\' + g[2].replace(/^['"]|['"]$/g, '');
+        }
+        grp = null;
+      };
       for (let k = i + 1; k < toks.length; k++) {
         const tk = toks[k];
         const opens = (tk.match(/[{(]/g) || []).length;
         const closes = (tk.match(/[}\)]/g) || []).length;
-        if (depth + opens - closes < 0) { const pre = tk.split(/[}\)]/)[0]; if (pre) rest.push(pre); break; }
+        if (depth + opens - closes < 0) {
+          // The verb's block closes here. If a group is still open, this token also closes it
+          // (`$_)}` -- group `)` and block `}` glued): feed it to the group and resolve first.
+          const pre = tk.split(/[}\)]/)[0];
+          if (grp) { if (pre) grp.toks.push(pre); resolveGrp(); } else if (pre) rest.push(pre);
+          break;
+        }
         if (tk === ';') break;
         if (depth === 0 && /^(?:else|elseif|catch|finally)$/i.test(tk)) break;
         const d0 = depth;
@@ -462,18 +480,7 @@ function winDeleteScan(seg, classify) {
         } else if (grp) {
           grp.toks.push(tk);
         }
-        // The one group we can resolve: positional `(Join-Path A B)` / `$(Join-Path A B)` is `A\B`.
-        // Treating it as inert let `ForEach { Remove-Item … (Join-Path $HOME $_) }` -- the Join-Path
-        // spelling of the "$HOME\$_" home wipe -- fall to the approve pass and auto-approve. Resolved,
-        // it reaches the same ask tier; `(Join-Path $HOME build)` is a literal own-home path (falls
-        // through). Named `-Path`/`-ChildPath` stays inert (documented bypass).
-        if (grp && d0 > 0 && depth === 0) {
-          const g = grp.toks.map((x) => x.replace(/^\$?\(/, '').replace(/\)+$/, ''));
-          if (g.length === 3 && /^join-path$/i.test(g[0]) && g[1] && g[2] && g[1][0] !== '-' && g[2][0] !== '-') {
-            rest[grp.at] = g[1].replace(/^['"]|['"]$/g, '') + '\\' + g[2].replace(/^['"]|['"]$/g, '');
-          }
-          grp = null;
-        }
+        if (grp && d0 > 0 && depth === 0) resolveGrp();
       }
       let recursive = false, whatif = false, hasFilter = false;
       const targets = [];

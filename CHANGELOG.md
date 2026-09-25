@@ -65,7 +65,7 @@ bash `rm` classifier, so `Remove-Item -Recurse -Force /System/Library`, `/etc`, 
 and the home root deny, while your own `/Users/<you>/…` cleanups fall through. CI now also runs on
 `macos-latest`.
 
-998 tests.
+999 tests.
 
 ## [0.8.0] - 2026-09-07
 
