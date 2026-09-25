@@ -904,7 +904,9 @@ testPosh('win del evasion: PROGRA~1 8.3 name denies', join('Remove-Item -Recurse
 testPosh('win del: $HOME wildcard denies', join('Remove-Item -Recurse -For', 'ce $HOME\\*'), 'deny');
 testPosh('win del: braced HOME var denies', join('Remove-Item -Recurse -For', 'ce ${HOME}'), 'deny');
 { const h = require('os').homedir(); testPosh('win del: home exact path denies', join('Remove-Item -Recurse -For', 'ce ' + h), 'deny'); }
-testPosh('win del: userprofile ..\\bob other-profile denies', join('Remove-Item -Recurse -For', 'ce $env:USERPROFILE\\..\\bob'), 'deny');
+// Literal (not $env:USERPROFILE) so it canonicalizes to C:\Users\bob on every OS -- on a Linux
+// runner $env:USERPROFILE expands to /home/runner and `..\bob` lands under /home, not C:\Users.
+testPosh('win del: Users\\x\\..\\bob other-profile escape denies', join('Remove-Item -Recurse -For', 'ce C:\\Users\\someone\\..\\bob'), 'deny');
 testPosh('win del: glued if-block delete denies', join('if (Test-Path C:\\Windows) {Remove-Item -Recurse -For', 'ce C:\\Windows}'), 'deny');
 testPosh('win del: & script-block delete denies', join('& {Remove-Item -Recurse -For', 'ce $HOME}'), 'deny');
 testPosh('win del: parenthesized delete denies', join('(Remove-Item -Recurse -For', 'ce C:\\Windows)'), 'deny');
