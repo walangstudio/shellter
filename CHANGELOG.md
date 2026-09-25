@@ -56,7 +56,8 @@ A target that is computed at runtime is never hard-denied. When the variable sit
 a catastrophic root (`"$HOME\$sub"`, `"C:\Windows\$x"`, a `Get-ChildItem $HOME | ForEach-Object {
 … "$HOME\$_" }` loop) it could expand to the root itself, so the delete is **asked** — never an
 unappealable deny, and never the silent auto-approve that falling through would hand to the approve
-pass. Deeper computed paths (`"$HOME\proj\$x"`), `Join-Path`/`$()` subexpression arguments, and a
+pass. A positional `(Join-Path $HOME $_)` resolves to `$HOME\$_` and gets the same ask. Deeper
+computed paths (`"$HOME\proj\$x"`), other `Join-Path`/`$()` subexpression arguments, and a
 folder named like a verb glued after `$()` fall through (`$Recycle.Bin` stays a literal system dir).
 
 PowerShell on macOS/Linux (`pwsh`) gets the same protection: a leading-`/` target goes through the
@@ -64,7 +65,7 @@ bash `rm` classifier, so `Remove-Item -Recurse -Force /System/Library`, `/etc`, 
 and the home root deny, while your own `/Users/<you>/…` cleanups fall through. CI now also runs on
 `macos-latest`.
 
-995 tests.
+998 tests.
 
 ## [0.8.0] - 2026-09-07
 

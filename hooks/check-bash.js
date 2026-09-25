@@ -378,7 +378,13 @@ function winDeleteTargetDanger(raw, home, hasFilter) {
   // LITERAL targets only: shellter expands `$HOME` to its real value in one match variant, and on a
   // Unix host that yields `/home/me$_` -- still computed (`$_`), so it belongs to the ask tier, not a
   // hard deny (a Mac `"$HOME\$dir"` cleanup would otherwise be unappealable).
-  if (/^\/(?!\/)/.test(r0) && r0.indexOf('$') === -1) { const u = rmTargetDanger(r0); if (u) return u; }
+  // On Windows pwsh a drive-less `/Users/<me>/proj` IS the user's own home subtree, but rmTargetDanger's
+  // carve-out compares it to `c:/users/<me>` and misses. Skip the passthrough for a path strictly
+  // under home (drive stripped, no `..`); the home root itself still goes through and denies.
+  const homeU = home ? '/' + home.replace(/^[A-Za-z]:/, '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
+  const underOwnHome = homeU.length > 1 && !/(?:^|\/)\.\.(?:\/|$)/.test(r0) &&
+    r0.replace(/\/+$/, '').toLowerCase().startsWith(homeU.toLowerCase() + '/');
+  if (/^\/(?!\/)/.test(r0) && r0.indexOf('$') === -1 && !underOwnHome) { const u = rmTargetDanger(r0); if (u) return u; }
   // Registry hive ROOT via Remove-Item -- the `:` is REQUIRED (a relative dir named `hkcu` is not a
   // hive). Deep hive paths (`HKLM:\SOFTWARE\App`) are dual-use, left to a prompt.
   if (/^(?:HK(?:LM|CU|CR|U|CC)):\\*$/i.test(r0)) return 'registry hive';
@@ -437,6 +443,7 @@ function winDeleteScan(seg, classify) {
       // at a `;`, and at an else/catch/finally keyword. Balanced parens (`(x86)`) stay intact.
       const rest = [];
       let depth = 0;
+      let grp = null;                                  // tokens of the depth-0 group being collected
       for (let k = i + 1; k < toks.length; k++) {
         const tk = toks[k];
         const opens = (tk.match(/[{(]/g) || []).length;
@@ -449,7 +456,24 @@ function winDeleteScan(seg, classify) {
         // A top-level token is an arg; a nested `(Join-Path $HOME x)` is not, but it still occupies ONE
         // positional/flag-value slot -- push an inert '' placeholder for it so a preceding `-Path` binds
         // to the group (empty = safe), not to the NEXT flag (which made `-Filter *` a wildcard target).
-        if (d0 === 0) rest.push(depth === 0 ? tk : '');
+        if (d0 === 0) {
+          rest.push(depth === 0 ? tk : '');
+          if (depth > 0) grp = { at: rest.length - 1, toks: [tk] };
+        } else if (grp) {
+          grp.toks.push(tk);
+        }
+        // The one group we can resolve: positional `(Join-Path A B)` / `$(Join-Path A B)` is `A\B`.
+        // Treating it as inert let `ForEach { Remove-Item … (Join-Path $HOME $_) }` -- the Join-Path
+        // spelling of the "$HOME\$_" home wipe -- fall to the approve pass and auto-approve. Resolved,
+        // it reaches the same ask tier; `(Join-Path $HOME build)` is a literal own-home path (falls
+        // through). Named `-Path`/`-ChildPath` stays inert (documented bypass).
+        if (grp && d0 > 0 && depth === 0) {
+          const g = grp.toks.map((x) => x.replace(/^\$?\(/, '').replace(/\)+$/, ''));
+          if (g.length === 3 && /^join-path$/i.test(g[0]) && g[1] && g[2] && g[1][0] !== '-' && g[2][0] !== '-') {
+            rest[grp.at] = g[1].replace(/^['"]|['"]$/g, '') + '\\' + g[2].replace(/^['"]|['"]$/g, '');
+          }
+          grp = null;
+        }
       }
       let recursive = false, whatif = false, hasFilter = false;
       const targets = [];

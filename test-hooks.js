@@ -967,6 +967,11 @@ testPosh('fp win del (pwsh on unix): /tmp build dir is fine', join('Remove-Item 
   check('win del (mac home): another user profile denies', ps(join('Remove-Item -Recurse -For', 'ce /Users/bob')), 'deny');
   check('fp win del (mac home): own-home cache cleanup is fine', ps(join('Remove-Item -Recurse -For', 'ce $HOME/.cache/app')), 'fallthrough');
   check('fp win del (mac home): own-home project dir is fine', ps(join('Remove-Item -Recurse -For', 'ce /Users/tester/project/dist')), 'fallthrough'); }
+// Final delta review (Fable): positional `(Join-Path A B)` resolves to `A\B`, so the Join-Path
+// spelling of the ForEach home wipe asks instead of auto-approving (main denied it). And a drive-less
+// `/Users/<me>/…` on Windows pwsh is the own-home subtree, not a system dir.
+testPosh('win del: ForEach home loop via (Join-Path $HOME $_) asks (was auto-approved)', 'Get-ChildItem $HOME | % { Remove-Item -Recurse -Force (Join-Path $HOME $_) }', 'ask');
+{ const u = '/' + require('os').homedir().replace(/^[A-Za-z]:/, '').replace(/\\/g, '/').replace(/^\/+/, ''); testPosh('fp win del: drive-less own-home path is fine', join('Remove-Item -Recurse -For', 'ce ' + u + '/proj/dist'), 'fallthrough'); testPosh('win del: drive-less home root still denies', join('Remove-Item -Recurse -For', 'ce ' + u), 'deny'); }
 testPosh('fp win del: Join-Path subexpression target falls through', 'Remove-Item (Join-Path $HOME build) -Recurse', 'fallthrough');
 testPosh('fp win del: folder named del glued after $() is not the verb', 'Copy-Item "$($env:TEMP)\\del" "C:\\Program Files\\App" -Recurse', 'fallthrough');
 testPosh('win del: literal C:\\$Recycle.Bin still denies', join('Remove-Item -Recurse -For', 'ce C:\\$Recycle.Bin'), 'deny');
