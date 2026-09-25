@@ -874,6 +874,89 @@ testPosh('F6: PowerShell Remove-Item still approves benign md',
   'Remove-Item .pr-body-bump.md', 'allow');
 testPosh('F6: PowerShell Remove-Item still approves regular files',
   'Remove-Item out.log', 'allow');
+// v0.9.0 (Windows delete coverage): recursive delete of a system dir (any depth), drive root,
+// home root, the Users container, or another user's profile via Remove-Item and its aliases now
+// denies; a path under the user's OWN home, another drive, or a single-file delete is NOT blocked
+// (winDeleteTargetDanger, FP-safe). Verb split via join() so the file itself carries no live literal.
+testPosh('win del: Remove-Item -Recurse -Force system32 denies', join('Remove-Item -Recurse -For', 'ce C:\\Windows\\System32'), 'deny');
+testPosh('win del: Remove-Item -Recurse -Force "Program Files" denies', join('Remove-Item -Recurse -For', 'ce "C:\\Program Files"'), 'deny');
+testPosh('win del: Remove-Item -Recurse -Force $env:ProgramFiles denies', join('Remove-Item -Recurse -For', 'ce $env:ProgramFiles'), 'deny');
+testPosh('win del: ri -Force -Recurse ~ (home root) denies', 'ri -Force -Recurse ~', 'deny');
+testPosh('win del: del alias -Recurse -Force system32 denies', join('del -Recurse -For', 'ce C:\\Windows\\System32'), 'deny');
+testPosh('win del: Remove-Item -r -Force C:\\Windows (abbrev) denies', join('Remove-Item -r -For', 'ce C:\\Windows'), 'deny');
+testPosh('win del: Remove-Item -Recurse -Force C:\\Users container denies', join('Remove-Item -Recurse -For', 'ce C:\\Users'), 'deny');
+testPosh('win del: Remove-Item -Recurse -Force another user profile denies', join('Remove-Item -Recurse -For', 'ce C:\\Users\\someoneelse'), 'deny');
+testPosh('fp win del: $env:USERPROFILE subdir cleanup is fine', join('Remove-Item -Recurse -For', 'ce $env:USERPROFILE\\.cache\\app'), 'fallthrough');
+testPosh('fp win del: ~ subdir cleanup is fine', join('Remove-Item -Recurse -For', 'ce ~\\project\\node_modules'), 'fallthrough');
+testPosh('fp win del: other-drive project dir is fine', join('Remove-Item -Recurse -For', 'ce D:\\projects\\old'), 'fallthrough');
+testPosh('fp win del: single system file (no -Recurse) is not hard-blocked', join('Remove-Item -For', 'ce C:\\Windows\\Temp\\mylog.txt'), 'fallthrough');
+{ const h = require('os').homedir(); testPosh('fp win del: own-home subdir is fine', join('Remove-Item -Recurse -For', 'ce "' + h + '\\project"'), 'fallthrough'); }
+testPosh('win del: Clear-Content of a system file no longer auto-approves', 'Clear-Content C:\\Windows\\System32\\config\\SAM', 'fallthrough');
+testPosh('win del: bare clear (screen) still approves', 'clear', 'allow');
+// v0.9.0 evasion hardening: colon-param (-Recurse:$true), forward slashes, trailing-dot, and
+// 8.3 short names must not slip the system-dir deny.
+testPosh('win del evasion: -Recurse:$true colon-param denies', join('Remove-Item -Recurse:$tr', 'ue -Force C:/Windows'), 'deny');
+testPosh('win del evasion: forward-slash system path denies', join('Remove-Item -Recurse -For', 'ce C:/Windows/System32'), 'deny');
+testPosh('win del evasion: trailing-dot system path denies', join('Remove-Item -Recurse -For', 'ce C:\\Windows.'), 'deny');
+testPosh('win del evasion: PROGRA~1 8.3 name denies', join('Remove-Item -Recurse -For', 'ce C:\\PROGRA~1\\app'), 'deny');
+// v0.9.0 review round (Fable DO-NOT-SHIP): home-root/wildcard regressions, glued script blocks,
+// ancestor-escape normalization, verb-as-argument FP, flag-value FP, -WhatIf, degenerate home.
+testPosh('win del: $HOME wildcard denies', join('Remove-Item -Recurse -For', 'ce $HOME\\*'), 'deny');
+testPosh('win del: braced HOME var denies', join('Remove-Item -Recurse -For', 'ce ${HOME}'), 'deny');
+{ const h = require('os').homedir(); testPosh('win del: home exact path denies', join('Remove-Item -Recurse -For', 'ce ' + h), 'deny'); }
+testPosh('win del: userprofile ..\\bob other-profile denies', join('Remove-Item -Recurse -For', 'ce $env:USERPROFILE\\..\\bob'), 'deny');
+testPosh('win del: glued if-block delete denies', join('if (Test-Path C:\\Windows) {Remove-Item -Recurse -For', 'ce C:\\Windows}'), 'deny');
+testPosh('win del: & script-block delete denies', join('& {Remove-Item -Recurse -For', 'ce $HOME}'), 'deny');
+testPosh('win del: parenthesized delete denies', join('(Remove-Item -Recurse -For', 'ce C:\\Windows)'), 'deny');
+testPosh('win del: ancestor-escape to system denies', join('Remove-Item -Recurse -For', 'ce C:\\tmp\\..\\Windows'), 'deny');
+testPosh('win del: drive-relative system path denies', join('Remove-Item -Recurse -For', 'ce \\Windows'), 'deny');
+testBash('fp win del: delete verb as grep argument is not a delete', 'grep del -r C:/Windows/Logs', 'allow');
+testPosh('fp win del: -Include filter value is not a target', join('Remove-Item -Path .\\logs -Recurse -Inc', 'lude *.*'), 'fallthrough');
+testPosh('fp win del: -WhatIf dry run is not blocked', join('Remove-Item -Recurse -Force C:\\Windows -What', 'If'), 'fallthrough');
+testPosh('fp win del: other-drive Users profile is fine', join('Remove-Item -Recurse -For', 'ce D:\\Users\\niny0\\proj'), 'fallthrough');
+testPosh('fp win del: $env:SystemDrive subpath is fine', join('Remove-Item -Recurse -For', 'ce $env:SystemDrive\\work\\build'), 'fallthrough');
+{ const r = runHook(BASH_HOOK, { tool_name: 'PowerShell', tool_input: { command: join('Remove-Item -Recurse -For', 'ce C:\\Windows') } }, { USERPROFILE: 'C:\\', HOME: 'C:\\' }); check('win del: degenerate USERPROFILE=drive-root still denies system dir', r.decision, 'deny'); }
+// v0.9.0 review round 2 (Fable): critical braced-block FP (lone } as target), command-position
+// idioms, comma arrays, -Recurse:<n>, deep-home wildcard, filter-scoped *, registry root, C:relative.
+testPosh('fp win del: try/catch braced block is not a drive-root delete', join('try { Remove-Item -Recurse -For', 'ce .\\dist } catch { }'), 'fallthrough');
+testPosh('fp win del: foreach braced block is fine', join('foreach ($d in 1,2) { Remove-Item -Recurse -For', 'ce $d }'), 'fallthrough');
+testPosh('fp win del: deep home wildcard cleanup is fine', join('Remove-Item -Recurse -For', 'ce ~\\project\\dist\\*'), 'fallthrough');
+// Conservative-core accepted bypasses (a delete hidden in an assignment/splat or bound via a
+// comma-array PROMPTS rather than denies -- the `=`/comma parsing false-positived on `rsync
+// --exclude=rd` and `[ "$x" = del ]`, so it was dropped). Falls through, never a false deny.
+testPosh('win del: assigned ($null=) home wipe falls through (accepted bypass)', join('$null = Remove-Item -Recurse -For', 'ce $HOME'), 'fallthrough');
+testPosh('win del: glued if-block home wipe denies', join('if($true){Remove-Item -Recurse -For', 'ce $HOME}'), 'deny');
+testPosh('win del: ForEach-Object block home wipe denies (not auto-approved)', join('ForEach-Object { Remove-Item -Recurse -For', 'ce $HOME }'), 'deny');
+testPosh('win del: -Path comma array falls through (accepted bypass)', join('Remove-Item -Recurse -Force -Path .\\a,C:\\Win', 'dows'), 'fallthrough');
+testPosh('win del: -Recurse:2 numeric is still recursive', join('Remove-Item -Recurse:2 -For', 'ce C:\\Windows'), 'deny');
+testPosh('win del: HKLM registry hive root denies', join('Remove-Item -Recurse -For', 'ce HKLM:\\'), 'deny');
+testPosh('fp win del: deep HKLM registry path is not blocked', join('Remove-Item -Recurse -For', 'ce HKLM:\\SOFTWARE\\MyApp'), 'fallthrough');
+testPosh('win del: drive-relative C:Windows denies', join('Remove-Item -Recurse -For', 'ce C:Windows'), 'deny');
+testPosh('fp win del: filter-scoped wildcard is not a wildcard-all', join('Remove-Item * -Recurse -Inc', 'lude *.pyc'), 'fallthrough');
+testPosh('win del: Clear-Host still auto-approves', 'Clear-Host', 'allow');
+// v0.9.0 conservative core (user-chosen scope): keep the FP-safe deny of a plain recursive
+// delete of a system/home/drive/Users target at command position; drop the fragile PS-grammar
+// parsing that false-positived on routine code (rsync --exclude=rd, try/catch, D:\boot). Fixes
+// the pwsh -NoProfile recursion regression and the -WhatIf-in-else bypass.
+testBash('win del: pwsh switch flag before -Command still recurses (home wipe denies)', join('pwsh -NoProfile -Command "Remove-Item -Recurse -For', 'ce $HOME"'), 'deny');
+testPosh('fp win del: sibling catch-branch path is not a delete target', join('try { Remove-Item -Recurse -For', 'ce .\\dist } catch { Get-ChildItem C:\\Users\\Public }'), 'fallthrough');
+testBash('fp win del: rsync --exclude=rd option value is not a delete verb', 'rsync -a --exclude=rd -r ~ /mnt/backup', 'fallthrough');
+testPosh('fp win del: data-drive folder named boot is fine', join('Remove-Item -Recurse -For', 'ce D:\\boot\\myproj'), 'fallthrough');
+testPosh('fp win del: relative dir named hkcu is not a registry hive', join('Remove-Item -Recurse -For', 'ce hkcu'), 'fallthrough');
+testPosh('win del: -WhatIf in an else branch does not abort the deny', join('if ($true) { Remove-Item -Recurse -For', 'ce $HOME } else { Get-Date -WhatIf }'), 'deny');
+// v0.9.0 conservative core, round-4 review (Fable): a runtime-computed target must PROMPT, not
+// hard-deny -- a quoted $var subpath (bash tokenizer drops the \ before $), a Join-Path/$()
+// subexpression, and a folder named like a verb glued after $(). $Recycle.Bin stays a literal.
+testPosh('fp win del: quoted $var subpath under home falls through', 'Remove-Item "$env:USERPROFILE\\$dir" -Recurse -Force', 'fallthrough');
+testPosh('fp win del: Join-Path subexpression target falls through', 'Remove-Item (Join-Path $HOME build) -Recurse', 'fallthrough');
+testPosh('fp win del: folder named del glued after $() is not the verb', 'Copy-Item "$($env:TEMP)\\del" "C:\\Program Files\\App" -Recurse', 'fallthrough');
+testPosh('win del: literal C:\\$Recycle.Bin still denies', join('Remove-Item -Recurse -For', 'ce C:\\$Recycle.Bin'), 'deny');
+// v0.9.0 conservative core, round-5 review (Fable): fix #2 depth filter dropped a nested group
+// entirely, so a preceding -Path bound to the NEXT flag and `-Filter *` became a wildcard target
+// (FP). A group now occupies an inert placeholder slot. Fix #3 no longer skips a module-qualified
+// verb (`Module\\Remove-Item`) -- only a path glued after a CLOSED subexpr `$(...)`.
+testPosh('fp win del: -Path (Join-Path ...) group with -Filter * falls through', 'Remove-Item -Path (Join-Path $env:TEMP "myapp") -Filter * -Recurse -Force', 'fallthrough');
+testPosh('win del: module-qualified Remove-Item in a block still denies', join('if($true){Microsoft.PowerShell.Management\\Remove-Item -Recurse -For', 'ce $HOME}'), 'deny');
 
 // F7: id_rsa and friends in cat/tee heredoc targets are denied. The heredoc
 // validator rejects via isSafeRelativePath; the chain-flatten then hits the

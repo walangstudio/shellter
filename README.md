@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.8.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.9.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-925%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-984%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -290,7 +290,12 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.8.0 — closes a cross-segment variable-indirection
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.9.0 — extends destructive-delete protection to the
+Windows/PowerShell verbs (`Remove-Item` and its aliases `ri`/`del`/`erase`/`rd`/`rmdir`), so a
+recursive delete of a system directory at any depth (`C:\Windows\System32`, `C:\Program Files`),
+a drive root, the home root, or another user's profile now denies — while a cleanup under your own
+home or on another drive is left untouched; also stops `Clear-Content` auto-approving. Previously
+0.8.0 — closes a cross-segment variable-indirection
 bypass that auto-approved secret reads (`X=.env; cat $X`), adds a coverage gate so a command
 the engine could not fully analyze degrades to `ask` instead of falling through, and stops the
 manual installer granting blanket file-tool permissions. Previously 0.7.1 — two false-positive fixes: `git config <key>`
