@@ -7,6 +7,66 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.9.0] - 2026-09-25
+
+Windows delete verbs get the same destructive-target protection as `rm`.
+
+Until now `rm -rf` got a rich tokenized classifier (system dirs at any depth, home, `/root`,
+traversal), but the Windows/PowerShell delete verbs got two coarse regexes that only matched a
+drive root, `$HOME`, or a wildcard. A recursive `Remove-Item -Recurse -Force C:\Windows\System32`
+or `"C:\Program Files"` fell straight through, and the old regexes also false-positived on a
+`$env:USERPROFILE\subdir` cleanup (the variable name matched anywhere in the argument).
+
+`Remove-Item` and its aliases (`ri`, `del`, `erase`, `rd`, `rmdir`) now go through a tokenized
+`winDeleteTargetDanger` classifier. A **recursive** delete (`-Recurse`, its abbreviations down to
+`-r`, `-Recurse:<n>`, or cmd `/s`; `-WhatIf` and `-Recurse:$false` are the no-ops they look like)
+denies when the target is a system directory at any depth (`C:\Windows`, `C:\Program Files[ (x86)]`,
+`C:\ProgramData`, `System32`/`SysWOW64`, `Boot`, …), a drive root, the home root (`~`, `$HOME`,
+`$env:USERPROFILE`), the `C:\Users` container, another user's profile, or a registry hive root
+(`HKLM:\`). The target is canonicalized (`path.win32.normalize`) so nothing hides a system dir
+behind a `-Recurse:$true` colon-param, forward slashes, a trailing dot/space, a `\\?\`/`FileSystem::`
+prefix, a `PROGRA~1` 8.3 name, a `${env:X}` brace, an en-dash flag, a loopback `\\localhost\C$\…`
+share, or a `.`/`..` ancestor-escape (`C:\tmp\..\Windows`).
+
+**False-positive-safe is the priority.** A path **under your own home** (`~\project\dist\*`,
+`$env:USERPROFILE\.cache\app`, `C:\Users\you\build`), a project directory on another drive
+(`D:\work`, `D:\boot\myproj`), a single-file delete, an `-Include`/`-Filter`-scoped `*`, and a
+braced block whose delete targets something safe (`try { Remove-Item .\dist } catch { … }`) all
+fall through to a prompt, never a hard deny. The verb counts only at command position (stage start,
+a `{`/`(` block open, or after `&`/`.`), and its arguments are read only within its own block, so a
+sibling `catch`/`else` branch's paths are not scanned and `grep del -r dir` / `rsync --exclude=rd`
+are not mistaken for deletes. A lone `}`/`)` token, a relative dir named `hkcu`, and a degenerate
+`USERPROFILE=C:\` home cannot trigger a deny. `powershell -NoProfile -Command "…"` now recurses into
+the inner command (a switch flag before `-Command` used to break the match).
+
+**Scope (deliberately conservative, after review).** This covers a delete written as a normal
+command. It does **not** try to catch a delete hidden in an assignment/splat (`$null = Remove-Item …`,
+`@args`), a comma-array `-Path a,b`, a here-string, or a double-quoted path ending in `\` — those
+prompt rather than deny (a bypass, never a false deny), because parsing them robustly false-positived
+on routine PowerShell. The PowerShell **approve** path still auto-approves a delete piped from or
+wrapped in a read-only cmdlet (`Get-ChildItem C:\x | Remove-Item -Recurse`, `ForEach-Object { … }`),
+and the `rm` alias on a Windows target and git-bash `/c/…` mounts are still uncovered — all deferred
+to a follow-up that reworks the PS approve path.
+
+Also: `Clear-Content` / `Clear-Item` / `Clear-RecycleBin` no longer auto-approve. The screen-clear
+alias `clear` in the approve list matched `Clear-<Noun>` cmdlets (the `-` was a word boundary), so
+truncating a file auto-approved with no prompt; bare `clear` / `cls` / `Clear-Host` still approve.
+
+A target that is computed at runtime is never hard-denied. When the variable sits **directly under**
+a catastrophic root (`"$HOME\$sub"`, `"C:\Windows\$x"`, a `Get-ChildItem $HOME | ForEach-Object {
+… "$HOME\$_" }` loop) it could expand to the root itself, so the delete is **asked** — never an
+unappealable deny, and never the silent auto-approve that falling through would hand to the approve
+pass. A positional `(Join-Path $HOME $_)` resolves to `$HOME\$_` and gets the same ask. Deeper
+computed paths (`"$HOME\proj\$x"`), other `Join-Path`/`$()` subexpression arguments, and a
+folder named like a verb glued after `$()` fall through (`$Recycle.Bin` stays a literal system dir).
+
+PowerShell on macOS/Linux (`pwsh`) gets the same protection: a leading-`/` target goes through the
+bash `rm` classifier, so `Remove-Item -Recurse -Force /System/Library`, `/etc`, `/Users/<other>`
+and the home root deny, while your own `/Users/<you>/…` cleanups fall through. CI now also runs on
+`macos-latest`.
+
+999 tests.
+
 ## [0.8.0] - 2026-09-07
 
 A live bypass, a fail-open floor, and an installer that was handing out the permissions the

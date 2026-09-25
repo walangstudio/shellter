@@ -316,6 +316,240 @@ function rmDanger(seg) {
   return null;
 }
 
+// --- Windows / PowerShell destructive-delete danger ---------------------------------------
+// The bash rm path (rmDanger/rmTargetDanger) is Unix-path-oriented -- RM_SYSTEM_PREFIX only
+// matches leading-slash paths, so a Windows target (`C:\Windows`) never matches it. The PS
+// delete verbs (Remove-Item and its aliases ri/del/erase/rd/rmdir) therefore need their own
+// classifier. Mirrors rmTargetDanger: deny a catastrophic LITERAL target (system dir at any
+// depth, drive root, the home root, the Users container, another user's profile), while carving
+// out the user's OWN home subtree so a routine cleanup (`Remove-Item -Recurse ~\project`) is
+// NEVER blocked. FP-safe by construction: it only classifies system-shaped targets, so a project
+// dir on any drive, or a path under the user's home, returns null (falls through to a prompt).
+// Drive part is `C:` or absent (a bare `\Windows` = current-drive system) -- NOT any drive, so a
+// data-drive folder that happens to be named `D:\boot\myproj` or `E:\Windows\...` is not flagged.
+const WIN_SYSTEM_RE = /^(?:c:)?\\(?:windows|winnt|program files(?: \(x86\))?|progra~\d|programdata|system32|syswow64|boot|recovery|\$recycle\.bin|perflogs|config\.msi)(?:\\|$)/i;
+
+// Canonicalize a delete TARGET to a comparable Windows path so nothing can hide a system dir
+// behind quoting, backticks, a `{`/`(` block wrapper, a `\\?\`/`\\.\`/provider prefix, an env
+// var, a mixed slash, a trailing dot/space (Windows ignores them), or a `.`/`..` ancestor-escape.
+// Returns a backslash path with no trailing separator.
+function winCanon(raw, home) {
+  let t = String(raw).replace(/^['"]|['"]$/g, '').replace(/`/g, '');   // quotes + PS backtick escapes
+  t = t.replace(/^\$\{(env:)?([^}]+)\}/i, (_m, a, b) => '$' + (a || '') + b); // ${env:X} -> $env:X (before the } strip)
+  t = t.replace(/^[{(]+/, '').replace(/}+$/, '');                        // block/group wrappers
+  if (/\)$/.test(t) && t.indexOf('(') === -1) t = t.replace(/\)+$/, ''); // unbalanced trailing ) (keep `(x86)`)
+  t = t.replace(/^(?:[\w.]+\\)?FileSystem::/i, '');                      // provider qualifier (before the prefix)
+  t = t.replace(/^\\{1,2}[.?]\\(?:UNC\\)?/i, '');                        // \\?\  \\.\  \\?\UNC\
+  t = t.replace(/^\\{1,2}(?:localhost|127\.0\.0\.1|\.)\\([A-Za-z])\$(?=\\|$)/i, '$1:'); // loopback admin share -> X:
+  if (home) {
+    t = t.replace(/^~(?=[\\/]|$)/, home)
+         .replace(/^\$env:USERPROFILE\b/i, home)
+         .replace(/^\$env:HOMEPATH\b/i, home)
+         .replace(/^\$HOME\b/i, home);
+  }
+  t = t.replace(/^\$env:SystemRoot\b/i, 'C:\\Windows')
+       .replace(/^\$env:windir\b/i, 'C:\\Windows')
+       .replace(/^\$env:ProgramFiles\(x86\)/i, 'C:\\Program Files (x86)')
+       .replace(/^\$env:ProgramW6432\b/i, 'C:\\Program Files')
+       .replace(/^\$env:ProgramFiles\b/i, 'C:\\Program Files')
+       .replace(/^\$env:CommonProgramFiles\b/i, 'C:\\Program Files\\Common Files')
+       .replace(/^\$env:ProgramData\b/i, 'C:\\ProgramData')
+       .replace(/^\$env:ALLUSERSPROFILE\b/i, 'C:\\ProgramData')
+       .replace(/^\$env:(?:SystemDrive|HOMEDRIVE)\b/i, 'C:');
+  t = t.replace(/\//g, '\\');                          // forward -> back slash
+  t = t.replace(/^([A-Za-z]:)(?=[^\\])/, '$1\\');      // drive-relative `C:Windows` -> `C:\Windows`
+  t = t.replace(/([^\\.\s])[. ]+(?=\\|$)/g, '$1');     // trailing dots/spaces per component (never a `..` segment)
+  if (t.indexOf('\\') !== -1) { try { t = path.win32.normalize(t); } catch (_) { /* keep raw */ } }
+  return t.replace(/\\+$/, '') || t;                   // drop trailing sep for comparison
+}
+
+// Classify one delete target. Deny a catastrophic LITERAL target (drive root, home root or
+// home-wildcard, the Users container, another user's profile, a system dir at any depth); carve
+// out the user's OWN home subtree so a routine cleanup is NEVER blocked. FP-safe: a project dir
+// on any drive, or a single named path under home, returns null (falls through to a prompt).
+function winDeleteTargetDanger(raw, home, hasFilter) {
+  if (!raw) return null;
+  const r0 = String(raw).replace(/^['"]|['"]$/g, '');
+  if (r0 === '*' || r0 === '*.*') return hasFilter ? null : 'wildcard';   // an -Include/-Filter scopes `*`
+  // PowerShell also runs on macOS/Linux (`pwsh`), where the target is a Unix path. Reuse the bash rm
+  // classifier for a leading-`/` target (system dirs incl. /System /Library /Applications /Users /etc,
+  // the fs root, `..` traversal, with the own-home carve-out). Additive: only a reason it returns
+  // can deny; anything it passes still goes through the Windows checks below.
+  // LITERAL targets only: shellter expands `$HOME` to its real value in one match variant, and on a
+  // Unix host that yields `/home/me$_` -- still computed (`$_`), so it belongs to the ask tier, not a
+  // hard deny (a Mac `"$HOME\$dir"` cleanup would otherwise be unappealable).
+  // On Windows pwsh a drive-less `/Users/<me>/proj` IS the user's own home subtree, but rmTargetDanger's
+  // carve-out compares it to `c:/users/<me>` and misses. Skip the passthrough for a path strictly
+  // under home (drive stripped, no `..`); the home root itself still goes through and denies.
+  const homeU = home ? '/' + home.replace(/^[A-Za-z]:/, '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') : '';
+  const underOwnHome = homeU.length > 1 && !/(?:^|\/)\.\.(?:\/|$)/.test(r0) &&
+    r0.replace(/\/+$/, '').toLowerCase().startsWith(homeU.toLowerCase() + '/');
+  if (/^\/(?!\/)/.test(r0) && r0.indexOf('$') === -1 && !underOwnHome) { const u = rmTargetDanger(r0); if (u) return u; }
+  // Registry hive ROOT via Remove-Item -- the `:` is REQUIRED (a relative dir named `hkcu` is not a
+  // hive). Deep hive paths (`HKLM:\SOFTWARE\App`) are dual-use, left to a prompt.
+  if (/^(?:HK(?:LM|CU|CR|U|CC)):\\*$/i.test(r0)) return 'registry hive';
+  const t = winCanon(raw, home);
+  if (!t) return null;                                                    // lone `}`/`)` canonicalizes to '' -- not a target
+  // A `$var` still in the canonical path means the target is computed at runtime and unknowable, so
+  // PROMPT, never hard-deny -- this also catches a bash-tokenized `"$HOME\$sub"` (the `\$` collapses
+  // to `$` and drops the separator). `$Recycle.Bin` is a literal system dir, not a variable.
+  if (/\$(?!recycle\.bin(?:\\|$))/i.test(t)) return null;
+  if (t === '*' || t === '*.*') return hasFilter ? null : 'wildcard';    // `.\*` normalizes to `*`
+  if (/^(?:[A-Za-z]:\\*|\\+)$/.test(t)) return 'drive root';             // C:  C:\  \   (never matches '')
+  if (/^(?:[A-Za-z]:\\*|\\+)\*(?:\.\*)?$/.test(t)) return 'drive root';   // C:\*  \*  C:*  (a bare `*` does NOT match)
+  const tl = t.toLowerCase();
+  if (home) {
+    const hc = winCanon(home, '').toLowerCase();
+    // A degenerate home that canonicalizes to a bare drive (`c:`) or empty must NOT anchor a
+    // carve-out (it would swallow the whole drive -- the rmTargetDanger HOME=/ lesson again).
+    if (hc && !/^[a-z]:$/.test(hc)) {
+      if (tl === hc || tl === hc + '\\*') return 'home directory';        // the home ROOT itself / its whole contents
+      if (tl.startsWith(hc + '\\')) return null;                          // any deeper path (incl. a deep `\*`) is a cleanup
+    }
+  }
+  // The Users container / another user's profile. Static `C:\Users` so it does not depend on the
+  // running user's home shape -- a home-derived check fell through on a `/home/runner` (Linux CI) or
+  // degenerate home. The own-home carve-out above already returned for the current user.
+  if (/^c:\\users(?:\\|$)/i.test(t)) return 'user profiles directory';
+  if (WIN_SYSTEM_RE.test(t)) return 'system directory';
+  return null;
+}
+
+// Shared parser for the Windows delete predicates below (both run on both tools). Finds a RECURSIVE
+// delete (PS -Recurse and abbrevs / cmd /s, and NOT -WhatIf) via a delete verb AT COMMAND POSITION --
+// Remove-Item and its aliases ri/del/erase/rd/rmdir (NOT `rm`, handled by rmDanger) -- and returns the
+// first non-null `classify(target, home, hasFilter)`. A single-file delete cannot wipe a tree, so it
+// is left to a normal prompt to keep the FP surface minimal.
+function winDeleteScan(seg, classify) {
+  const home = safeHomedir();
+  for (const stage of splitPipeStages(seg)) {
+    const toks = tokenizeArgs(stage);
+    for (let i = 0; i < toks.length; i++) {
+      const rawTok = toks[i];
+      // Conservative command-position: the verb bare at stage start, glued after a block/group open
+      // (`if($x){Remove-Item`, `(Remove-Item`), after a call operator (`&`/`.`), or after a spaced
+      // `{` (`ForEach-Object { Remove-Item`). Deliberately NOT `=` / `@` / a quoted operator, which
+      // false-positived on `rsync --exclude=rd`, `[ "$x" = del ]`, and splat/assignment idioms --
+      // those are accepted BYPASSES (a delete hidden in an assignment/splat prompts, never denies).
+      const cmdWord = (rawTok.match(/[{(]([^{(]*)$/) || [null, rawTok])[1];
+      if (cmdWord !== rawTok && /[)}]/.test(cmdWord)) continue;   // glued after a CLOSED subexpr (`$($env:TEMP)\del`) it's a path, not a verb -- but a module qualifier (`Module\Remove-Item`) still counts
+      const name = cmdWord.replace(/^['"]/, '').replace(/`/g, '').replace(/^.*[\\/]/, '').toLowerCase();
+      if (!/^(?:remove-item|ri|del|erase|rd|rmdir)$/.test(name)) continue;
+      const prev = i > 0 ? toks[i - 1] : '';
+      const atCmd = i === 0 || /[{(]/.test(rawTok) || prev === '&' || prev === '.' || /\{$/.test(prev);
+      if (!atCmd) continue;
+      // Collect arguments ONLY within the verb's own command -- stop at the `}`/`)` that closes its
+      // enclosing block (so a sibling `catch { ... }` / `else { ... }` path is not read as a target),
+      // at a `;`, and at an else/catch/finally keyword. Balanced parens (`(x86)`) stay intact.
+      const rest = [];
+      let depth = 0;
+      let grp = null;                                  // tokens of the depth-0 group being collected
+      // The one group we can resolve: positional `(Join-Path A B)` / `$(Join-Path A B)` is `A\B`.
+      // Treating it as inert let `ForEach { Remove-Item … (Join-Path $HOME $_) }` -- the Join-Path
+      // spelling of the "$HOME\$_" home wipe -- fall to the approve pass and auto-approve. Resolved,
+      // it reaches the same ask tier; `(Join-Path $HOME build)` is a literal own-home path (falls
+      // through). Named `-Path`/`-ChildPath` stays inert (documented bypass).
+      const resolveGrp = () => {
+        const g = grp.toks.map((x) => x.replace(/^\$?\(/, '').replace(/[)}]+$/, ''));
+        if (g.length === 3 && /^join-path$/i.test(g[0]) && g[1] && g[2] && g[1][0] !== '-' && g[2][0] !== '-') {
+          rest[grp.at] = g[1].replace(/^['"]|['"]$/g, '') + '\\' + g[2].replace(/^['"]|['"]$/g, '');
+        }
+        grp = null;
+      };
+      for (let k = i + 1; k < toks.length; k++) {
+        const tk = toks[k];
+        const opens = (tk.match(/[{(]/g) || []).length;
+        const closes = (tk.match(/[}\)]/g) || []).length;
+        if (depth + opens - closes < 0) {
+          // The verb's block closes here. If a group is still open, this token also closes it
+          // (`$_)}` -- group `)` and block `}` glued): feed it to the group and resolve first.
+          const pre = tk.split(/[}\)]/)[0];
+          if (grp) { if (pre) grp.toks.push(pre); resolveGrp(); } else if (pre) rest.push(pre);
+          break;
+        }
+        if (tk === ';') break;
+        if (depth === 0 && /^(?:else|elseif|catch|finally)$/i.test(tk)) break;
+        const d0 = depth;
+        depth += opens - closes;
+        // A top-level token is an arg; a nested `(Join-Path $HOME x)` is not, but it still occupies ONE
+        // positional/flag-value slot -- push an inert '' placeholder for it so a preceding `-Path` binds
+        // to the group (empty = safe), not to the NEXT flag (which made `-Filter *` a wildcard target).
+        if (d0 === 0) {
+          rest.push(depth === 0 ? tk : '');
+          if (depth > 0) grp = { at: rest.length - 1, toks: [tk] };
+        } else if (grp) {
+          grp.toks.push(tk);
+        }
+        if (grp && d0 > 0 && depth === 0) resolveGrp();
+      }
+      let recursive = false, whatif = false, hasFilter = false;
+      const targets = [];
+      for (let j = 0; j < rest.length; j++) {
+        let a = rest[j];
+        if (!a) continue;
+        if (/^[‒-―]/.test(a)) a = '-' + a.replace(/^[‒-―]+/, ''); // en/em dash -> -
+        if (a[0] === '-') {
+          if (/^-whatif$/i.test(a)) { whatif = true; continue; }
+          if (/^-(?:recurse|recurs|recur|recu|rec|re|r):(?:\$?false|0)$/i.test(a)) continue;   // -Recurse:$false = not recursive
+          if (/^-(?:recurse|recurs|recur|recu|rec|re|r)(?::.*)?$/i.test(a)) { recursive = true; continue; } // any other -Recurse[:val]
+          const m = a.match(/^-(?:literalpath|lp|path)[:=](.+)$/i);
+          if (m) { targets.push(m[1]); continue; }                          // -Path:VALUE
+          if (/^-(?:literalpath|lp|path)$/i.test(a)) { if (j + 1 < rest.length) targets.push(rest[++j]); continue; }
+          if (/^-(?:include|exclude|filter)(?:[:=]|$)/i.test(a)) { hasFilter = true; if (!/[:=]/.test(a) && j + 1 < rest.length) j++; continue; } // scopes `*`; value not a target
+          if (/^-(?:stream|credential)(?:[:=]|$)/i.test(a)) { if (!/[:=]/.test(a) && j + 1 < rest.length) j++; continue; } // value not a target
+          continue;                                                          // any other flag
+        }
+        if (/^\/[A-Za-z]$/.test(a)) { if (/^\/s$/i.test(a)) recursive = true; continue; } // cmd /flag
+        targets.push(a);                                                     // positional target (no comma-split -- a quoted `x,y` path is one target)
+      }
+      if (whatif || !recursive) continue;
+      for (const tg of targets) {
+        const r = classify(tg, home, hasFilter);
+        if (r) return r;
+      }
+    }
+  }
+  return null;
+}
+
+// Hard deny: a literal catastrophic target.
+function winDeleteDanger(seg) {
+  return winDeleteScan(seg, (tg, home, hasFilter) => {
+    const r = winDeleteTargetDanger(tg, home, hasFilter);
+    return r ? 'Destructive Windows/PowerShell delete (' + r + ') blocked' : null;
+  });
+}
+
+// A computed target (`"$HOME\$sub"`, a `ForEach { … "$HOME\$_" }` item) is unknowable, so the deny
+// classifier lets it fall through -- but when the variable sits DIRECTLY under a catastrophic root
+// it can expand to that root itself (an empty `$sub` wipes the whole home). Hard-denying it
+// false-positived on routine `"$HOME\$dir"` cleanups, and falling through let the approve pass
+// auto-approve a `Get-ChildItem $HOME | ForEach-Object { … "$HOME\$_" }` home wipe that the old
+// rule denied. ASK: never an unappealable deny, never a silent allow.
+function winComputedRootTarget(raw, home) {
+  const t = winCanon(raw, home);
+  if (!t) return null;
+  const at = t.search(/\$(?!recycle\.bin(?:\\|$))/i);
+  if (at < 0) return null;
+  const preRaw = t.slice(0, at);
+  const pre = preRaw.replace(/\\+$/, '').toLowerCase();
+  if (/^[a-z]:$/.test(pre) || (pre === '' && preRaw.startsWith('\\'))) return 'a drive root';
+  if (home) {
+    const hc = winCanon(home, '').toLowerCase();
+    if (hc && !/^[a-z]:$/.test(hc) && pre === hc) return 'the home directory';
+  }
+  if (/^c:\\users$/.test(pre)) return 'the Users folder';
+  if (pre && WIN_SYSTEM_RE.test(pre)) return 'a system directory';
+  return null;
+}
+
+function winDeleteAskDanger(seg) {
+  return winDeleteScan(seg, (tg, home) => {
+    const r = winComputedRootTarget(tg, home);
+    return r ? 'Recursive delete of a computed path directly under ' + r + ' -- an empty variable would remove all of it; confirm the target' : null;
+  });
+}
+
 function splitChainSegments(cmd) {
   const len = cmd.length;
   let i = 0;
@@ -697,7 +931,7 @@ function splitPoshSegments(cmd) {
 // from inside another shell command.
 function parsePoshInvocation(segment) {
   const m = segment.match(
-    /^\s*(?:[^\s]*[\\/])?(?:powershell(?:\.exe)?|pwsh(?:\.exe)?)\s+(?:-[A-Za-z]+\s+(?!-)\S+\s+)*-(?:c|command)\b\s+(.+)$/i
+    /^\s*(?:[^\s]*[\\/])?(?:powershell(?:\.exe)?|pwsh(?:\.exe)?)\s+(?:-[A-Za-z]+(?:\s+(?!-)\S+)?\s+)*-(?:c|command)\b\s+(.+)$/i
   );
   if (!m) return null;
   const arg = m[1].trim();
@@ -1630,11 +1864,14 @@ const DENY_PATTERNS = [
 // PS flags) so they do not match ordinary bash commands and are safe to run on
 // both tools.
 const POSH_DENY_PATTERNS = [
-  // Destructive recursive/forced removal of home / drive root / wildcard.
-  [/\b(Remove-Item|ri|rmdir|rd|del|erase)\b[^;|]*-(?:Recurse|rec)\b[^;|]*-(?:Force|for)\b[^;|]*(\$HOME|\$env:USERPROFILE|\$env:SystemRoot|[A-Za-z]:\\?(\s|$|\*)|\*)/i,
-    'Destructive PowerShell removal of home/root/wildcard blocked'],
-  [/\b(Remove-Item|ri)\b[^;|]*-(?:Force|for)\b[^;|]*-(?:Recurse|rec)\b[^;|]*(\$HOME|\$env:USERPROFILE|[A-Za-z]:\\?(\s|$|\*)|\*)/i,
-    'Destructive PowerShell removal of home/root/wildcard blocked'],
+  // Destructive recursive delete of a system dir (any depth), drive root, home root, the Users
+  // container or another user's profile -- via Remove-Item and its aliases (ri/del/erase/rd/rmdir).
+  // Tokenized so a path UNDER the user's own home, or a project dir on any drive, is NOT blocked
+  // (flag-order-independent, quote-aware, no substring false-positive). Supersedes the two coarse
+  // regexes this replaced, which only caught the drive root / bare home and false-positived on a
+  // `$env:USERPROFILE\subdir` cleanup.
+  [winDeleteDanger, null],
+  [winDeleteAskDanger, null, 'ask'],
   // Invoke-Expression of dynamic/downloaded content. The `iex` arm excludes a bare
   // quote (`iex "..."`) so it does not fire on Elixir's `iex "code"` REPL on the Bash
   // tool; the real PS shapes are `iex(`, `iex $var`, `... | iex`, and full `Invoke-Expression`.
@@ -1840,7 +2077,9 @@ const POSH_APPROVE_PATTERNS = [
   // Read-only verb-noun cmdlets.
   /^\s*(Get|Select|Where|ForEach|Sort|Measure|Format|Compare|Group|Out|Write|Resolve|Split|Join|Test|ConvertTo|ConvertFrom)-[A-Za-z]+\b/i,
   // Canonical read-only aliases.
-  /^\s*(gci|gc|gci|ls|dir|cat|type|pwd|gl|gi|gm|gps|gsv|select|where|sort|measure|echo|cls|clear|fl|ft|fw|sls)\b/i,
+  // `clear(?!-)` keeps the bare screen-clear alias but stops matching `Clear-Content`/`Clear-Item`/
+  // `Clear-RecycleBin` etc. (the `-` was a word boundary), which truncate/erase and must not auto-approve.
+  /^\s*(gci|gc|ls|dir|cat|type|pwd|gl|gi|gm|gps|gsv|select|where|sort|measure|echo|cls|clear(?:-host)?(?!-)|fl|ft|fw|sls)\b/i,
   // Navigation / harmless builtins.
   /^\s*(cd|Set-Location|Push-Location|Pop-Location)\b/i,
   // Version / environment introspection.
