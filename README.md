@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.9.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.10.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-999%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-1037%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -182,6 +182,20 @@ $env:CLAUDE_HOOK_LOG = "$env:TEMP\hook.log"; claude
 
 Forward slashes work on Windows (Node normalizes them).
 
+## Bypass mode, auto mode, and the git workflow guards
+
+In `bypassPermissions` (`--dangerously-skip-permissions`) and `auto` mode, shellter never asks. You
+opted out of prompts there, so an `ask` passes through: bypass runs it, and auto hands it to its own
+classifier instead of the unconditional allow a hook `ask` would get. Every `deny` still blocks in
+every mode. `default`, `acceptEdits` and `plan` still ask.
+
+In those prompting modes, most asks are the git workflow guards: push to `main`/default, force push,
+`reset --hard`, `clean -f`, `checkout --`, `update-ref -d`, `filter-branch`/`filter-repo`. To run
+those unprompted, set `SHELLTER_GIT_GUARDS=off` (also `0`/`false`/`no`), e.g. in the `env` block of
+`~/.claude/settings.json`. It covers only those git asks: security denies (`git config` hooks and
+credential helpers) and every non-git ask (`sudo`, SQL `DROP`) are unaffected. A project's
+`.claude/settings.json` can set `env` too, so a cloned repo could turn these asks off.
+
 ## Custom patterns
 
 - Deny / ask: add `[/regex/i, 'reason']` (hard deny) or `[/regex/i, 'reason', 'ask']` (surface for approval) to `DENY_PATTERNS` in `check-bash.js`. A matcher may also be a predicate function returning a reason string (see `rmDanger`)
@@ -290,7 +304,11 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.9.0 — extends destructive-delete protection to the
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.10.0 - never asks in bypass or auto mode
+(denies still block), stops false "could not fully analyze" prompts on heredocs, nested `$( … )`
+quoting (found in real sessions), analyzes Python fed through a heredoc, narrows the
+data-file polyglot rule from a hard deny to an ask on remote fetches only, and adds the
+`SHELLTER_GIT_GUARDS=off` opt-out. Previously 0.9.0 - extends destructive-delete protection to the
 Windows/PowerShell verbs (`Remove-Item` and its aliases `ri`/`del`/`erase`/`rd`/`rmdir`), so a
 recursive delete of a system directory at any depth (`C:\Windows\System32`, `C:\Program Files`),
 a drive root, the home root, or another user's profile now denies — while a cleanup under your own

@@ -46,6 +46,26 @@ function deny(reason, snippet) {
   process.exit(0);
 }
 
+// A dual-use content signal (legitimate in docs/CI, suspicious in a config an agent fabricates)
+// surfaces for approval instead of hard-denying -- a wrong deny cannot be overridden in-session.
+// In bypassPermissions and auto mode the user has opted out of prompts, and a hook `ask` there
+// is either a prompt they did not want or (auto) an unconditional allow that skips the classifier.
+// Pass through instead: bypass runs it, auto lets its classifier judge. Denies are unaffected.
+let quietAsk = false;
+function ask(reason, snippet) {
+  if (quietAsk) { audit('fallthrough', 'ask suppressed (bypass/auto mode): ' + reason, snippet); process.exit(0); }
+  audit('ask', reason, snippet);
+  const output = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'ask',
+      permissionDecisionReason: reason + ' -- approve only if you intended it',
+    },
+  });
+  process.stdout.write(output + '\n');
+  process.exit(0);
+}
+
 // Resolve symlinks for the deepest existing ancestor and re-append the
 // missing tail. Avoids `ln -s ~/.env /tmp/x; Read /tmp/x` bypass.
 function safeRealpath(p) {
@@ -113,7 +133,12 @@ const ANSI_TARGET_EXTENSIONS = /\.(js|ts|jsx|tsx|py|rs|go|md|txt|json|yaml|yml|h
 
 // Polyglot: shell command substitution in data files (NOT markdown).
 const POLYGLOT_EXTENSIONS = /\.(json|yaml|yml|xml|csv|txt|toml|ini|cfg|conf)(\.(bak|old|backup|orig|tmp|swp|save))?$/i;
-const POLYGLOT_PATTERN = /(\$\(|`)\s*(curl|wget|bash|sh|nc|python|perl|ruby)\b/i;
+// A remote fetch inside a command substitution (`$(curl …)`, `` `wget …` ``) in a data/config file
+// is the polyglot / supply-chain shape. It used to also match any interpreter name (bash/sh/python/
+// perl/ruby) and HARD-deny, which blocked a .txt note mentioning `python -c` in inline-code backticks
+// and a CI .yml `run:` step using `$(python …)`. Interpreter mentions are routine; running them is
+// gated by the Bash hook anyway. Only the fetch shape is flagged, and it ASKS (CI installers do this).
+const POLYGLOT_PATTERN = /(\$\(|`)\s*(?:env\s+)?(?:[\w.~\\/-]{0,128}[\\/])?(curl|wget|nc|iwr|Invoke-WebRequest|Invoke-RestMethod)\b/i;
 
 // Sensitive paths (extension-based, dir-based, env-style, secrets dirs).
 // Backup suffixes (.bak, .old, .backup, .orig, .swp, .save) are matched too.
@@ -184,6 +209,7 @@ function pathMatchesAnySensitive(p) {
 }
 
 let data = '';
+let pendingAsk = null;   // a dual-use content signal, emitted only after every deny check
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { data += chunk; });
 process.stdin.on('end', () => {
@@ -193,6 +219,7 @@ process.stdin.on('end', () => {
   } catch {
     process.exit(0);
   }
+  quietAsk = /^(?:bypassPermissions|auto)$/.test(input && input.permission_mode);
 
   const tool = input?.tool_name || '';
 
@@ -252,8 +279,10 @@ process.stdin.on('end', () => {
         deny('ANSI escape sequence in source file blocked', filePath);
       }
 
+      // Deferred: an ask must never pre-empt a deny, so this is emitted only after every deny
+      // check below (injection scan, sensitive-path match) has had its say.
       if (POLYGLOT_EXTENSIONS.test(filePath) && POLYGLOT_PATTERN.test(flat)) {
-        deny('Shell command substitution in data file blocked', filePath);
+        pendingAsk = pendingAsk || { reason: 'Remote fetch inside a command substitution in a data/config file', snippet: filePath };
       }
 
       // Disciplined injection scan (variation-selector smuggling, homoglyph, role
@@ -313,7 +342,7 @@ process.stdin.on('end', () => {
     }
   }
 
-  if (!filePath) process.exit(0);
+  if (!filePath) { if (pendingAsk) ask(pendingAsk.reason, pendingAsk.snippet); process.exit(0); }
 
   // Check the path as given AND its symlink-resolved form.
   const resolved = safeRealpath(filePath);
@@ -329,6 +358,7 @@ process.stdin.on('end', () => {
     }
   }
 
+  if (pendingAsk) ask(pendingAsk.reason, pendingAsk.snippet);
   audit('fallthrough', '', filePath);
   process.exit(0);
 });
