@@ -1004,6 +1004,7 @@ function approve(snippet) {
 const SCRIPT_RISK_DECISION = 'ask';
 
 function flagRisk(reason, snippet) {
+  if (quietAsk && SCRIPT_RISK_DECISION === 'ask') { audit('fallthrough', 'ask suppressed (bypass/auto mode): ' + reason, snippet); process.exit(0); }
   audit(SCRIPT_RISK_DECISION, reason, snippet);
   const output = JSON.stringify({
     hookSpecificOutput: {
@@ -1024,7 +1025,12 @@ const ASK_NOTICE =
   ' | shellter flagged this for your approval -- it can lose data or run with elevated/remote ' +
   'access. Approve only if you intended it. If you do NOT approve, do not work around it -- ask the user.';
 
+// In bypassPermissions and auto mode the user has opted out of prompts, and a hook `ask` there
+// is either a prompt they did not want or (auto) an unconditional allow that skips the classifier.
+// Pass through instead: bypass runs it, auto lets its classifier judge. Denies are unaffected.
+let quietAsk = false;
 function ask(reason, snippet) {
+  if (quietAsk) { audit('fallthrough', 'ask suppressed (bypass/auto mode): ' + reason, snippet); process.exit(0); }
   audit('ask', reason, snippet);
   const output = JSON.stringify({
     hookSpecificOutput: {
@@ -1130,6 +1136,12 @@ const NO_NAMES = new Set();
 // Record the gap instead and, after every deny pass has had its say, degrade to
 // `ask` rather than letting the approve pass launder it into an auto-approval.
 const coverageGaps = [];
+
+// Opt-out for the git WORKFLOW guards only (push to main/default, force push, reset --hard,
+// clean -f, checkout --, update-ref -d, filter-branch/filter-repo -- the rules tagged 'git').
+// `SHELLTER_GIT_GUARDS=off` lets a user who runs in bypass mode keep those unprompted. It never
+// touches a hard deny (e.g. git config hooksPath/credential.helper) or any non-git ask.
+const GIT_GUARDS_OFF = /^(?:off|0|false|no)$/i.test(String(process.env.SHELLTER_GIT_GUARDS || '').trim());
 function noteGap(kind) {
   if (coverageGaps.length < 8 && !coverageGaps.includes(kind)) coverageGaps.push(kind);
 }
@@ -1161,10 +1173,17 @@ const PS_VAR_AT = new RegExp(
 // exists to close. One apostrophe was enough.
 const VAR_AT = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}|^\$([A-Za-z_][A-Za-z0-9_]*)/;
 
-function expandVars(s, env, isPosh) {
+function expandVars(s, env, isPosh, onGap) {
   const at = isPosh ? PS_VAR_AT : VAR_AT;
   let out = '';
   let q = null;
+  // A `$(` inside a "…" string opens a fresh quoting context (bash and PowerShell both nest
+  // quotes inside a command substitution: `"$p: $(grep "^ '?x")"`). Tracking a single `q` closed
+  // the outer string at the inner `"`, so the rest read as an unterminated quote -> a false
+  // `quote-parse` gap -> ask on an ordinary pnpm/grep loop. Save the state per `$(`, restore it at
+  // the matching `)`; `depth` counts unquoted parens inside the innermost such substitution.
+  const stack = [];
+  let depth = 0;
   let i = 0;
   while (i < s.length) {
     const c = s[i];
@@ -1184,7 +1203,15 @@ function expandVars(s, env, isPosh) {
       const esc = isPosh ? '`' : '\\';
       if (c === esc && i + 1 < s.length) { out += c + s[i + 1]; i += 2; continue; }
       if (c === '"') { out += c; q = null; i++; continue; }
+      if (c === '$' && s[i + 1] === '(') { stack.push({ q, depth }); q = null; depth = 0; out += '$('; i += 2; continue; }
     } else if (c === "'" || c === '"') { out += c; q = c; i++; continue; }
+    if (q === null && stack.length) {
+      if (c === '(') depth++;
+      else if (c === ')') {
+        if (depth > 0) depth--;
+        else { const f = stack.pop(); q = f.q; depth = f.depth; out += c; i++; continue; }
+      }
+    }
     if (c === '$') {
       const rest = s.slice(i);
       const m = at.exec(rest);
@@ -1200,8 +1227,121 @@ function expandVars(s, env, isPosh) {
     out += c;
     i++;
   }
-  if (q) noteGap('quote-parse');   // unterminated quote: we cannot say what expands
+  if (q || stack.length) (onGap || noteGap)('quote-parse');   // unterminated quote/substitution: we cannot say what expands
   return out;
+}
+
+// A heredoc fed to a Python interpreter reading its program from stdin (`python - <<'EOF'`,
+// `python3 <<EOF`, `python - "$arg" <<'EOF'`) IS a script, but the `python -c` rules (RCE
+// primitive -> deny; process/network/filesystem stdlib -> ask) only matched the `-c` spelling, so
+// the same code through a heredoc was never analyzed. Re-express each such body as the equivalent
+// `python3 -c` one-liner so the existing rules see it -- one analysis, no new rules. A heredoc to
+// `python script.py` / `python -m mod` is that program's stdin DATA, not code, and is skipped.
+// Blank the CONTENTS of Python string literals and `#` comments so the code rules match code,
+// not prose: a heredoc script that writes issue text containing "group requests" is not
+// `import requests`. f-strings are kept whole (`f"{__import__('os').system('id')}"` runs code).
+function stripPyStrings(src) {
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '#') { while (i < src.length && src[i] !== '\n') i++; continue; }
+    const pm = /^([rRbBuUfF]{0,2})('''|"""|'|")/.exec(src.slice(i, i + 5));
+    if (pm && (pm[1] === '' || !/[A-Za-z0-9_]/.test(src[i - 1] || ''))) {
+      const [, prefix, q] = pm;
+      const isF = /[fF]/.test(prefix);
+      let j = i + prefix.length + q.length;
+      while (j < src.length) {
+        if (src[j] === '\\' && !/[rR]/.test(prefix)) { j += 2; continue; }
+        if (src.startsWith(q, j)) break;
+        if (q.length === 1 && src[j] === '\n') break;   // unterminated one-line string: stop at EOL
+        j++;
+      }
+      const end = Math.min(src.length, j + q.length);
+      out += isF ? src.slice(i, end) : prefix + q + q;   // keep an empty literal in place
+      i = end;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+// True when python's args leave the program on stdin: no script, -m or -c before a `-` or the end.
+// -W/-X/-Q/--check-hash-based-pycs take a value, which is not a script name.
+function pyReadsStdinProgram(args) {
+  for (let k = 0; k < args.length; k++) {
+    const t = args[k];
+    if (t === '-') return true;
+    if (/^-(?:[WXQ]|-check-hash-based-pycs)$/.test(t)) { k++; continue; }
+    if (/^-[^-]*[mc]/.test(t) || !t.startsWith('-')) return false;
+  }
+  return true;
+}
+
+function pythonHeredocsAsInline(cmd) {
+  const out = [];
+  const lines = cmd.split('\n');
+  const HEAD = /(?:^|[\s;&|(])(?:[^\s;&|]{0,256}[\\/])?(?:py|python(?:[23](?:\.\d+)?)?)(?:\.exe)?\s([^\n]{0,512}?)(?<!<)<<(?!<)(-?)\s*(['"]?)([A-Za-z_]\w*)\3/;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(HEAD);
+    if (!m) continue;
+    if (!pyReadsStdinProgram(tokenizeArgs(m[1]))) continue;   // a script file / module: stdin is data
+    const body = [];
+    let j = i + 1;
+    for (; j < lines.length; j++) {
+      const l = m[2] === '-' ? lines[j].replace(/^\t+/, '') : lines[j];
+      if (l === m[4]) break;
+      body.push(lines[j]);
+    }
+    if (j >= lines.length) continue;   // no terminator: not a well-formed heredoc
+    out.push('python3 -c ' + stripPyStrings(body.join('\n')).split('\n').join(' ; '));
+    i = j;
+  }
+  return out;
+}
+
+// Blank the BODY lines of every QUOTED-delimiter heredoc (`<<'EOF'`, `<<"EOF"`, `<<\EOF`). Bash
+// never expands or parses anything in such a body -- an apostrophe in Markdown or a Python `'''`
+// there is text, not a shell quote. Used ONLY to re-check the `quote-parse` gap: the deny passes
+// still scan the body as before. Unquoted `<<EOF` bodies DO run `$(…)`, so they are left alone.
+// Returns null when a terminator is missing (can't be sure what is body), keeping the gap.
+// A `<<` counts as a marker only OUTSIDE quotes and comments: `echo "<<'X'"` is text, and
+// counting it blanked the real code lines after it and laundered the gap into an allow.
+function stripQuotedHeredocBodies(cmd) {
+  const lines = cmd.split('\n');
+  const out = [];
+  const pending = [];   // terminators still owed, in order: { word, dash, quoted }
+  const MARK = /<<(?!<)(-?)[ \t]*(?:(['"])([A-Za-z_]\w*)\2|\\([A-Za-z_]\w*)|([A-Za-z_]\w*))/y;
+  let q = null;   // open quote carried across lines: ' " or $' (ANSI-C, backslash escapes)
+  for (const line of lines) {
+    if (pending.length) {
+      const t = pending[0];
+      const body = t.dash ? line.replace(/^\t+/, '') : line;
+      if (body === t.word) { pending.shift(); out.push(line); continue; }
+      out.push(t.quoted ? '' : line);
+      continue;
+    }
+    out.push(line);
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q === "'") { if (c === "'") q = null; continue; }
+      if (c === '\\') { i++; continue; }
+      if (q) { if (c === q[q.length - 1]) q = null; continue; }
+      if (c === '$' && line[i + 1] === "'") { q = "$'"; i++; continue; }
+      if (c === "'" || c === '"') { q = c; continue; }
+      if (c === '#' && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) break;
+      if (c === '<' && line[i + 1] === '<' && line[i - 1] !== '<') {
+        MARK.lastIndex = i;
+        const m = MARK.exec(line);
+        if (!m) continue;
+        pending.push({ word: m[3] || m[4] || m[5], dash: m[1] === '-', quoted: !!(m[3] || m[4]) });
+        i = MARK.lastIndex - 1;
+      }
+    }
+  }
+  return pending.length || q ? null : out.join('\n');
 }
 
 // PowerShell variable names are case-insensitive; bash's are not.
@@ -1755,15 +1895,15 @@ const DENY_PATTERNS = [
   // `git` and the subcommand -- `-C <path>`, `-c <cfg>`, `-p/-P`, and long flags
   // like `--no-pager` / `--git-dir=...` -- so e.g. `git --no-pager push -f` and
   // `git -C /repo push -f` are both still caught.
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*\b(main|master)\b(?![-\w\/])/, 'git push to main/master -- push to a feature branch instead?', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+origin\s*$/, 'git push to the default branch', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*--force(?!-with-lease)/, 'git push --force -- can overwrite remote history', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+(?:\S+\s+)*-f\b/, 'git push -f -- can overwrite remote history', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*reset\s+--hard/, 'git reset --hard -- can destroy uncommitted work', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*clean\s+-[a-zA-Z]*f/, 'git clean -f -- deletes untracked files', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*checkout\s+--\s/, 'git checkout -- -- discards uncommitted changes', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*update-ref\s+-d\b/, 'git update-ref -d -- destroys refs', 'ask'],
-  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*filter-(branch|repo)\b/, 'git filter-branch / filter-repo -- rewrites history', 'ask'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*\b(main|master)\b(?![-\w\/])/, 'git push to main/master -- push to a feature branch instead?', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+origin\s*$/, 'git push to the default branch', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+.*--force(?!-with-lease)/, 'git push --force -- can overwrite remote history', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*push\s+(?:\S+\s+)*-f\b/, 'git push -f -- can overwrite remote history', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*reset\s+--hard/, 'git reset --hard -- can destroy uncommitted work', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*clean\s+-[a-zA-Z]*f/, 'git clean -f -- deletes untracked files', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*checkout\s+--\s/, 'git checkout -- -- discards uncommitted changes', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*update-ref\s+-d\b/, 'git update-ref -d -- destroys refs', 'ask', 'git'],
+  [/git\s+(?:(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[pP])\s+)*filter-(branch|repo)\b/, 'git filter-branch / filter-repo -- rewrites history', 'ask', 'git'],
 
   // Sensitive file reads via shell. The verb list covers the common readers/dumpers
   // (cat/head/…, plus xxd/od/strings/base64/dd/openssl/gpg) so a zsh/bash/fish
@@ -2288,7 +2428,7 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (depth > 6) { noteGap('nesting-depth'); return; }
 
   const stripped = seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
-  const emit = mode === 'ask' ? ask : deny;
+  const emit = mode === 'hard' ? deny : ask;
   const wants = (sev) => (mode === 'ask' ? sev === 'ask' : sev !== 'ask');
 
   // Test each rule against the raw segment, its env-stripped form, AND a
@@ -2314,8 +2454,9 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
   // PowerShell + cmd deny patterns are anchored to their own syntax, so they are
   // safe to evaluate on both tools (and catch Windows tools shelled out from bash).
   for (const set of [DENY_PATTERNS, POSH_DENY_PATTERNS, CMD_DENY_PATTERNS]) {
-    for (const [pattern, reason, sev] of set) {
+    for (const [pattern, reason, sev, tag] of set) {
       if (!wants(sev)) continue;
+      if (tag === 'git' && GIT_GUARDS_OFF) continue;
       if (typeof pattern === 'function') {
         for (const v of variants) { const r = pattern(v); if (r) emit(typeof r === 'string' ? r : reason, seg); }
       } else {
@@ -2336,7 +2477,7 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
 
   const shellC = parseShellCInvocation(seg);
   if (shellC) {
-    if (mode !== 'ask' && shellC.opaque) {
+    if (mode === 'hard' && shellC.opaque) {
       deny('Opaque shell -c argument blocked -- contains $(...), backticks, or $VAR', seg);
     }
     for (const inner of splitChainSegments(shellC.innerCmd)) checkSegmentDeny(inner, depth + 1, mode);
@@ -2771,6 +2912,7 @@ process.stdin.on('end', () => {
   } catch {
     process.exit(0);
   }
+  quietAsk = /^(?:bypassPermissions|auto)$/.test(input && input.permission_mode);
 
   let rawCmd = input?.tool_input?.command;
   // Some hosts pass the command as an argv array (`["rm","-rf","/"]`); join it so it is
@@ -2815,6 +2957,22 @@ process.stdin.on('end', () => {
   // as an extra match variant. Also populates varEnv for the approve floor.
   const expanded = expandSegments(segments, cwd, isPosh);
 
+  // A `quote-parse` gap caused only by text inside a QUOTED heredoc body is not a real gap: the
+  // flat split above turned the body into pseudo-segments, and an apostrophe in Markdown or a
+  // Python `'''` then looked like an unterminated shell quote -> ask on every doc/code heredoc
+  // that missed the narrow fast path. Re-check with those bodies blanked and drop the gap if the
+  // rest parses cleanly. Deny coverage is unchanged: every pass still scans the body.
+  if (!isPosh && coverageGaps.includes('quote-parse')) {
+    const stripped = stripQuotedHeredocBodies(cmd);
+    if (stripped !== null && stripped !== cmd) {
+      let bad = false;
+      for (const seg of splitChainSegments(stripped.replace(/\n/g, ' ; '))) {
+        expandVars(seg, new Map(), false, () => { bad = true; });
+      }
+      if (!bad) coverageGaps.splice(coverageGaps.indexOf('quote-parse'), 1);
+    }
+  }
+
   for (let i = 0; i < segments.length; i++) {
     checkSegmentDeny(segments[i], 0, 'hard', expanded[i]);
   }
@@ -2848,6 +3006,10 @@ process.stdin.on('end', () => {
   for (let i = 0; i < segments.length; i++) {
     checkSegmentDeny(segments[i], 0, 'ask', expanded[i]);
   }
+  // A heredoc body is a whole program: the python -c RCE/socket rules apply, but as an ask
+  // (`import socket`, `model.eval()` are routine there and a wrong deny is unappealable), and the
+  // dual-use stdlib asks (subprocess, os.remove) are skipped -- a script touching files is normal.
+  if (!isPosh) for (const s of pythonHeredocsAsInline(cmd)) checkSegmentDeny(s, 0, 'soft');
 
   // Coverage gate. Placed after every deny pass (so a hard deny still wins) and
   // before the approve pass (so an unanalysed command can never be auto-approved).

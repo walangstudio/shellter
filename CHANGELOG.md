@@ -7,6 +7,53 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.10.0] - 2026-09-30
+
+Fewer false prompts, found by auditing every `ask` in two real bypass-mode sessions.
+
+**False "could not fully analyze" asks (12 of the 19 prompts in those sessions).** shellter degrades
+to `ask` when it cannot parse a command, and it was failing to parse two ordinary shapes:
+- A **quoted heredoc** (`<<'EOF'`) whose body held an apostrophe or a Python `'''`. The flat chain
+  split turns the body into pseudo-segments, and that text read as an unterminated shell quote.
+  Bash never expands or parses a quoted heredoc body, so the `quote-parse` gap is now re-checked with
+  those bodies blanked. Every deny pass still scans the body; an unquoted `<<EOF` body (which runs
+  `$(…)`) is unchanged, and a real unterminated quote elsewhere still asks.
+- **Quotes nested inside `$( … )` inside a double-quoted string** (`"$p: $(grep "^ '?x" f)"`). The
+  quote tracker kept one state, closed the outer string at the inner `"`, and saw the rest as
+  unterminated. A `$(` inside `"…"` now opens a fresh quoting context, restored at its `)`.
+
+**Python fed through a heredoc is now analyzed.** `python - <<'EOF'`, `python3 <<EOF`, and
+`python - "$arg" <<'EOF'` (and `py -3 -`) run the body as a program, but the `python -c` rules never
+saw it, so `os.system('curl … | sh')` inside a heredoc ran unchecked. The body now goes through every
+`python -c` RCE rule, with string literals and comments blanked first so prose is not mistaken for
+calls. A body is a whole program, where `import socket` or `model.eval()` is routine, so a hit
+**asks** rather than denies, and the dual-use stdlib asks (`subprocess`, `os.remove`) are skipped:
+a script touching files is normal. A heredoc that is stdin *data* for `python script.py` or `python -m mod` is not
+treated as code; option values (`-W error`, `-X dev`) are not mistaken for a script name.
+
+A heredoc marker counts only outside quotes and comments, so `echo "<<'X'"` cannot blank the real
+code after it and launder a parse gap into an auto-allow.
+
+**No prompts in bypass or auto mode.** A hook `ask` still prompted under `bypassPermissions`, and in
+`auto` mode Claude Code turns it into an unconditional allow that skips the auto-mode classifier.
+Both hooks now read `permission_mode` and, in those two modes, pass an `ask` through instead: bypass
+runs it, auto lets its classifier judge. Every deny still blocks in every mode, and `default`,
+`acceptEdits` and `plan` still ask. A suppressed ask is logged as `fallthrough` in the audit log.
+
+**Data-file polyglot rule narrowed.** It hard-denied any `$(` or backtick followed by an interpreter
+name (`python`, `bash`, `sh`, …) in `.json/.yaml/.txt/.toml/.ini/.cfg/.conf`, which blocked a note
+mentioning `` `python -c` `` and a CI workflow step using `$(python …)`. It now flags only a remote
+fetch inside a substitution (`$(curl …)`, `$(env /usr/bin/curl …)`, `` `wget …` ``), and **asks** instead of denying: CI
+installers do this legitimately. The ask is emitted after every deny check, so it can never
+pre-empt a real deny in the same file.
+
+**`SHELLTER_GIT_GUARDS=off`.** For people who stay in `default` mode, the git workflow guards
+(push to `main`/default, force push, `reset --hard`, `clean -f`, `checkout --`, `update-ref -d`,
+`filter-branch`/`filter-repo`) are now tagged and can be turned off with this variable. It covers
+only those asks: security denies (e.g. `git config` hook/credential keys) and non-git asks stay.
+
+1037 tests.
+
 ## [0.9.0] - 2026-09-25
 
 Windows delete verbs get the same destructive-target protection as `rm`.
