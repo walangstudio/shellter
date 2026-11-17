@@ -2130,6 +2130,9 @@ const POSH_DENY_PATTERNS = [
     'PowerShell web upload blocked -- review manually'],
   // Reading sensitive files via PowerShell/cmd (Get-Content/gc/type/Select-String/.NET).
   // Mirrors the bash `cat .env` rule so a PowerShell-shaped read can't slip past it.
+  [poshGlobSecretRead, null],
+  // Variable-provider read: `${C:\proj\.env}` is the file's content.
+  [new RegExp('\\$\\{[A-Za-z]+:[\\\\/][^}]*' + SECRET_TOKENS + '[^}]*\\}', 'i'), 'Reading sensitive file via the variable provider blocked'],
   [new RegExp('\\b(?:Get-Content|gc|type|more|findstr|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)\\b[^;|]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via PowerShell/cmd blocked'],
   // .NET reads: File::ReadAllText/OpenText/OpenRead/Open and StreamReader.
@@ -2311,7 +2314,10 @@ const APPROVE_PATTERNS = [
 // aliases for Invoke-WebRequest and are gated by POSH_DENY instead.
 const POSH_APPROVE_PATTERNS = [
   // Read-only verb-noun cmdlets.
-  /^\s*(Get|Select|Where|ForEach|Sort|Measure|Format|Compare|Group|Out|Write|Resolve|Split|Join|Test|ConvertTo|ConvertFrom)-[A-Za-z]+\b/i,
+  /^\s*(?:(?:Get|Select|Where|ForEach|Sort|Measure|Compare|Group|Resolve|Split|Join|Test|ConvertTo|ConvertFrom)-[A-Za-z]+|Format-(?:Table|List|Wide|Custom|Hex)|Out-(?:String|Null|Host|Default)|Write-(?:Output|Host|Verbose|Debug|Warning|Error|Information|Progress))(?![\w-])/i,
+  /^\s*[%?]\s/,
+  // Out-File / Set-Content into a plain project file name (same shape as the Remove-Item rule).
+  /^\s*(?:Out-File|Set-Content)\s+(?:-(?:FilePath|Path|LiteralPath)\s+)?(['"]?)(?!\.?\w*\.?(?:env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks|bashrc|zshrc|profile|gitconfig|ps1|psm1|bat|cmd)\1(?:\s|$))\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*\1(?:\s+-(?:Encoding\s+[\w-]+|Append|NoNewline|Force|Width\s+\d+))*\s*$/i,
   // Canonical read-only aliases.
   // `clear(?!-)` keeps the bare screen-clear alias but stops matching `Clear-Content`/`Clear-Item`/
   // `Clear-RecycleBin` etc. (the `-` was a word boundary), which truncate/erase and must not auto-approve.
@@ -2484,6 +2490,26 @@ function bashDeEscape(s) {
   return out;
 }
 
+// What PowerShell makes of `.e`nv`, `.e"n"v` and `('.e'+'nv')`: all name .env.
+function poshDeObfuscate(s) {
+  let out = s;
+  for (let i = 0; i < 8; i++) {
+    const next = out.replace(/(['"])([^'"]*)\1\s*\+\s*(['"])([^'"]*)\3/, (m, a, x, b, y) => a + x + y + a);
+    if (next === out) break;
+    out = next;
+  }
+  return out.replace(/`(?=\S)/g, '').replace(/(?<=[\w.])(['"])([\w.]*)\1/g, (m, q, w) => w);
+}
+
+// A PowerShell content read whose path is a glob that expands to a secret (`gc .e?v`).
+function poshGlobSecretRead(seg) {
+  for (const stage of splitPipeStages(seg)) {
+    if (!POSH_READ_VERB.test(stage)) continue;
+    for (const t of tokenizeArgs(stage).slice(1)) if (scan.globHitsSecret(t) === 'secret') return 'Reading a sensitive file via a glob blocked';
+  }
+  return null;
+}
+
 function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (depth === undefined) depth = 0;
   if (mode === undefined) mode = 'hard';
@@ -2505,6 +2531,10 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (!isPoshTool) {
     const de = bashDeEscape(seg);
     if (!variants.includes(de)) variants.push(de);
+  }
+  if (isPoshTool) {
+    const po = poshDeObfuscate(seg);
+    if (!variants.includes(po)) variants.push(po);
   }
   if (extraVariant && !variants.includes(extraVariant)) {
     variants.push(extraVariant);
@@ -2616,11 +2646,7 @@ function checkSegmentApprove(seg, depth, isPosh, idx) {
     // stateless while PowerShell variables persist across tool calls, so the assignment
     // and the read can simply be sent as two separate calls -- the second one is a bare
     // read of a variable this process never saw. Give PS its own floor first.
-    if (hasUnresolvedPoshRead(seg, idx)) return false;
-    for (const pattern of POSH_APPROVE_PATTERNS) {
-      if (pattern.test(seg)) return true;
-    }
-    return false;
+    return checkPoshApprove(seg, depth, idx);
   }
 
   if (heredocWriteUnsafe(seg)) return false;
@@ -2900,6 +2926,94 @@ function checkBashApprove(seg, depth, idx) {
   if (hasUnresolvedRead(seg, idx)) return false;
   for (const pattern of APPROVE_PATTERNS) if (pattern.test(seg)) return true;
   return false;
+}
+
+// One PS-quoting-aware walk: pipe stages (groups collapsed to `()` / `{}`), the content of
+// every top-level group that PowerShell would evaluate, redirect targets, and whether a
+// call/background `&` appears anywhere but the start of a stage. null = unbalanced.
+function poshScan(seg) {
+  const stages = [], groups = [], redirs = [];
+  let cur = '', q = null, amp = false;
+  const CLOSE = { '(': ')', '{': '}' };
+  const group = (i) => {                       // seg[i] is ( or {; returns index of its closer or -1
+    const stack = [CLOSE[seg[i]]];
+    let gq = null;
+    for (let j = i + 1; j < seg.length; j++) {
+      const c = seg[j];
+      if (c === '`') { j++; continue; }
+      if (gq === "'") { if (c === "'") gq = null; continue; }
+      if (gq === '"') { if (c === '"') gq = null; else if (c === '$' && seg[j + 1] === '(') { stack.push(')'); j++; } else if (c === ')' && stack.length > 1 && stack[stack.length - 1] === ')') stack.pop(); continue; }
+      if (c === "'" || c === '"') { gq = c; continue; }
+      if (c === '(' || c === '{') { stack.push(CLOSE[c]); continue; }
+      if (c === ')' || c === '}') { if (stack.pop() !== c) return -1; if (!stack.length) return j; }
+    }
+    return -1;
+  };
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (c === '`') { cur += c + (seg[i + 1] || ''); i++; continue; }
+    if (q === "'") { if (c === "'") q = null; cur += c; continue; }
+    if (q === '"') {
+      if (c === '"') q = null;
+      if (c === '$' && seg[i + 1] === '(') {
+        const e = group(i + 1); if (e < 0) return null;
+        groups.push(seg.slice(i + 2, e)); cur += '$()'; i = e; continue;
+      }
+      cur += c; continue;
+    }
+    if (c === "'" || c === '"') { q = c; cur += c; continue; }
+    if (c === '(' || c === '{') {
+      const e = group(i); if (e < 0) return null;
+      groups.push(seg.slice(i + 1, e)); cur += c + CLOSE[c]; i = e; continue;
+    }
+    if (c === ')' || c === '}') return null;
+    if (c === '|' && seg[i + 1] !== '|') { stages.push(cur); cur = ''; continue; }
+    if (c === '&' && cur.trim() !== '') { amp = true; }
+    if (c === '>') {
+      const m = /^>>?\s*(?:&\d|("[^"]*"|'[^']*'|[^\s|;&]+))/.exec(seg.slice(i, i + 400));
+      if (m && m[1] !== undefined) redirs.push(m[1].replace(/^(['"])(.*)\1$/, '$2'));
+    }
+    cur += c;
+  }
+  if (q) return null;
+  stages.push(cur);
+  return { stages: stages.map((s) => s.trim()).filter(Boolean), groups, redirs, amp };
+}
+
+const POSH_SAFE_METHOD = /^(?:ToString|Trim(?:Start|End)?|Split|Replace|Substring|ToUpper|ToLower|StartsWith|EndsWith|Contains|IndexOf|PadLeft|PadRight|Add(?:Days|Hours|Minutes|Seconds|Months|Years)|GetType)$/;
+// Static members of value types: pure functions (`[math]::Round(x)`, `[datetime]::Now`).
+const POSH_SAFE_STATIC = /\[(?:math|int|long|double|decimal|string|datetime|timespan|regex|version|guid|char|bool)\]::[A-Za-z_]\w*/gi;
+// An expression that cannot invoke anything: variables, property access, operators, literals.
+// (Groups were already collapsed and approved separately by the caller.)
+function isSimplePoshExpr(flat) {
+  let b = flat.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+  b = b.replace(POSH_SAFE_STATIC, '0');
+  if (!/^\s*(?:[$'"\d\[!]|-(?:not|join|split)\b|\(\))/.test(b)) return false;
+  if (/[|;&{}`]|::|(?<![-=!<>])=(?!=)/.test(b.replace(/\{\}/g, ''))) return false;
+  for (const m of b.matchAll(/\.\s*([A-Za-z_]\w*)\s*\(\)/g)) if (!POSH_SAFE_METHOD.test(m[1])) return false;
+  return !/(?:^|[\s,])[A-Za-z_][\w-]*\s*\(\)/.test(b);       // bare word + call parens
+}
+
+function checkPoshApprove(seg, depth, idx) {
+  if (depth > 6) return false;
+  const sc = poshScan(seg);
+  if (!sc || sc.amp) return false;
+  for (const t of sc.redirs) if (!/^\$null$/i.test(t) && (/[$:`]/.test(t) || !isSafeRelativePath(t))) return false;
+  for (const inner of sc.groups) {
+    for (const s of splitPoshSegments(inner)) if (!checkPoshApprove(s, depth + 1, idx)) return false;
+  }
+  if (!sc.stages.length) return true;
+  if (sc.stages.length === 1 && isSimplePoshExpr(sc.stages[0])) return true;
+  if (hasUnresolvedPoshRead(seg, idx)) return false;
+  for (let k = 0; k < sc.stages.length; k++) {
+    const st = sc.stages[k];
+    if (k > 0 && /^\s*(?:Get-Content|gc|cat|type|Format-Hex|Import-Csv|Import-Clixml)\b/i.test(st)) return false;   // reads piped paths we cannot see
+    if (/@\{\}/.test(st)) return false;                    // hashtable literal: not modelled
+    const body = st.replace(/\.\s*([A-Za-z_]\w*)\s*\(\)/g, (m0, name) => (POSH_SAFE_METHOD.test(name) ? '' : m0));
+    if (/\(\)\s*\.\s*[A-Za-z_]\w*\s*\(\)/.test(body)) return false;   // (cmd).Method(): unknown method
+    if (!POSH_APPROVE_PATTERNS.some((p) => p.test(st))) return false;
+  }
+  return true;
 }
 
 // Shell keywords that can precede a command word inside a compound statement. Without

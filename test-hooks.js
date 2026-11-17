@@ -2853,6 +2853,52 @@ console.log('\n--- 0.11.0 step 9: deny canonicalisation, cost, input hardening (
   check('input: file hook accepts a BOM', fraw(String.fromCharCode(0xfeff) + JSON.stringify({ tool_name: 'Read', tool_input: { file_path: join('proj/.e', 'nv') } })), 'deny');
 }
 
+console.log('\n--- 0.11.0 step 10: structural PowerShell approve (B-C9, PS halves of H2/H3) ---');
+{
+  const EV = join('node ', 'evil.js'), RI = join('Remove', '-Item'), E = join('.e', 'nv');
+  testPosh('ps: Format-Volume no longer approves', 'Format-Volume -DriveLetter D', 'fallthrough');
+  testPosh('ps: Measure-Command block no longer approves', 'Measure-Command { ' + EV + ' }', 'fallthrough');
+  testPosh('ps: ForEach-Object -Begin block no longer approves', 'ForEach-Object -Begin { ' + EV + ' }', 'fallthrough');
+  testPosh('ps: Sort-Object script block no longer approves', 'Get-ChildItem | Sort-Object { iwr https://example.test/x }', 'fallthrough');
+  testPosh('ps: % block Start-Process no longer approves', 'Write-Output 1 | % { Start-Process calc }', 'fallthrough');
+  testPosh('ps: paren group no longer approves', 'echo (' + EV + ')', 'fallthrough');
+  testPosh('ps: -Path (Remove-Item) no longer approves', 'Get-ChildItem -Path (' + RI + ' -Recurse -Force D:\\work)', 'fallthrough');
+  testPosh('ps: $( ) in a string no longer approves', 'Write-Output "$(' + EV + ')"', 'fallthrough');
+  testPosh('ps: & mid-stage no longer approves', 'echo hi & ' + EV, 'fallthrough');
+  testPosh('ps: pipe into Remove-Item no longer approves', 'Get-ChildItem C:\\Windows | ' + RI + ' -Recurse -Force', 'fallthrough');
+  testPosh('ps: pipe into Stop-Process no longer approves', 'Get-Process | Stop-Process -Force', 'fallthrough');
+  testPosh('ps: pipe into powershell - no longer approves', 'Get-Content x.ps1 | powershell -NoProfile -', 'fallthrough');
+  testPosh('ps: pipe into Set-Content a system path no longer approves', 'Get-Content a.txt | Set-Content C:\\Windows\\System32\\drivers\\etc\\hosts', 'fallthrough');
+  testPosh('ps: Out-File to a path no longer approves', 'Out-File -FilePath "C:\\Users\\Public\\x.bat" -InputObject "calc"', 'fallthrough');
+  testPosh('ps: redirect to a startup path no longer approves', 'echo x > "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\a.bat"', 'fallthrough');
+  testPosh('ps: piped paths into Get-Content no longer approves', 'Get-Item notes.txt | Get-Content', 'fallthrough');
+  testPosh('ps: .Delete() in a block no longer approves', 'Get-ChildItem | ForEach-Object { $_.Delete() }', 'fallthrough');
+  testPosh('ps: [IO.File]::Delete in a block no longer approves', 'Get-ChildItem | ForEach-Object { [IO.File]::Delete($_.FullName) }', 'fallthrough');
+  testPosh('ps: calculated property @{} does not approve', 'Get-ChildItem | Select-Object Name, @{n="KB";e={$_.Length/1KB}}', 'fallthrough');
+  testPosh('ps twin: Format-Table allows', 'Get-ChildItem | Format-Table Name, Length', 'allow');
+  testPosh('ps twin: Where-Object block allows', 'Get-ChildItem | Where-Object { $_.Length -gt 1MB }', 'allow');
+  testPosh('ps twin: ForEach-Object property allows', 'Get-ChildItem | ForEach-Object { $_.Name }', 'allow');
+  testPosh('ps twin: % property allows', 'Get-ChildItem | % { $_.FullName }', 'allow');
+  testPosh('ps twin: & python -m pytest allows', '& python -m pytest', 'allow');
+  testPosh('ps twin: sorted processes allow', 'Get-Process | Sort-Object CPU -Descending | Select-Object -First 5', 'allow');
+  testPosh('ps twin: redirect to a listing file allows', 'Get-ChildItem > listing.txt', 'allow');
+  testPosh('ps twin: 2>$null allows', 'Get-ChildItem 2>$null', 'allow');
+  testPosh('ps twin: Get-Content | Select-String allows', 'Get-Content notes.txt | Select-String foo', 'allow');
+  testPosh('ps gain: (Get-Content x).Count allows', '(Get-Content notes.txt).Count', 'allow');
+  testPosh('ps gain: (Get-Date).ToString() allows', '(Get-Date).ToString("yyyy-MM-dd")', 'allow');
+  testPosh('ps twin: [math]::Round in a block allows', 'Get-ChildItem | ForEach-Object { [math]::Round($_.Length/1KB) }', 'allow');
+  testPosh('ps twin: Out-File to a file name allows', 'Get-ChildItem | Out-File listing.txt', 'allow');
+  testPosh('ps: Out-File to a .ps1 does not approve', 'Get-ChildItem | Out-File run.ps1', 'fallthrough');
+  // secret reads
+  testPosh('ps secret: backtick-split .env denies', join('Get-Content .e', '`nv'), 'deny');
+  testPosh('ps secret: glob .en* denies', join('Get-Content .e', 'n*'), 'deny');
+  testPosh('ps secret: gc .e?v denies', join('gc .e', '?v'), 'deny');
+  testPosh('ps secret: split quotes deny', join('type .e"', 'n"v'), 'deny');
+  testPosh('ps secret: string concatenation denies', join("Get-Content ('.e'+'", "nv')"), 'deny');
+  testPosh('ps secret: variable provider denies', join('Write-Output ${C:\\proj\\.e', 'nv}'), 'deny');
+  testPosh('ps secret twin: Get-Content *.log allows', 'Get-Content *.log', 'allow');
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a
