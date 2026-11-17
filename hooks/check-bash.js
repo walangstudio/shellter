@@ -2046,7 +2046,7 @@ const DENY_PATTERNS = [
     'Downloading a file onto a shell rc path -- approve only if intended', 'ask'],
   // shellter's trust store (self-granted trust) and Claude Code's settings (allow rules,
   // hooks) as a WRITE target: the path must end the write, so copying FROM them is not hit.
-  [new RegExp(WRITE_INTO + 'shellter-trust\\.json' + WRITE_TARGET_END, 'i'),
+  [new RegExp(WRITE_INTO + '\\.claude[\\\\/]shellter-trust\\.json' + WRITE_TARGET_END, 'i'),
     'Writing the shellter trust store blocked -- trust a script with `node shellter-trust.js add <path>`'],
   [new RegExp(WRITE_INTO + '\\.claude[\\\\/]settings(?:\\.local)?\\.json' + WRITE_TARGET_END, 'i'),
     'Writing Claude Code settings (allow rules, hooks) -- approve only if intended', 'ask'],
@@ -2710,7 +2710,11 @@ const EXEC_FLAGS = {
 function hasExecFlag(toks) {
   const w = base(toks[0]);
   const re = EXEC_FLAGS[w];
-  if (re && toks.slice(1).some((t) => re.test(t))) return true;
+  // tar's compress program is a known compressor in the common case.
+  const COMPRESSOR = /^(?:zstd|pigz|lz4|xz|gzip|bzip2|pbzip2)$/;
+  const known = (t, k, a) => w === 'tar' && (COMPRESSOR.test((/^--use-compress-program=(.*)$/.exec(t) || [])[1] || '') ||
+    (t === '-I' && COMPRESSOR.test(a[k + 1] || '')));
+  if (re && toks.slice(1).some((t, k, a) => re.test(t) && !known(t, k, a))) return true;
   if (w === 'git') {
     const rest = toks.slice(1).filter((t, i, a) => !(t === '-C' || a[i - 1] === '-C'));
     if (rest[0] === 'rebase' && rest.some((t) => /^-[A-Za-z]*x/.test(t))) return true;
@@ -2996,7 +3000,7 @@ function poshScan(seg) {
     }
     if (c === ')' || c === '}') return null;
     if (c === '|' && seg[i + 1] !== '|') { stages.push(cur); cur = ''; continue; }
-    if (c === '&' && cur.trim() !== '') { amp = true; }
+    if (c === '&' && cur.trim() !== '' && !/>\s*$/.test(cur)) { amp = true; }   // `2>&1` is a stream merge
     if (c === '>') {
       const m = /^>>?\s*(?:&\d|("[^"]*"|'[^']*'|[^\s|;&]+))/.exec(seg.slice(i, i + 400));
       if (m && m[1] !== undefined) redirs.push(m[1].replace(/^(['"])(.*)\1$/, '$2'));
@@ -3016,7 +3020,7 @@ const POSH_SAFE_STATIC = /\[(?:math|int|long|double|decimal|string|datetime|time
 function isSimplePoshExpr(flat) {
   let b = flat.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
   b = b.replace(POSH_SAFE_STATIC, '0');
-  if (!/^\s*(?:[$'"\d\[!]|-(?:not|join|split)\b|\(\))/.test(b)) return false;
+  if (!/^\s*(?:[$'"\d\[!]|-\d|-(?:not|join|split)\b|\(\))/.test(b)) return false;
   if (/[|;&{}`]|::|(?<![-=!<>])=(?!=)/.test(b.replace(/\{\}/g, ''))) return false;
   for (const m of b.matchAll(/\.\s*([A-Za-z_]\w*)\s*\(\)/g)) if (!POSH_SAFE_METHOD.test(m[1])) return false;
   return !/(?:^|[\s,])[A-Za-z_][\w-]*\s*\(\)/.test(b);       // bare word + call parens

@@ -200,14 +200,15 @@ const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
 // Wallet / crypto / browser cookie files.
 const WALLET_PATTERN = /\b(wallet\.dat|keystore\.json|UTC--\d{4}-\d{2}-\d{2}T)\b|(^|\/)\.electrum\/wallets\/|(^|\/)\.bitcoin\/wallet\.dat$/i;
 const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|google-chrome|mozilla)[^\/]*\/.*\/(Cookies|Cookies-journal|Login Data|Web Data)$/i;
-// The user's own shell history and Claude config: plausibly holds a pasted token, but
-// reading it is also routine. Ask, never deny.
 // shellter's own trust store and installed hooks: a write there is the agent granting itself
-// trust or switching shellter off. The dev repo's `hooks/` (no `.claude` segment) is not matched.
-const SHELLTER_SELF = /(^|\/)shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|shellter-(?:trust|scan))\.js$/i;
+// trust or switching shellter off. The dev repo's `hooks/` (no `.claude` segment) is not matched,
+// and a fixture that merely shares the store's file name is not the store (see isTrustStore).
+const SHELLTER_SELF = /(^|\/)\.claude\/shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|shellter-(?:trust|scan))\.js$/i;
 // Allow rules and hooks live here. The user edits it too, so ask, never deny.
 const CLAUDE_SETTINGS = /(^|\/)\.claude\/settings(?:\.local)?\.json$/i;
-const PERSONAL_HISTORY =/(^|\/)(?:\.(?:bash|zsh)_history|\.claude\.json)$/i;
+// The user's own shell history and Claude config: plausibly holds a pasted token, but
+// reading it is also routine. Ask, never deny.
+const PERSONAL_HISTORY = /(^|\/)(?:\.(?:bash|zsh)_history|\.claude\.json)$/i;
 // macOS Keychain databases.
 const MACOS_KEYCHAIN = /(^|\/)(Library\/Keychains\/|login\.keychain(-db)?$|System\.keychain$)/i;
 // Windows credential / hive files. The bare hive names (SAM/SYSTEM/SECURITY) require a
@@ -235,10 +236,49 @@ const GREP_SECRET_EXTRACTION = [
 // broad off-project location (a home/system root) -- i.e. mass credential harvesting.
 // Regex tokens between the keyword and the separator (`password\s*=\S`, `token.*:`) count as gap.
 const GREP_KEYWORD_EXTRACTION = /(password|secret|api.?key|token|credential|private.?key)(?:\s|\\[sSwW][*+?]?|\.[*+?]|\[\^?[^\]]{0,16}\][*+?]?){0,6}[:=](?:\s|\\[sS][*+?]?){0,4}[^${\s]/i;
-// A token SHAPE written as a regex (`AKIA[0-9A-Z]{16}`, `ghp_[A-Za-z0-9]{36}`, `BEGIN.*PRIVATE KEY`).
-// This repo's own source is full of those strings, so only a broad search path denies.
-const GREP_TOKEN_SHAPE = /AKIA|gh[pousr]_|xox[bpoa]|eyJ|PRIVATE.{0,8}KEY|BEGIN.{0,24}(?:RSA|OPENSSH|EC|DSA|PGP)/i;
-const BROAD_SEARCH_PATH = /^(?:~|\/(?:home|Users|etc|root|var|opt|usr|private|srv|mnt|mount)\b|\/$|[A-Za-z]:[\\\/]Users\b|[A-Za-z]:[\\\/]?$|(?:\.\.[\\\/]){2})/i;
+// A token SHAPE written as a regex (`AKIA[0-9A-Z]{16}`, `ghp_[A-Za-z0-9]{36}`, `BEGIN.*PRIVATE KEY`):
+// case-sensitive and followed by regex syntax, so `privateKey` or `beginSection` is not one. This
+// repo's own source is full of those strings, so only a broad search path denies.
+const GREP_TOKEN_SHAPE = /AKIA\[|gh[pousr]_\[|xox\[|eyJ\[|BEGIN[\s\S]{0,24}PRIVATE KEY/;
+
+// A broad search path is a place to harvest from, not a project: a filesystem or drive root, a
+// home root (any user's) or an ancestor of it, a dot-directory directly under a home root, or
+// system config. A project below a home directory is not broad.
+const HOME_ROOT = '(?:/(?:home|users)/[^/]+|[a-z]:/users/[^/]+|/root)';
+const BROAD_RE = new RegExp('^(?:/?|[a-z]:/?|/(?:home|users|var|usr|opt|srv|mnt|mount|private)/?|[a-z]:/users/?|' +
+  HOME_ROOT + '(?:/\\.[^/]+)?/?|/(?:private/)?etc(?:/.*)?)$', 'i');
+function isBroadSearchPath(p) {
+  if (typeof p !== 'string' || !p) return false;
+  let home = '';
+  try { home = canon(require('os').homedir()).replace(/\/+$/, '').toLowerCase(); } catch { /* no home */ }
+  const forms = pathForms(p.replace(/^~(?=[\\/]|$)/, home || '~'));
+  return forms.some((f) => {
+    const c = canon(f).replace(/\/{2,}/g, '/').replace(/\/(?:\.\/)+/g, '/').replace(/^\/\/\?\//, '').toLowerCase();
+    if (BROAD_RE.test(c)) return true;
+    const t = c.replace(/\/+$/, '');
+    return !!home && ((home + '/').startsWith(t + '/') || new RegExp('^' + home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/\\.[^/]+$').test(t));
+  });
+}
+
+// A glob names a secret only through a literal secret stem: after brace expansion and `[x]` -> `x`,
+// the last component with its glob runs removed still holds a secret name, or a directory component
+// is literally `.ssh`/`.aws`/`.gnupg`. Guessing from wildcards false-denied `**/*credential*`.
+const SECRET_STEM = /\.env(?!\.(?:example|sample|template|dist|defaults?)\b)|id_rsa|id_ed25519|id_ecdsa|\.netrc|\.npmrc|\.pgpass|\.git-credentials|\.pem$|\.key$/i;
+function globNamesSecret(g) {
+  if (typeof g !== 'string' || !/[*?[{]/.test(g)) return false;
+  return [g, ...scan.expandBraces(g)].some((f) => {
+    const parts = f.replace(/\\/g, '/').replace(/\[([^\]\\])\]/g, '$1').split('/');
+    if (parts.slice(0, -1).some((c) => /^\.(?:ssh|aws|gnupg)$/i.test(c))) return true;
+    return SECRET_STEM.test(parts[parts.length - 1].replace(/\[[^\]]*\]|[*?]+/g, ''));
+  });
+}
+
+// The real trust store, resolved: a fixture that shares its file name is not it.
+function isTrustStore(p) {
+  let store = '';
+  try { store = canon(safeRealpath(require('./shellter-trust.js').trustStorePath())).toLowerCase(); } catch { return false; }
+  return !!store && canon(p).toLowerCase() === store;
+}
 
 function pathMatchesAnySensitive(p) {
   if (!p) return null;
@@ -390,17 +430,17 @@ process.stdin.on('end', () => {
       }
       // keyword=value harvesting across a broad off-project path (a self-audit in your own
       // repo, i.e. a relative path, stays allowed).
-      if (BROAD_SEARCH_PATH.test(filePath) && GREP_KEYWORD_EXTRACTION.test(searchPattern)) {
+      if (isBroadSearchPath(filePath) && GREP_KEYWORD_EXTRACTION.test(searchPattern)) {
         deny('Searching for plaintext credentials across a home/system path blocked', searchPattern);
       }
-      if (BROAD_SEARCH_PATH.test(filePath) && GREP_TOKEN_SHAPE.test(searchPattern)) {
+      if (isBroadSearchPath(filePath) && GREP_TOKEN_SHAPE.test(searchPattern)) {
         deny('Searching for secret token shapes across a home/system path blocked', searchPattern);
       }
       // The file filter selects what gets read: `glob: "**/.env*"` reads every .env.
       const gl = input?.tool_input?.glob;
       if (typeof gl === 'string' && gl) {
         for (const p of pathForms(filePath ? filePath + '/' + gl : gl)) {
-          if (pathMatchesAnySensitive(p) || SENSITIVE_GLOB.test(p) || scan.globHitsSecret(p) === 'secret') {
+          if (pathMatchesAnySensitive(p) || SENSITIVE_GLOB.test(p) || globNamesSecret(p)) {
             deny('Grep over sensitive files blocked', p);
           }
         }
@@ -416,7 +456,7 @@ process.stdin.on('end', () => {
     if (reason) {
       deny('Access to sensitive file/path blocked: ' + reason, p);
     }
-    if (WRITE_TOOLS.has(tool) && SHELLTER_SELF.test(p)) {
+    if (WRITE_TOOLS.has(tool) && (SHELLTER_SELF.test(p) || isTrustStore(p))) {
       deny('Writing shellter\'s own trust store or hooks blocked', p);
     }
     if (WRITE_TOOLS.has(tool) && CLAUDE_SETTINGS.test(p)) {
@@ -425,7 +465,7 @@ process.stdin.on('end', () => {
     if (PERSONAL_HISTORY.test(p)) {
       pendingAsk = pendingAsk || { reason: 'Shell history / Claude config may hold tokens', snippet: p };
     }
-    if (tool === 'Glob' && (SENSITIVE_GLOB.test(p) || scan.globHitsSecret(p) === 'secret')) {
+    if (tool === 'Glob' && (SENSITIVE_GLOB.test(p) || globNamesSecret(p))) {
       deny('Glob pattern targeting sensitive files blocked', p);
     }
   }

@@ -131,34 +131,38 @@ function decodeOneLayer(text, opts) {
   const maxLen = opts.maxLen || 8192;
   const minEntropy = opts.minEntropy || 3.5;
   const out = [];
-  let used = 0;
+  let used = 0, attempts = 0;
 
+  // The budget counts tokens that decode to text; a path or SHA list is not "encoded tokens".
+  // Raw attempts are capped separately as the DoS bound.
   const b64 = /[A-Za-z0-9+/]{24,}={0,2}/g;
   let m;
-  while ((m = b64.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED) {
+  while ((m = b64.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED && attempts < 512) {
     const tok = m[0];
     if (tok.length < minLen || tok.length > maxLen) continue;
     if (shannonEntropy(tok) < minEntropy) continue;
+    attempts++;
     try {
       const buf = Buffer.from(tok, 'base64');
       if (!buf.length) continue;
       const u8 = buf.toString('utf8');
-      if (printableRatio(u8) > 0.8) { out.push(u8); decodedLen += u8.length; }
+      let hit = false;
+      if (printableRatio(u8) > 0.8) { out.push(u8); decodedLen += u8.length; hit = realText(u8); }
       const nulls = countNulls(buf);
       if (nulls > buf.length / 4) {
         const u16 = buf.toString('utf16le');
-        if (printableRatio(u16) > 0.8) { out.push(u16); decodedLen += u16.length; }
+        if (printableRatio(u16) > 0.8) { out.push(u16); decodedLen += u16.length; hit = hit || realText(u16); }
       }
-      used++;
+      if (hit) used++;
     } catch { /* not base64 */ }
   }
 
   if (m) exhausted = true;   // a candidate token was left undecoded
   const hex = /\b(?:[0-9a-fA-F]{2}){16,}\b/g;
-  while ((m = hex.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED) {
+  while ((m = hex.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED && attempts++ < 512) {
     try {
       const u8 = Buffer.from(m[0], 'hex').toString('utf8');
-      if (printableRatio(u8) > 0.8) { out.push(u8); used++; decodedLen += u8.length; }
+      if (printableRatio(u8) > 0.8) { out.push(u8); if (realText(u8)) used++; decodedLen += u8.length; }
     } catch { /* not hex */ }
   }
   if (m) exhausted = true;
@@ -166,6 +170,9 @@ function decodeOneLayer(text, opts) {
   // caller keeps the original string return.
   return opts._report ? { text: out.join('\n'), used, exhausted } : out.join('\n');
 }
+
+// Decoded bytes that read as text, not U+FFFD noise: only these spend the decode budget.
+function realText(s) { return (s.match(/�/g) || []).length < s.length * 0.05; }
 
 function printableRatio(s) {
   if (!s.length) return 0;
@@ -475,6 +482,17 @@ function scanShell(text, opts) {
   return findings;
 }
 
+// Is text[at] quoted rather than said: inside `inline code` or a ``` fence, on a `>` blockquote
+// line, or right after an opening quote character?
+function isMention(text, at) {
+  const ls = text.lastIndexOf('\n', at - 1) + 1;
+  const line = text.slice(ls, at);
+  if (/^\s*>/.test(line)) return true;
+  if (((line.match(/`/g) || []).length % 2) === 1) return true;
+  if (/["'“‘«]\s*$/.test(line)) return true;
+  return ((text.slice(0, ls).match(/^\s*```/gm) || []).length % 2) === 1;
+}
+
 function scanInjectionText(findings, text, decodedLayer) {
   const { counts, clean } = normalizeForScan(text);
   // Invisible / steganographic-unicode matchers (tag, bidi-override, variation-selector,
@@ -513,14 +531,19 @@ function scanInjectionText(findings, text, decodedLayer) {
   // prose into a match; the short role-label matchers are left unfolded (a stray "аі:"
   // would otherwise fold to a fake "AI:" label).
   const folded = foldConfusables(clean);
-  const ov = OVERRIDE_RE.exec(folded);
-  if (ov) {
+  // With an exfil target nearby -> Class A (real attack). A bare override phrase (a security doc,
+  // a test fixture, a chatbot prompt string) -> Class B. A quoted one (inline code, a fenced block,
+  // a blockquote, right after an opening quote) is a mention -> B2. "You are now a/an/the" is
+  // role-prompt boilerplate -> B2.
+  let best = null;
+  const allOv = new RegExp(OVERRIDE_RE.source, 'gi');
+  for (let ov, k = 0; k < 50 && (ov = allOv.exec(folded)); k++) {
     const window = folded.slice(Math.max(0, ov.index - 200), ov.index + 200);
-    const withExfil = EXFIL_TARGET_RE.test(window);
-    // With an exfil target nearby -> Class A (real attack). A bare override phrase (a
-    // security doc, a test fixture, a chatbot prompt string) -> Class B.
-    pushFinding(findings, folded, ov.index, 'injection', withExfil ? 'override-with-exfil-target' : 'instruction-override', withExfil ? SEVERITY.HIGH : SEVERITY.MEDIUM);
+    const sev = EXFIL_TARGET_RE.test(window) ? SEVERITY.HIGH
+      : /^you\s+are\s+now/i.test(ov[0]) || isMention(folded, ov.index) ? SEVERITY.LOW : SEVERITY.MEDIUM;
+    if (!best || RANK[sev] > RANK[best.sev]) best = { index: ov.index, sev };
   }
+  if (best) pushFinding(findings, folded, best.index, 'injection', best.sev === SEVERITY.HIGH ? 'override-with-exfil-target' : 'instruction-override', best.sev);
 
   // Jailbreak / role-hijack phrases -> Class B (MEDIUM): denied only on an agent-instruction file.
   const rh = ROLE_HIJACK_RE.exec(clean);
@@ -617,7 +640,7 @@ function scanInjection(text, opts) {
   // Markdown emphasis inside a keyword (`ignore **previous** instructions`), only when the text
   // has both an emphasis marker and an override word.
   if (/[*_~`]/.test(text) && /\b(?:ignore|disregard|forget|previous|prior|instructions?|system)\b/i.test(text)) {
-    const plain = text.replace(/(?<=\w)[*_~`]+|[*_~`]+(?=\w)/g, '');
+    const plain = text.replace(/(?<=\w)[*_~]+|[*_~]+(?=\w)|(?<=\w)`+(?=\w)/g, '');   // a code span stays a mention
     if (plain !== text) {
       const sub = [];
       scanInjectionText(sub, plain, true);
