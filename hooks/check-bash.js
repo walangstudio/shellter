@@ -1861,11 +1861,11 @@ const DENY_PATTERNS = [
     'Modifying cron/systemd/init blocked -- possible persistence'],
   [/(>|>>|tee\s+(-a)?)\s*\/etc\//i, 'Writing to /etc blocked'],
   // Appending to your own shell rc file is routine setup -> ask (not a hard deny).
-  [/(>|>>|tee\s+(-a)?)\s*[^\s|;&]*\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc|config\.fish)\b/i,
+  [/(>|>>|tee\s+(-a)?)\s*[^\s|;&]{0,256}\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc|config\.fish)\b/i,
     'Writing to a shell rc file -- approve only if intended', 'ask'],
-  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]*\.git\/hooks\//i,
+  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]{0,512}\.git\/hooks\//i,
     'Writing to .git/hooks blocked -- possible persistence'],
-  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]*(\.github\/workflows\/|\.gitlab-ci\.yml|\.circleci\/config|Jenkinsfile|\.drone\.yml|\.azure-pipelines\.yml|\.woodpecker\.yml|buildkite\.yml)\b/i,
+  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]{0,512}(\.github\/workflows\/|\.gitlab-ci\.yml|\.circleci\/config|Jenkinsfile|\.drone\.yml|\.azure-pipelines\.yml|\.woodpecker\.yml|buildkite\.yml)\b/i,
     'Writing to CI config blocked -- possible supply-chain attack'],
 
   // Privilege escalation / identity tampering
@@ -1957,7 +1957,7 @@ const DENY_PATTERNS = [
   // as a VCS install, so those are exempt; any other raw URL is blocked.
   [/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:npm|yarn|pnpm|bun)\s+(?:-\S+\s+)*(?:install|add|i)\b(?![^|;&]*(?:git\+|github\.com|gitlab\.com|bitbucket\.org|\.git\b))[^|;&]*https?:\/\//i,
     'Installing a package from a raw URL blocked -- use a VCS URL or a package name'],
-  [/\b(curl|wget)\s+[^;|&]{0,1024}\.(sh|py|rb|pl)\b[^;|&]{0,1024}-o\s/i, 'Downloading executable script for later run -- review manually'],
+  [/\b(curl|wget)\s+[^;|]{0,1024}\.(sh|py|rb|pl)\b[^;|]{0,1024}-o\s/i, 'Downloading executable script for later run -- review manually'],
 
   // Container escape
   [/docker\s+run\s+.*--privileged/i, 'Privileged docker run blocked'],
@@ -1975,7 +1975,7 @@ const DENY_PATTERNS = [
   // (`dd if=/dev/urandom of=test.bin`) is a routine fixture -> ask.
   // Device / system path only (a Windows drive-letter *file* path like `C:/data/out.bin`
   // is an ordinary fixture and falls to the `dd if=` ask rule below).
-  [/\bdd\b[^|;]*\bof=(?:\/dev\/(?!null\b)|\/(?:etc|usr|bin|sbin|boot|sys|proc|var|lib)\b|\\\\[.?]\\)/i, 'dd writing to a device / system path blocked'],
+  [/\bdd\b[^|;]{0,512}\bof=(?:\/dev\/(?!null\b)|\/(?:etc|usr|bin|sbin|boot|sys|proc|var|lib)\b|\\\\[.?]\\)/i, 'dd writing to a device / system path blocked'],
   [/\bdd\s+if=/i, 'dd -- raw disk/file copy, approve only if intended', 'ask'],
 
   // Firewall. Read-only inspection (`iptables -L`, `ufw status`, `nft list`,
@@ -2025,7 +2025,7 @@ const DENY_PATTERNS = [
   // Persistence / credential WRITES. The redirect-only rc/hook/CI rules above miss
   // .ssh/authorized_keys, in-place editors, and download-to-file. These close that.
   // Redirect / tee / append into any persistence or credential target:
-  [new RegExp('(?:>>?|\\btee\\b(?:\\s+-a)?)\\s*[^\\n|;&]*' + PERSIST_TARGETS, 'i'),
+  [new RegExp('(?:>>?|\\btee\\b(?:\\s+-a)?)\\s*[^\\n|;&]{0,512}' + PERSIST_TARGETS, 'i'),
     'Writing to a persistence/credential file blocked -- possible backdoor'],
   // cp / mv / install specifically INTO an .ssh key file (rc files excluded here:
   // `cp ~/.bashrc ~/.bashrc.bak` backups are legit and can't be told from writes).
@@ -2034,13 +2034,13 @@ const DENY_PATTERNS = [
   // in-place editors (`sed -i ~/.bashrc`, `perl -i`). Uses the NO-CI target set --
   // editing your own repo's CI workflow with `sed -i` is routine (CI files are still
   // covered for redirect/download-into-place by the rules above/below).
-  [new RegExp('\\b(?:sed|perl)\\b[^|;]*\\s-i\\S*\\s[^|;]*' + PERSIST_TARGETS_NOCI, 'i'),
+  [new RegExp('\\b(?:sed|perl)\\b[^|;]{0,128}\\s-i\\S{0,32}\\s[^|;]{0,512}' + PERSIST_TARGETS_NOCI, 'i'),
     'In-place edit of a persistence/credential file blocked -- possible backdoor'],
   // download-to-file (`curl -o ~/.ssh/authorized_keys`, `wget -O` a git hook):
   [new RegExp('\\b(?:curl|wget)\\b[^|;]*(?:-o|-O|--output(?:-document)?)\\b[^|;]*' + PERSIST_TARGETS, 'i'),
     'Downloading a file onto a persistence/credential path blocked -- possible backdoor'],
   // rc-file in-place edit / download-into-place -> ask (routine self-setup vs a backdoor).
-  [new RegExp('\\b(?:sed|perl)\\b[^|;]*\\s-i\\S*\\s[^|;]*' + PERSIST_RC_RE, 'i'),
+  [new RegExp('\\b(?:sed|perl)\\b[^|;]{0,128}\\s-i\\S{0,32}\\s[^|;]{0,512}' + PERSIST_RC_RE, 'i'),
     'In-place edit of a shell rc file -- approve only if intended', 'ask'],
   [new RegExp('\\b(?:curl|wget)\\b[^|;]*(?:-o|-O|--output(?:-document)?)\\b[^|;]*' + PERSIST_RC_RE, 'i'),
     'Downloading a file onto a shell rc path -- approve only if intended', 'ask'],
@@ -2089,7 +2089,7 @@ const DENY_PATTERNS = [
   [/\bxattr\s+.*-d\s+com\.apple\.quarantine/i, 'Stripping com.apple.quarantine blocked'],
   // macOS: persistence
   [/\blaunchctl\s+(load|bootstrap|enable|submit)\b/i, 'launchctl load/bootstrap blocked -- possible persistence'],
-  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]*\/Library\/Launch(Agents|Daemons)\//i,
+  [/(>|>>|tee\s+(-a)?|cp\s|mv\s)\s*[^\n|;&]{0,512}\/Library\/Launch(Agents|Daemons)\//i,
     'Writing to LaunchAgents/LaunchDaemons blocked -- possible persistence'],
   // macOS: kexts / disks / accounts
   [/\b(kextload|kmutil\s+load)\b/i, 'Kernel extension load blocked'],
@@ -2132,7 +2132,7 @@ const POSH_DENY_PATTERNS = [
   // Mirrors the bash `cat .env` rule so a PowerShell-shaped read can't slip past it.
   [poshGlobSecretRead, null],
   // Variable-provider read: `${C:\proj\.env}` is the file's content.
-  [new RegExp('\\$\\{[A-Za-z]+:[\\\\/][^}]*' + SECRET_TOKENS + '[^}]*\\}', 'i'), 'Reading sensitive file via the variable provider blocked'],
+  [new RegExp('\\$\\{[A-Za-z]+:[\\\\/][^}]{0,256}' + SECRET_TOKENS + '[^}]{0,256}\\}', 'i'), 'Reading sensitive file via the variable provider blocked'],
   [new RegExp('\\b(?:Get-Content|gc|type|more|findstr|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)\\b[^;|]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via PowerShell/cmd blocked'],
   // .NET reads: File::ReadAllText/OpenText/OpenRead/Open and StreamReader.
@@ -3330,10 +3330,14 @@ function scanShellRedirectInjection(seg) {
   }
 }
 
+// Run as a hook (or loaded fresh by the in-process replay); when `require`d, only expose the
+// rule tables (for the regex cost test).
+const MAIN = !module.parent;
+if (!MAIN) module.exports = { DENY_PATTERNS, POSH_DENY_PATTERNS, CMD_DENY_PATTERNS };
 let data = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', chunk => { data += chunk; });
-process.stdin.on('end', () => {
+if (MAIN) process.stdin.setEncoding('utf8');
+if (MAIN) process.stdin.on('data', chunk => { data += chunk; });
+if (MAIN) process.stdin.on('end', () => {
   let input;
   try {
     input = JSON.parse(data.replace(/^\uFEFF/, ''));

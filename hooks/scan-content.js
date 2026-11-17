@@ -299,11 +299,11 @@ const MCP_IMPORTANT_RE = new RegExp('<IMPORTANT>[\\s\\S]{0,400}(?:do\\s+not\\s+(
 // ~16 ms/KB on `<!--` padding, which pushed adapter hook calls past their timeout.
 const HTML_COMMENT_KEYWORD_RE = /curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|webhook/i;
 function findActionComment(s) {
+  let e = -1;
   for (let i = s.indexOf('<!--'); i !== -1; ) {
-    const e = s.indexOf('-->', i + 4);
+    if (e < i + 4) e = s.indexOf('-->', i + 4);   // reuse the closer while it is still ahead
     if (e === -1) return null;
-    const body = s.slice(i + 4, e);
-    if (body.length <= 820 && HTML_COMMENT_KEYWORD_RE.test(body)) return { index: i, text: s.slice(i, e + 3) };
+    if (e - i - 4 <= 820 && HTML_COMMENT_KEYWORD_RE.test(s.slice(i + 4, e))) return { index: i, text: s.slice(i, e + 3) };
     i = s.indexOf('<!--', i + 4);
   }
   return null;
