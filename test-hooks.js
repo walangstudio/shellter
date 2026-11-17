@@ -2726,6 +2726,9 @@ console.log('\n--- 0.11.0 step 7: approve-listed commands that execute arguments
   testBash('sed twin: regex range allows', 'sed -n /de/,/fg/p f.txt', 'allow');
   testBash('sed twin: computed line from grep allows', "sed -n \"$(grep -n X f.txt | cut -d: -f1),+10p\" f.txt", 'allow');
   testBash('sed twin: paren inside the substitution allows', "P=src/a.ts; sed -n \"$(grep -n 'save()' \"$P\" | cut -d: -f1),+48p\" \"$P\"", 'allow');
+  // replay find: double quotes inside the substitution must not split the sed script token
+  testBash('sed twin: double quotes inside the substitution allow', "T=src/types.d.ts; for t in A B; do sed -n \"$(grep -n \"type $t = \" $T | head -1 | cut -d: -f1),+14p\" $T; done", 'allow');
+  testBash('sed: an e command after a quoted substitution still does not approve', "T=f.txt; sed \"$(grep -n \"x\" $T | cut -d: -f1)e id\" $T", 'fallthrough');
   testBash('tar: checkpoint-action no longer approves', "tar cf /dev/null x --checkpoint=1 --checkpoint-action=exec='" + EV + "'", 'fallthrough');
   testBash('tar: abbreviated --to-com no longer approves', "tar xf a.tar --to-com='" + EV + "'", 'fallthrough');
   testBash('tar twin: create archive allows', 'tar -czf out.tgz dist', 'allow');

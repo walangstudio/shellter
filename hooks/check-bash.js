@@ -2801,6 +2801,26 @@ function sedPlaceholders(t) {
   }
   return out.replace(/\$\{[^}]*\}|\$[A-Za-z_]\w*/g, '1');
 }
+// `s` with every `$( )` / `$(( ))` (outside single quotes) replaced by `1`. null = cannot delimit.
+function blankCommandSubs(s) {
+  let out = '', q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { out += c; if (c === "'") q = null; continue; }
+    if (c === '\\') { out += c + (s[i + 1] || ''); i++; continue; }
+    if (c === '"') { q = q ? null : '"'; out += c; continue; }
+    if (!q && c === "'") { q = "'"; out += c; continue; }
+    if (c === '$' && s[i + 1] === '(') {
+      const r = extractParenContent(s, i + 1);
+      if (!r) return null;
+      out += '1';
+      i = r.end - 1;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
 function sedExecs(toks, rawToks) {
   const scripts = [];
   let sawE = false, positional = null;
@@ -2921,7 +2941,15 @@ function checkBashApprove(seg, depth, idx) {
   // 7. Approve-listed commands that run their arguments.
   if (hasExecFlag(toks)) return false;
   if (w0 === 'awk' && awkExecs(toks)) return false;
-  if (w0 === 'sed' && sedExecs(toks, offs.map((o, k) => seg.slice(o, k + 1 < offs.length ? offs[k + 1] : seg.length).trim()))) return false;
+  if (w0 === 'sed') {
+    // `"$(grep -n "x" f | cut -d: -f1),+9p"`: the inner quotes would split the script token, so
+    // each `$( )` becomes a number first (its body was approve-checked in step 1).
+    const ss = blankCommandSubs(seg);
+    if (ss === null) return false;
+    const so = [];
+    const st = tokenizeArgs(ss, so);
+    if (sedExecs(st, so.map((o, k) => ss.slice(o, k + 1 < so.length ? so[k + 1] : ss.length).trim()))) return false;
+  }
 
   if (hasUnresolvedRead(seg, idx)) return false;
   for (const pattern of APPROVE_PATTERNS) if (pattern.test(seg)) return true;
