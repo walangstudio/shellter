@@ -2226,7 +2226,7 @@ const APPROVE_PATTERNS = [
   /^\s*(ruff|black|mypy|pylint|pyright|isort|flake8|bandit|pyflakes|autopep8|yapf|pycodestyle|pydocstyle|pyupgrade)\b/,
 
   // Go
-  /^\s*go\s+(version|env|run|test|build|vet|fmt|generate|list|doc|mod\s+(tidy|download|verify|graph|why|init))\b/,
+  /^\s*go\s+(version|env|run(?![^|;&]*\s[\w.-]+\.[a-z]{2,}\/\S*@)|test|build|vet|fmt|generate|list|doc|mod\s+(tidy|download|verify|graph|why|init))\b/,
 
   // JavaScript / TypeScript tooling
   /^\s*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc)\b/,
@@ -2238,7 +2238,7 @@ const APPROVE_PATTERNS = [
   /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:run|test|build|dev|lint|format|exec|start|typecheck|[\w-]+:[\w:-]+|config\s+(?:get|list)|why|ls|list|outdated)(?=\s|$)/,
   // `pnpm install` with flags only (no package argument): same trust as `npm ci`.
   /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:install|i)(?:\s+(?:-[\w-]+(?:=\S+)?|\d*>>?\s*&?\S+))*\s*$/,
-  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/,
+  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+(?:tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)|start)\b/,
   /^\s*yarn\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|start)\b/,
   /^\s*npm\s+(?:-[A-Za-z]+\s+)*(run|test|ci)\b/,
 
@@ -2268,7 +2268,9 @@ const APPROVE_PATTERNS = [
   /^\s*type\s+-[apt]/,
 
   // Multiplexers / archives / perms
-  /^\s*(tmux|screen)\s/,
+  // Multiplexers: inspection and teardown only (`new-session`, `send-keys`, `screen -dm` run commands).
+  /^\s*tmux\s+(?:ls|list-[a-z-]+|capture-pane|display-message|has-session|show-[a-z-]+|kill-session|kill-server)\b/,
+  /^\s*screen\s+-(?:ls|list)\b/,
   /^\s*(tar|zip|unzip|gzip|gunzip|bzip2|xz|zstd|7z)\s/,
   /^\s*(chmod|chown)\s/,
 ];
@@ -2325,7 +2327,7 @@ const POSH_APPROVE_PATTERNS = [
   /^\s*&\s+(['"]?)(?:\.[\\\/]\.venv[\\\/](?:Scripts|bin)[\\\/])?uv(?:\.exe)?\1\s+(run|sync|lock|tree|pip\s+(?:list|show|tree))\b/i,
   // pnpm/yarn/bun/npm under PowerShell (mirror bash JS-tooling rules with flag tolerance).
   /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/i,
-  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/i,
+  /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+(?:tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)|start)\b/i,
   /^\s*yarn\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|start)\b/i,
   /^\s*npm\s+(?:-[A-Za-z]+\s+)*(run|test|ci)\b/i,
 ];
@@ -2611,6 +2613,135 @@ const execEnvDanger = (a) => EXEC_ENV.test(a.name) && !/^[\w.+:=,@%-]*$/.test(a.
 
 const APPROVE_WRAPPERS = new Set(['command', 'builtin', 'timeout', 'time']);
 
+// Options that make an approve-listed command run a program.
+const EXEC_FLAGS = {
+  sort: /^--co/, split: /^--f/, rg: /^--(?:pre|hostname-bin)(?:=|$)/, bat: /^--pager/, delta: /^--pager/,
+  wget: /^(?:-e|--exe|--use-a)/, curl: /^(?:-[A-Za-z]*K|--conf)/,
+  tar: /^(?:--(?:checkpoint-a|to-c|us|rs|rmt|inf|new-)|-[A-Za-z]*[IF])/, zip: /^(?:-TT|--unzip-command)/,
+  fd: /^(?:-[A-Za-z]*[xX]|--exec)/,
+  git: /^--(?:exec|upload-pack|receive-pack|open-files-in-pager|ext-diff|extcmd)(?:=|$)/,
+};
+function hasExecFlag(toks) {
+  const w = base(toks[0]);
+  const re = EXEC_FLAGS[w];
+  if (re && toks.slice(1).some((t) => re.test(t))) return true;
+  if (w === 'git') {
+    const rest = toks.slice(1).filter((t, i, a) => !(t === '-C' || a[i - 1] === '-C'));
+    if (rest[0] === 'rebase' && rest.some((t) => /^-[A-Za-z]*x/.test(t))) return true;
+    if (rest[0] === 'bisect' && rest[1] === 'run') return true;
+  }
+  return false;
+}
+
+// awk runs commands through system(), `cmd | getline`, `print | cmd`; and loads code with -f/-i/-l/-e.
+function awkExecs(toks) {
+  let prog = null;
+  for (let i = 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (/^(?:-f|-i|-l|-e|-E|--file|--include|--load|--source|--exec)/.test(t)) return true;
+    if (t === '-v' || t === '-F' || t === '--assign' || t === '--field-separator') { i++; continue; }
+    if (t.startsWith('-') && t !== '-') continue;
+    prog = t; break;
+  }
+  if (prog === null) return false;
+  if (/\bsystem\s*\(|\bgetline\b|@(?:include|load)\b/.test(prog)) return true;
+  const noStr = prog.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/\/(?:[^\/\\\n]|\\.)*\//g, '//');
+  return /\bprintf?\b[^;}\n]*(?<!\|)\|(?!\|)/.test(noStr);
+}
+
+// Sequential GNU-sed script walk. True when the script runs a command (`e`, `s///e`),
+// writes a file (`w`, `s///w`), or cannot be parsed.
+function sedScriptExecs(s) {
+  let i = 0;
+  const n = s.length;
+  const skipDelim = (d) => {            // returns false when unterminated
+    for (; i < n; i++) { if (s[i] === '\\') { i++; continue; } if (s[i] === d) { i++; return true; } }
+    return false;
+  };
+  const addr = () => {
+    if (i >= n) return true;
+    if (/[0-9]/.test(s[i])) { while (i < n && /[0-9]/.test(s[i])) i++; }
+    else if (s[i] === '$') i++;
+    else if (s[i] === '/') { i++; if (!skipDelim('/')) return false; while (/[IM]/.test(s[i] || '')) i++; }
+    else if (s[i] === '\\' && i + 1 < n) { const d = s[i + 1]; i += 2; if (!skipDelim(d)) return false; while (/[IM]/.test(s[i] || '')) i++; }
+    return true;
+  };
+  const ws = () => { while (i < n && /[ \t]/.test(s[i])) i++; };
+  const eol = () => { while (i < n && s[i] !== '\n') i++; };
+  while (i < n) {
+    while (i < n && /[\s;{}]/.test(s[i])) i++;
+    if (i >= n) break;
+    if (!addr()) return true;
+    ws();
+    if (s[i] === ',' || s[i] === '~') { i++; ws(); if (s[i] === '+' || s[i] === '~') i++; if (!addr()) return true; ws(); }
+    while (s[i] === '!') { i++; ws(); }
+    if (i >= n) break;
+    const c = s[i++];
+    if (c === '{' || c === '}') continue;
+    if (c === '#') { eol(); continue; }
+    if (c === 's' || c === 'y') {
+      const d = s[i++];
+      if (d === undefined || d === '\n' || d === '\\') return true;
+      if (!skipDelim(d) || !skipDelim(d)) return true;
+      const f = /^[A-Za-z0-9]*/.exec(s.slice(i, i + 16))[0];
+      if (c === 's' && /[ew]/.test(f)) return true;
+      i += f.length;
+      continue;
+    }
+    if (c === 'e' || c === 'w' || c === 'W') return true;
+    if (/[aicrR]/.test(c)) { eol(); continue; }
+    if (/[btT:]/.test(c)) { while (i < n && s[i] !== ';' && s[i] !== '\n' && s[i] !== '}') i++; continue; }
+    if (/[dDgGhHlnNpPqQxz=F]/.test(c)) { while (i < n && /[0-9 \t]/.test(s[i])) i++; continue; }
+    return true;
+  }
+  return false;
+}
+// Shell expansions inside a sed script stand for text we cannot see: treat each as a number
+// (the common `"${n}p"`, `"$((a+1)),$((b))p"` line-address shape). `$( )` / `$(( ))` are
+// delimited with extractParenContent: a paren inside (`grep -n 'save()'`) is common. null =
+// cannot delimit.
+// Known ceiling: an expansion whose runtime value carries sed syntax (`1e cmd`) is not modelled.
+function sedPlaceholders(t) {
+  let out = '';
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === '$' && t[i + 1] === '(') {
+      const r = extractParenContent(t, i + 1);
+      if (!r) return null;
+      out += '1';
+      i = r.end - 1;
+      continue;
+    }
+    out += t[i];
+  }
+  return out.replace(/\$\{[^}]*\}|\$[A-Za-z_]\w*/g, '1');
+}
+function sedExecs(toks, rawToks) {
+  const scripts = [];
+  let sawE = false, positional = null;
+  for (let i = 1; i < toks.length; i++) {
+    const t = toks[i];
+    if (t === '--') { if (positional === null) positional = i + 1; break; }
+    if (/^(?:-[A-Za-z]*f|--file)/.test(t)) return true;
+    if (t === '--expression' || /^-[A-Za-df-zA-Z]*e$/.test(t)) { sawE = true; scripts.push(i + 1); i++; continue; }
+    if (t.startsWith('--expression=')) { sawE = true; scripts.push(-i); continue; }
+    if (t.startsWith('-') && t.length > 1) continue;
+    if (positional === null) positional = i;
+  }
+  if (!sawE && positional !== null) scripts.push(positional);
+  for (const k of scripts) {
+    const idx = Math.abs(k);
+    if (idx >= toks.length) continue;
+    let text = k < 0 ? toks[idx].slice('--expression='.length) : toks[idx];
+    const raw = rawToks[idx] || '';
+    if (!/^'[^']*'$/.test(raw)) {
+      text = sedPlaceholders(text);
+      if (text === null) return true;
+    }
+    if (sedScriptExecs(text)) return true;
+  }
+  return false;
+}
+
 const KW_PREFIX = /^\s*(?:if|then|else|elif|do|while|until|!|\{)(?=\s|$)\s*/;
 const KW_END = /^\s*(?:done|fi|esac|\})(?![\w-])/;
 
@@ -2700,6 +2831,11 @@ function checkBashApprove(seg, depth, idx) {
     return splitChainSegments(shellC.innerCmd).length > 0 && approveAll(shellC.innerCmd, depth, idx);
   }
 
+
+  // 7. Approve-listed commands that run their arguments.
+  if (hasExecFlag(toks)) return false;
+  if (w0 === 'awk' && awkExecs(toks)) return false;
+  if (w0 === 'sed' && sedExecs(toks, offs.map((o, k) => seg.slice(o, k + 1 < offs.length ? offs[k + 1] : seg.length).trim()))) return false;
 
   if (hasUnresolvedRead(seg, idx)) return false;
   for (const pattern of APPROVE_PATTERNS) if (pattern.test(seg)) return true;
