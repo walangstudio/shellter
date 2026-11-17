@@ -134,11 +134,12 @@ function pipeToInterpDanger(s) {
 // Split an argument string into tokens, honoring single/double quotes and
 // stripping them (so `"/"` -> `/`). Good enough for flag/target extraction, not a
 // full shell parser.
-function tokenizeArgs(s) {
+function tokenizeArgs(s, offs) {
   const out = [];
-  let cur = '', q = null, has = false;
+  let cur = '', q = null, has = false, st = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
+    if (!has && !/\s/.test(c)) st = i;
     if (q === "'") { if (c === "'") q = null; else cur += c; has = true; continue; }
     if (q === '"') {
       // Inside double quotes bash treats `\` as an escape ONLY before $ ` " \ or newline;
@@ -155,10 +156,10 @@ function tokenizeArgs(s) {
       has = true; continue;
     }
     if (c === "'" || c === '"') { q = c; has = true; continue; }
-    if (/\s/.test(c)) { if (has) { out.push(cur); cur = ''; has = false; } continue; }
+    if (/\s/.test(c)) { if (has) { out.push(cur); if (offs) offs.push(st); cur = ''; has = false; } continue; }
     cur += c; has = true;
   }
-  if (has) out.push(cur);
+  if (has) { out.push(cur); if (offs) offs.push(st); }
   return out;
 }
 
@@ -817,20 +818,24 @@ function parseFindExec(segment) {
 }
 
 // Returns the inner command string from `xargs [opts] CMD ARGS`.
-function parseXargs(segment) {
+function parseXargs(segment, strict) {
   const stripped = segment.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*/, '');
   if (!/^xargs\b/.test(stripped)) return null;
   const tokens = stripped.split(/\s+/);
   if (tokens[0] !== 'xargs') return null;
-  const valueFlags = new Set(['-I', '-n', '-P', '-d', '-E', '-s', '-L']);
+  const valueFlags = new Set(['-I', '-n', '-P', '-d', '-E', '-s', '-L', '-a']);
+  const longValue = /^--(?:arg-file|delimiter|max-args|max-procs|max-chars|process-slot-var)$/;
+  const longBool = /^--(?:null|no-run-if-empty|verbose|interactive|exit|open-tty|show-limits|eof|replace|max-lines)(?:=|$)/;
   let i = 1;
   while (i < tokens.length) {
     const tok = tokens[i];
     if (!tok.startsWith('-')) break;
     if (tok.startsWith('--') && tok.includes('=')) { i++; continue; }
-    if (tok.startsWith('--')) { i++; continue; }
+    if (longValue.test(tok)) { i += 2; continue; }
+    if (tok.startsWith('--')) { if (strict && !longBool.test(tok)) return undefined; i++; continue; }
     if (tok.length > 2 && valueFlags.has(tok.slice(0, 2))) { i++; continue; }
     if (tok.length === 2 && valueFlags.has(tok) && i + 1 < tokens.length) { i += 2; continue; }
+    if (strict && !/^-[0prtxo]+$/.test(tok)) return undefined;
     i++;
   }
   if (i >= tokens.length) return null;
@@ -2225,8 +2230,14 @@ const APPROVE_PATTERNS = [
 
   // JavaScript / TypeScript tooling
   /^\s*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc)\b/,
-  /^\s*(npx|pnpm|yarn|bun)\s+(?:-[A-Za-z]+\s+)*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)\b/,
-  /^\s*pnpm\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|exec|start)\b/,
+  /^\s*(npx|pnpm|yarn|bun)\s+(?:--prefix\s+\S+\s+|-[A-Za-z]+\s+)*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|playwright\s+test)\b/,
+  /^\s*npm\s+(?:view|ls|outdated|config\s+(?:get|list))\b/,
+  /^\s*node\s+--check\s/,
+  // `gh api` read: no method override and no body/field flag anywhere in the segment.
+  /^\s*gh\s+api(?![^|;&]*\s(?:-X|--method|-f|-F|--field|--raw-field|--input)\b)\s/,
+  /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:run|test|build|dev|lint|format|exec|start|typecheck|[\w-]+:[\w:-]+|config\s+(?:get|list)|why|ls|list|outdated)(?=\s|$)/,
+  // `pnpm install` with flags only (no package argument): same trust as `npm ci`.
+  /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:install|i)(?:\s+(?:-[\w-]+(?:=\S+)?|\d*>>?\s*&?\S+))*\s*$/,
   /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+\S+|start)\b/,
   /^\s*yarn\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|lint|format|start)\b/,
   /^\s*npm\s+(?:-[A-Za-z]+\s+)*(run|test|ci)\b/,
@@ -2248,24 +2259,12 @@ const APPROVE_PATTERNS = [
   /^\s*pre-commit\s+(run|install|autoupdate|validate-config|migrate-config|sample-config)\b/,
   /^\s*(tflint|shellcheck|hadolint|yamllint|markdownlint)\b/,
 
-  // Shell control flow / builtins
-  /^\s*(for|while|until|do|done|if|then|else|elif|fi|case|esac|select)\b/,
-  /^\s*do\s/,
-  /^\s*done\s*$/,
-  /^\s*then\s*$/,
-  /^\s*fi\s*$/,
+  // Shell builtins. Keywords, wrappers (command/timeout/time/builtin), trap and assignments are
+  // handled structurally in checkBashApprove: what they run must approve.
+  /^\s*(?:\[\[?\s|:(?:\s|$)|(?:break|continue|return|exit|shift|wait|sleep)\b)/,
   // `source` / `.` removed here: routed through the script-content scanner so a
   // sourced local script is inspected, not blanket-approved.
-  // KNOWN LIMIT (defense-in-depth, tracked): `command`/`timeout`/`time`/`builtin` here approve
-  // the wrapper without examining what it wraps, so `timeout 5 sh /tmp/y` auto-approves although
-  // bare `sh /tmp/y` only prompts. This ALSO amplifies any deny rule that is not wrapper-aware
-  // into a silent allow: the pipe-to-interpreter and process-substitution denies are tokenized
-  // through stepWrappers precisely so this can't launder them, but a future `^`-anchored deny
-  // added without the same treatment would be laundered here. The robust fix is a wrapper-aware
-  // approve pass (recurse into the wrapped command) that still preserves `command -v X` and
-  // `timeout <legit-cmd>`; deferred to its own change so it can be reviewed on its own.
-  /^\s*(export|set|type|command|hash|builtin|timeout|time|trap|read|local|declare|readonly|unset)\s/,
-  /^\s*command\s+-v\s/,
+  /^\s*(set|type|hash|read|unset)\s/,
   /^\s*type\s+-[apt]/,
 
   // Multiplexers / archives / perms
@@ -2564,99 +2563,146 @@ function checkSegmentApprove(seg, depth, isPosh, idx) {
 
   if (heredocWriteUnsafe(seg)) return false;
 
-  // Pipe: a segment is only safe if EVERY stage is safe. Without this, `echo x |
-  // xargs node` / `find /home | xargs rm -rf` would approve on the first stage
-  // alone. (Deny patterns that span a pipe, e.g. `curl | bash`, already ran.)
+  return checkBashApprove(seg, depth, idx);
+}
+
+const base = (t) => String(t || '').replace(/^.*[\\/]/, '');
+
+// Every command / process substitution that bash would EXECUTE in `s` (outside single
+// quotes; `$(` runs inside double quotes too). Top level only -- callers recurse.
+// `$(( expr ))` is arithmetic: not a command, but a `$(cmd)` nested in it still runs.
+// Returns null when a substitution cannot be delimited (caller must not approve).
+function extractCommandSubs(s) {
+  const out = [];
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { if (c === "'") q = null; continue; }
+    if (c === '\\') { i++; continue; }
+    if (q === "$'") { if (c === "'") q = null; continue; }
+    if (c === '"') { q = q ? null : '"'; continue; }
+    if (!q && c === '$' && s[i + 1] === "'") { q = "$'"; i++; continue; }
+    if (!q && c === "'") { q = "'"; continue; }
+    if (c === '`') {
+      const e = s.indexOf('`', i + 1);
+      if (e === -1) return null;
+      out.push(s.slice(i + 1, e)); i = e; continue;
+    }
+    const open = (c === '$' && s[i + 1] === '(') || (!q && (c === '<' || c === '>') && s[i + 1] === '(');
+    if (!open) continue;
+    const r = extractParenContent(s, i + 1);
+    if (!r) return null;
+    let ar = null;
+    if (c === '$' && r.inner[0] === '(' && (ar = extractParenContent(r.inner, 0)) && ar.end === r.inner.length) {
+      const nested = extractCommandSubs(ar.inner);
+      if (nested === null) return null;
+      out.push(...nested);
+    } else out.push(r.inner);
+    i = r.end - 1;
+  }
+  return out;
+}
+
+// Env names whose VALUE is run as a command (or loaded as code) by an otherwise read-only
+// approved tool. A bare-word value (`GIT_PAGER=cat`, `EDITOR=true`) names a PATH program
+// with no arguments and stays approvable.
+const EXEC_ENV = /^(?:\w*(?:PAGER|EDITOR|VISUAL|BROWSER|ASKPASS|EXTERNAL_DIFF|_SSH|COMMAND)|GIT_(?:CONFIG\w*|EXEC_PATH|TEMPLATE_DIR)|LESS(?:OPEN|CLOSE)|BASH_ENV|ENV|PS4|SHELL|NODE_OPTIONS|(?:LD|DYLD)_\w+)$/;
+const execEnvDanger = (a) => EXEC_ENV.test(a.name) && !/^[\w.+:=,@%-]*$/.test(a.raw.replace(/^(['"])(.*)\1$/, '$2'));
+
+const APPROVE_WRAPPERS = new Set(['command', 'builtin', 'timeout', 'time']);
+
+const KW_PREFIX = /^\s*(?:if|then|else|elif|do|while|until|!|\{)(?=\s|$)\s*/;
+const KW_END = /^\s*(?:done|fi|esac|\})(?![\w-])/;
+
+function approveAll(text, depth, idx) {
+  const segs = splitChainSegments(text);
+  for (const s of segs) if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
+  return true;
+}
+
+function checkBashApprove(seg, depth, idx) {
+  // 1. Everything bash would execute inside a substitution must itself approve.
+  const subs = extractCommandSubs(seg);
+  if (subs === null) return false;
+  for (const inner of subs) if (!approveAll(inner, depth, idx)) return false;
+
+  // 2. Pipes: every stage.
   const stages = splitPipeStages(seg);
   if (stages.length > 1) {
     for (const st of stages) if (!checkSegmentApprove(st, depth + 1, false, idx)) return false;
     return true;
   }
 
-  // find / xargs: auto-approve only if every executed sub-command also approves.
-  // The deny pass already recurses into these, so a dangerous child is blocked
-  // before we get here; this stops a benign-looking find/xargs from laundering an
-  // un-denied interpreter (`find ... -exec node x +`, `... | xargs node`).
-  if (/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s]*\/)?find\b/.test(seg)) {
-    // find primaries that DELETE or WRITE a file (-delete, -fprintf/-fprint/-fls/
-    // -fprint0) are not auto-approved -- otherwise `find . -fprintf ~/.ssh/authorized_keys
-    // "..."` installs a backdoor with no prompt.
-    if (/\s-(?:delete|fls|fprint(?:f|0)?)\b/.test(seg)) return false;
-    const execCmds = parseFindExec(seg);
-    if (/\s-(?:exec|execdir|ok|okdir)\b/.test(seg) && !execCmds) return false;  // exec present but unparseable
-    for (const c of (execCmds || [])) {
-      for (const inner of splitChainSegments(c)) if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
-    }
-    return true;
+  // 3. Compound-command syntax: approve what the keyword introduces, not the keyword.
+  let m;
+  if (KW_END.test(seg)) return true;                         // only redirections can follow
+  if ((m = KW_PREFIX.exec(seg))) {
+    const rest = seg.slice(m[0].length);
+    return rest.trim() === '' || checkSegmentApprove(rest, depth + 1, false, idx);
   }
-  if (/^\s*(?:[A-Za-z_]\w*=\S*\s+)*xargs\b/.test(seg)) {
-    const xargsCmd = parseXargs(seg);
-    if (xargsCmd) {
-      for (const inner of splitChainSegments(xargsCmd)) if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
-    }
-    return true;
+  if (/^\s*(?:for|select)\s/.test(seg)) return true;         // word list is data; substitutions checked above
+  if ((m = /^\s*case\s[\s\S]*?\sin(?=\s|$)\s*/.exec(seg)) || (m = /^\s*(?=\(?[^\s()]+\)\s)/.exec(seg))) {
+    const rest = seg.slice(m[0].length).replace(/^\(?[^\s()]*\)\s*/, '').replace(/[;\s]+$/, '');
+    return rest === '' || checkSegmentApprove(rest, depth + 1, false, idx);
+  }
+  const t0 = seg.trimStart();
+  if (t0.startsWith('((')) return /\)\)\s*$/.test(t0);        // arithmetic command
+  if (t0[0] === '(') {
+    const r = extractParenContent(t0, 0);
+    if (!r || /[^\s\d<>&\/\w.-]/.test(t0.slice(r.end))) return false;
+    return approveAll(r.inner, depth, idx);
   }
 
+  // 4. Assignments. `X=1 cmd` approves iff `cmd` does; an exec-carrying env name never rides along.
+  const exp = /^\s*(?:export|declare|typeset|readonly|local)\b((?:\s+-[A-Za-z]+)*)\s*/.exec(seg);
+  const ap = splitAssignPrefix(exp ? seg.slice(exp[0].length) : seg);
+  if (ap.bad) return false;
+  if (ap.assigns.some(execEnvDanger)) return false;
+  if (exp) return /^[\w\s]*$/.test(ap.rest);
+  if (ap.assigns.length) return ap.rest === '' || checkSegmentApprove(ap.rest, depth + 1, false, idx);
+
+  const offs = [];
+  const toks = tokenizeArgs(seg, offs);
+  if (!toks.length) return false;
+  const w0 = base(toks[0]);
+
+  // 5. Wrappers: approve what they run.
+  if (APPROVE_WRAPPERS.has(w0)) {
+    if (w0 === 'command' && /^-[vV]$/.test(toks[1] || '')) return true;
+    const at = stepWrappers(toks, 0, NO_NAMES);
+    if (at >= toks.length) return false;
+    if (toks.slice(0, at).some((t) => CMD_WRAPPERS.has(base(t)) && !APPROVE_WRAPPERS.has(base(t)))) return false;
+    return checkSegmentApprove(seg.slice(offs[at]), depth + 1, false, idx);
+  }
+  if (w0 === 'trap') {
+    const a = toks[1] === '--' ? toks[2] : toks[1];
+    if (a === undefined || a === '' || a === '-' || /^-[lp]$/.test(a)) return true;
+    return approveAll(a, depth, idx);
+  }
+
+  // 6. find / xargs / sh -c: every executed sub-command.
+  if (w0 === 'find') {
+    if (toks.some((t) => /^-(?:delete|fls|fprint(?:f|0)?)$/.test(t))) return false;
+    const nExec = toks.filter((t) => /^-(?:exec|execdir|ok|okdir)$/.test(t)).length;
+    const execCmds = parseFindExec(seg) || [];
+    if (execCmds.length !== nExec) return false;
+    for (const c of execCmds) if (!approveAll(c, depth, idx)) return false;
+    return true;
+  }
+  if (w0 === 'xargs') {
+    const xargsCmd = parseXargs(seg, true);
+    if (xargsCmd === undefined) return false;                // unknown flag: arity unknown
+    return !xargsCmd || approveAll(xargsCmd, depth, idx);
+  }
   const shellC = parseShellCInvocation(seg);
   if (shellC) {
     if (shellC.opaque) return false;
-    const innerSegs = splitChainSegments(shellC.innerCmd);
-    if (innerSegs.length === 0) return false;
-    for (const inner of innerSegs) {
-      if (!checkSegmentApprove(inner, depth + 1, false, idx)) return false;
-    }
-    return true;
+    return splitChainSegments(shellC.innerCmd).length > 0 && approveAll(shellC.innerCmd, depth, idx);
   }
 
-  const assignMatch = seg.match(/^\s*[A-Za-z_][A-Za-z0-9_]*=(.*)$/);
-  if (assignMatch) {
-    const value = assignMatch[1].trim();
-    if (value === '') return true;
-    if (!value.includes('$(') && !value.includes('`')) return true;
 
-    if (value.startsWith('$(')) {
-      const r = extractParenContent(value, 1);
-      if (r && r.end === value.length) {
-        const innerSegs = splitChainSegments(r.inner);
-        for (const s of innerSegs) {
-          if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
-        }
-        return true;
-      }
-    }
-    if (value.startsWith('"$(') && value.endsWith(')"')) {
-      const r = extractParenContent(value, 2);
-      if (r && r.end === value.length - 1) {
-        const innerSegs = splitChainSegments(r.inner);
-        for (const s of innerSegs) {
-          if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
-        }
-        return true;
-      }
-    }
-    if (value.startsWith('`') && value.endsWith('`') && value.length > 2) {
-      const innerSegs = splitChainSegments(value.slice(1, -1));
-      for (const s of innerSegs) {
-        if (!checkSegmentApprove(s, depth + 1, false, idx)) return false;
-      }
-      return true;
-    }
-  }
-
-  // Approve floor: auto-approving a read whose target we cannot see is the same
-  // hole as never checking it. `cat $X` matched a plain-read approve rule and
-  // returned `allow`. Refuse to approve a read verb whose argument still holds an
-  // expansion we could not resolve; the normal permission prompt takes over.
-  // Narrow to READ_VERB_SET and to genuinely unresolved names, so a resolvable
-  // one (`F=/t/o.txt; jq -r '.a' $F`) still approves as before.
   if (hasUnresolvedRead(seg, idx)) return false;
-
-  const stripped = seg.replace(/^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
-  for (const pattern of APPROVE_PATTERNS) {
-    if (pattern.test(seg) || pattern.test(stripped)) {
-      return true;
-    }
-  }
+  for (const pattern of APPROVE_PATTERNS) if (pattern.test(seg)) return true;
   return false;
 }
 
@@ -3067,6 +3113,17 @@ process.stdin.on('end', () => {
       // A blanked body is never approved past a Class A injection finding (the Write tool denies it).
       bodyHigh = scan.hasHigh(scan.scanInjection(work, { decode: true }));
     }
+  }
+
+  // Substitution bodies run too: deny-check them like segments. On the approve view, so a
+  // commit-message heredoc inside `"$(cat <<'EOF' ... )"` is not read as commands.
+  if (!isPosh) {
+    const denySubs = (seg, depth, mode) => {
+      if (depth > 6) return;
+      for (const inner of (extractCommandSubs(seg) || [])) for (const s of splitChainSegments(inner)) { checkSegmentDeny(s, depth + 1, mode); denySubs(s, depth + 1, mode); }
+    };
+    for (const seg of appSegs) denySubs(seg, 0, 'hard');
+    for (const seg of appSegs) denySubs(seg, 0, 'ask');
   }
 
   // Coverage gate. Placed after every deny pass (so a hard deny still wins) and
