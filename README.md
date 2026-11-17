@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.10.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.11.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-1037%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-1616%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -123,6 +123,9 @@ shown).
 | `find … -exec CMD … \;` | `CMD` parsed and checked |
 | `xargs … CMD` | `CMD` parsed and checked |
 | process substitution | inner command checked; `bash <(curl …)` and `source <(curl/wget/base64 …)` denied; `source <(kubectl completion …)` and other local generators allowed |
+| `X=1 cmd`, `timeout`/`time`/`command`/`builtin`, `if`/`for`/`while`/`case`, `( )`, `{ }`, `trap`, `&` | approve side: approves only if the command it runs approves (`X=1 npm test` yes, `X=1 node x.js` no) |
+| `$( )`, backticks, `<( )`, `>( )` | every body is deny-checked and must itself approve |
+| PowerShell `( )`, `$( )`, `{ }`, pipe stages | every group body and every stage must approve |
 
 ## Script trust
 
@@ -142,7 +145,10 @@ node ~/.claude/hooks/shellter-trust.js remove <hash|path>
 ```
 
 Trust survives move/rename; editing the script invalidates it. Store at
-`~/.claude/shellter-trust.json` (override with `SHELLTER_TRUST_FILE`). If a build doesn't
+`~/.claude/shellter-trust.json` (override with `SHELLTER_TRUST_FILE`, an absolute path outside the
+project). A `:*` allow rule is matched against the script segment only, and a
+`.claude/settings.local.json` that is tracked by git is ignored: a cloned repo cannot whitelist
+its own script. shellter denies writes to its trust store and installed hooks. If a build doesn't
 surface `ask` reasons, set `SCRIPT_RISK_DECISION` in `check-bash.js` to `'deny'`.
 
 ## Injection-on-write
@@ -225,7 +231,8 @@ source, and the payload is only dangerous where an agent auto-ingests it (see
 
 Does not protect against: TOCTOU symlink races, kernel-level attacks or processes already
 running as you, tools other than Bash/Read/Write/Edit/Glob/Grep, brand-new patterns not
-yet in the deny list.
+yet in the deny list. **MCP tools (`mcp__*`) are not gated**: a filesystem or shell MCP server
+reads and runs whatever it is asked, and its tool shapes are unknown to shellter.
 
 **shellter fails open.** If `node` is not on the PATH Claude Code launches hooks with, the
 hook exits 127 and Claude Code treats that as non-blocking — the tool call runs unchecked.
@@ -304,7 +311,10 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.10.0 - never asks in bypass or auto mode
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.11.0 - security-fix release: auto-approve is
+structural (an env prefix, wrapper, keyword, substitution or heredoc approves only if what it runs
+approves), secret reads see through globs and escapes, Windows backslash paths are canonicalised,
+and the trust store ignores repo-committed allow rules. Previously 0.10.0 - never asks in bypass or auto mode
 (denies still block), stops false "could not fully analyze" prompts on heredocs, nested `$( … )`
 quoting (found in real sessions), analyzes Python fed through a heredoc, narrows the
 data-file polyglot rule from a hard deny to an ask on remote fetches only, and adds the

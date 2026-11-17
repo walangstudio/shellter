@@ -65,6 +65,90 @@ false positives or add fragile complexity out of proportion to the risk:
 - **Double base64 / hex decoding (D4)** — the content scanner decodes one layer; a payload
   encoded twice evades the decoded-layer scan.
 
+## Third review - structural approve (v0.11.0, 2026-11-17)
+
+Two independent reviews of v0.10.0: the command hook (B-*) and the file hook, trust store,
+scanner and adapters (F-*). Every finding was reproduced against the live hooks over stdin, and
+every fix ships with an attack test and a benign twin. The root cause behind most of the B-C
+findings was one design flaw: the approve pass matched the first word of a segment, not what the
+segment runs. It now recurses instead (env prefix, wrapper, keyword, `&`, substitution, `trap`,
+`find -exec`, `xargs`, PowerShell blocks all reduce to "does the inner command approve?"), which
+closes the holes without prompting on `X=1 npm test` or `timeout 30 npm test`. A committed
+prompt-rate corpus in `test-hooks.js` and `scripts/replay-corpus.js` (a replay of a real decision
+log against the previous release) gate every change on not adding prompts.
+
+| Finding | v0.10.0 | v0.11.0 |
+| --- | --- | --- |
+| B-C1 heredoc fast path approves an unvalidated `cat` preface | allow | deny / exact preface only |
+| B-C2 python heredoc validator is a keyword blacklist | allow | fallthrough (validator removed) |
+| B-C3 env prefix approves the whole command | allow | fallthrough unless the command approves |
+| B-C4 single `&` is not a separator | allow | split; each command checked |
+| B-C5 `$( )`, backticks, `<( )`, `>( )` never inspected | allow | deny-checked and must approve |
+| B-C6 shell keywords approve what follows | allow | the body must approve |
+| B-C7 quoted `find` primaries | allow | primaries read from tokens |
+| B-C8 approve-listed tools that execute arguments (awk, sed, tar, git, fd, rg, tmux, screen) | allow | no approve on exec options |
+| B-C9 PowerShell verb-prefix approve | allow | structural: every stage and group body |
+| B-H1 exponential assignment regex | 30 s+ hang | linear scan |
+| B-H2 secret reads via glob, backslash, `$'x'` | allow | deny |
+| B-H3 secret reads via `sort`, `diff`, input redirect, `ln`, `git diff --no-index`, `curl file://` | allow | deny |
+| B-H4 `curl --json @`, bundled `-sT`, `wget --body-file` uploads | allow | deny (secret) / ask (any file) |
+| B-H5 `xargs` flag arity | allow | unknown flag: no approve |
+| B-H6 heredoc trailing commands skip the ask tier | allow | full pipeline |
+| B-M1 polynomial rules on a long comment | slow | bounded |
+| B-M2 escaped / globbed `rm`, nested `sh -c`, grouped pipe to a shell, `git config set` | fallthrough | deny |
+| B-M3 `bun x <pkg>`, `go run host/mod@v`, `~/.kube/config`, gh `hosts.yml`, `/proc/self/environ` | allow | fallthrough / deny |
+| F-C1 `:*` rule matched against the whole compound command | allow | segment only |
+| F-C2 Windows backslash paths | fallthrough | deny |
+| F-H1 repo-committed `settings.local.json` | allow | ignored when git-tracked |
+| F-H2 agent writes its own trust / hooks / relative `SHELLTER_TRUST_FILE` | fallthrough / allow | deny / ignored |
+| F-H3 Grep `glob`, token-shape regexes | fallthrough | deny (broad path for shapes) |
+| F-H4 adapter write tools unscanned | allow | scanned (best-effort shapes) |
+| F-H5 adapters time out on 300 KB comment padding | fail open | linear scan, 20 s timeout |
+| F-H6 installer with a space in the home path | fail open | quoted |
+| F-M1 junction / `::$DATA` / other hosts' instruction files | fallthrough | deny |
+| F-M2 invisible format characters, Markdown emphasis | fallthrough | deny on instruction files |
+| F-M3 false hard-denies on ordinary content | deny | fallthrough / ask |
+| F-M4 `shellter scan` blind spots | no findings | reported |
+| F-M5 decode budget exhausted by 8 decoys | fallthrough | 64 tokens; exhaustion asks on instruction files |
+| F-M6 secret-path list gaps | fallthrough | deny (history / `.claude.json` ask) |
+| F-L1 dead `data:text/html` branch | fallthrough | deny in rendered docs |
+| F-L2 installer BOM / non-object settings | data loss | BOM accepted, non-object aborts |
+| F-L3 stale bun adapter tests | red | green |
+| F-L4 dead `permissions` line | present | removed |
+
+The heredoc approve view blanks quoted bodies before the approve pass, so a commit or PR body with
+an apostrophe no longer prompts. Deny passes still read the full text.
+
+### Accepted limits (v0.11.0)
+
+- **Code runners** (`tsx x.ts`, `ts-node`, `bun run`, `uv run`, `java -jar`, `pnpm exec`) still
+  auto-approve: they run project code, the same trust as `npm run`. Only the remote-fetch forms
+  (`bun x <pkg>`, `go run host/mod@version`) were closed.
+- **Destructive or persistent writes** that no rule names (`chmod -R 000 ~`, `mv ~/Documents /tmp`,
+  `git switch -f`, `echo x > ~/.config/autostart/...`, `cp evil ~/.bashrc`) still auto-approve. A
+  write-target classifier needs its own release and false-positive budget.
+- **`PATH=` / `PYTHONPATH=` / `LD_LIBRARY_PATH=` prefixes** stay approvable: they need a planted
+  file first, and `export PATH="$HOME/.cargo/bin:$PATH" && cargo build` is everywhere.
+- **A secret env var in a header or URL** (`curl -H "Authorization: Bearer $GITHUB_TOKEN" ...`) is
+  indistinguishable from every authenticated API call.
+- **`cp $X out.txt` with an unresolved `$X`** stays approvable: copying is not disclosure.
+- **sed / awk scripts whose shell variable carries code at runtime** are not modelled.
+- **Loop variables over a literal word list** (`for f in a b; do grep x $f; done`) stay
+  "unresolved" and prompt, as before. Resolving them is the largest remaining prompt-rate win.
+- **Heredoc bodies of `cat`/`tee`** are still deny-scanned as pseudo-commands (a known false-prompt
+  source); relaxing a deny pass does not belong in a security-fix release.
+- **WebFetch / WebSearch** are not gated: exfiltration needs a secret already read, which the gated
+  tools cover.
+- **MCP tools (`mcp__*`) are a known bypass.** A filesystem or shell MCP server reads and runs what
+  it is asked; shellter does not know its tool shapes, and a generic sniff would false-deny.
+- **Adapters fail open on a timeout.** The cause (a superlinear comment scan) is fixed; failing
+  closed would turn a slow machine into a false block.
+- **`ls` / `list` on `~/.ssh`** through the opencode and pi adapters: filenames only.
+- **Host tool shapes** for codex / agy / opencode patch and multi-edit tools are best-effort; only
+  the adapter side is verified.
+- **Triple encoding, and codex treating `ask` as silent**: unchanged, documented above.
+- **`tmux send-keys`, git commit hooks, `npm run` scripts**: project-trust model.
+
 ## Read the verdict labels precisely
 
 shellter is deny → script-scan → ask → approve → **fallthrough**. A finding's

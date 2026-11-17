@@ -7,6 +7,98 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.11.0] - 2026-11-17
+
+A security-fix release from a third review: the auto-approve pass now asks what a command actually
+runs, secret reads see through globs and escapes, and the trust store can no longer be steered by a
+cloned repo. The rule that kept the prompt rate flat: an over-broad allow becomes a recursion, not a
+deletion, so `X=1 npm test`, `timeout 30 npm test` and `if [ -f x ]; then npm test; fi` keep their
+silent allow. **In bypassPermissions and auto mode this release adds no prompts**: the only new
+verdicts there are denies on shapes whose plain form already denies.
+
+**Fewer false blocks.**
+- Keycap, (c), (R), TM and info-sign emoji with a variation selector no longer deny as smuggling.
+- A ZWJ emoji sequence or a leading BOM in `.tsx`/`.json`/`.yml` no longer denies; a zero-width char
+  anywhere else still does.
+- `re.exec(atob(x))` asks instead of denying; a bare `eval(atob(x))` still denies, and python
+  `exec(base64.b64decode(x))` now does too.
+- A `javascript:` link denies only where it renders (Markdown/HTML, instruction files); a sanitizer
+  test in `.js` is fine. `[x](data:text/html,...)` in Markdown now denies (the old rule never matched).
+- `<IMPORTANT>` blocks deny only on concealment or a transfer verb aimed at a secret.
+- A literal ESC colour sequence asks in source files and denies only in instruction files.
+- On instruction files, `<system>`/`<instructions>` tags, `User:`/`Assistant:` examples, persona
+  phrasing ("act as if you are"), and an HTML comment holding a link or the word "token" are advisory.
+  "you are now in the project root" and "if the user gives new instructions" no longer match.
+
+**Auto-approve is now structural.** A segment approves only if what it runs approves: an env prefix,
+`command`/`timeout`/`time`/`builtin`, shell keywords (`if`/`for`/`while`/`case`/subshell/brace
+group), `trap`, every `$( )`, backtick, `<( )` and `>( )` body, `find -exec`, and `xargs` are all
+recursed into. A single `&` now separates commands. The heredoc fast path accepts only an exact
+`cat`/`cat > file` preface and sends trailing commands through the full pipeline; heredoc bodies are
+blanked for the approve pass (so `git commit -m "$(cat <<'EOF' ... it's ... EOF)"` now allows instead
+of asking). Approve-listed commands that execute their arguments lose the approve on those options:
+`awk system()/getline/print |`, `sed e`/`s///e`/`w`, `tar --checkpoint-action/--to-command`,
+`git rebase -x`/`bisect run`/`--upload-pack`, `fd -x`, `rg --pre`, `sort --compress-program`,
+`tmux new-session`, `screen -dm`, `bun x <any package>`, `go run host/mod@version`. Env names whose
+value is run as a command (`*_PAGER`, `*EDITOR`, `GIT_SSH_COMMAND`, `LD_*`, ...) keep the approve only
+with a bare-word value. PowerShell approve is structural too: every pipe stage, every `( )`, `$( )` and
+`{ }` body must approve, a mid-stage `&` does not approve, redirect targets must be project files, and
+the verb-prefix rule is narrowed (`Format-Volume` no longer approves).
+
+**Secret reads.** Globs that expand to a secret (`cat .en*`, `~/.s?h/id_r*a`), backslash and `$'x'`
+escapes (`.e\nv`), more read verbs at command position (`sort`, `uniq`, `diff`, `comm`, `expand`,
+`fmt`, `shuf`, `join`, `tsort`), an input redirect anywhere in the segment (`sort < .env`,
+`done < .env`), `ln -s` of a secret, `git diff --no-index`, `curl file://`, `curl --json @`, bundled
+`-sT`, `wget --body-file` and the PowerShell spellings (`` .e`nv ``, `.e"n"v`, `('.e'+'nv')`,
+`${C:\p\.env}`) all deny like the plain form. File tools: backslash paths, NTFS stream and
+trailing-dot spellings, junctions into `.claude/`, `.envrc`, `.env_prod`, `_netrc`,
+`/proc/*/environ`, `~/.kube/config`, gh `hosts.yml` deny; shell history and `~/.claude.json` ask.
+Grep's `glob` is checked, and a token-shape regex or `password\s*=` over a home/system/drive-root
+path denies.
+
+**Trust store.** A `:*` allow rule is matched against the script's own segment, never the whole
+compound command (`git status; bash ./evil.sh` under `Bash(git status:*)` used to allow). A
+`.claude/settings.local.json` that the repo commits is ignored. `SHELLTER_TRUST_FILE` must be an
+absolute path outside the working directory. Writing the trust store or an installed shellter hook
+denies; writing `.claude/settings*.json` asks.
+
+**Hang and crash hardening.** The assignment scan is linear (a 36-step ambiguous prefix hung the hook
+for 30 s+), two polynomial rules are bounded, the HTML-comment scan is an indexOf walk (300 KB of
+padding pushed adapter calls past their timeout), adapter timeouts are 20 s, a UTF-8 BOM before the
+hook JSON is accepted, nested argv arrays are flattened, and the installer quotes hook paths (a home
+with a space failed open) and refuses to rewrite a settings file that is not a JSON object.
+
+**Scanner coverage.** Instruction surfaces now include `.cursor/rules/`, `.opencode/`, `opencode.json`,
+`.codex/`, `.gemini/`, `.github/instructions/`, `.pi/`, `.agents/`, `.windsurf/rules/` and any
+`SKILL.md`. Soft hyphen, LRM/RLM, invisible operators and similar format characters are stripped
+before matching, and Markdown emphasis inside a keyword is seen through. The decode budget is 64
+tokens (256 KB cap); running out on an instruction file asks. `shellter scan` sees through a
+`FF FE` prefix, scans `.mcp.json` command lines, `statusLine.command` and a `hooks` path in
+`plugin.json`, reads quoted and flow-list `allowed-tools`, and flags `Bash(**)`, `Bash(:*)`,
+`defaultMode: auto` and remote `type: http` hooks. The codex/agy shim and the opencode adapter
+gate `apply_patch`/`patch` blobs per file, agy `ReplacementChunks`, `search_replace`, `edit_file`
+and `multiedit` (tool shapes are best-effort).
+
+**Behaviour changes you may notice** (default, acceptEdits and plan mode only):
+- These used to auto-approve and now prompt, because the bare command prompts: an env prefix over a
+  non-approved command (`PYTHONPATH=. python -m mod`), a loop/if body or wrapper running one
+  (`timeout 90 ./run.sh`), a substitution running one or reading an unresolved variable, and an
+  exec-carrying env with a command-line value (`export GIT_CONFIG_PARAMETERS="..."`).
+- Python heredocs (`python3 - <<'EOF'`) prompt: the old body validator was a keyword blacklist.
+- A PowerShell pipeline whose later stage runs a non-approved command (`echo $q | docker exec -i db psql`)
+  prompts: every stage must approve now.
+- PowerShell `@{}` calculated properties, static calls outside `[math]`/`[string]`/`[datetime]`/...,
+  and `Out-File`/`Set-Content` to a path prompt.
+- `sort $f`/`diff $a $b` over an unresolved variable prompts, as `cat $f` already did, and
+  `diff .env.example .env` denies, as `cat .env` does.
+- Measured on one maintainer's real command log (5,379 unique commands, 3,385 benign auto-approvals):
+  57 benign commands (1.7%) now prompt, all in the classes above; 234 that used to prompt now
+  auto-approve (pnpm `--dir`/`--filter` and script-name forms, `npx --prefix`, `gh api` reads, loops
+  and conditionals whose body approves, `[ ]`, subshells, commit and PR heredocs). No benign command
+  went to deny.
+
+1616 tests in test-hooks.js, 31 shim checks, 33 bun adapter checks (opencode 18, pi 15).
+
 ## [0.10.0] - 2026-09-30
 
 Fewer false prompts, found by auditing every `ask` in two real bypass-mode sessions.
