@@ -21,7 +21,8 @@ function runHook(hookPath, input, env) {
       input: JSON.stringify(input),
       encoding: 'utf8',
       timeout: 5000,
-      env: { ...process.env, SHELLTER_GIT_GUARDS: '', ...(env || {}) },
+      // CLAUDE_HOOK_LOG cleared: test traffic must not land in the decision log the replay gate reads.
+      env: { ...process.env, CLAUDE_HOOK_LOG: '', SHELLTER_GIT_GUARDS: '', ...(env || {}) },
     });
     if (!out.trim()) return { decision: 'fallthrough' };
     const parsed = JSON.parse(out.trim());
@@ -3101,6 +3102,50 @@ console.log('\n--- 0.11.0 r2 step 2: regex cost bounds, linear comment scan (B H
     const t3 = Date.now();
     scan.scanInjection(big, { decode: true });
     check('cost: every scan view on 300 KB of ' + JSON.stringify(pad) + ' < 2 s', Date.now() - t3 < 2000, true);
+  }
+}
+
+console.log('\n--- 0.11.0 r2 step 3: the fix reviewers\' probes, pinned (in-process) ---');
+{
+  // A fresh copy of check-bash.js per probe with stdin / stdout / exit stubbed (the same runner as
+  // scripts/replay-corpus.js): 2,000+ probes in seconds instead of twenty minutes of spawns.
+  const Module = require('module');
+  const EXIT = {};
+  const hookSrc = fs.readFileSync(BASH_HOOK, 'utf8').replace(/^#!.*/, '');
+  const inproc = (cmd, tool) => {
+    const h = {}, fake = { setEncoding() {}, on(e, fn) { h[e] = fn; return fake; } };
+    let out = '', exited = false;
+    const rx = process.exit, rw = process.stdout.write, d = Object.getOwnPropertyDescriptor(process, 'stdin');
+    const savedLog = process.env.CLAUDE_HOOK_LOG, savedGuards = process.env.SHELLTER_GIT_GUARDS;
+    delete process.env.CLAUDE_HOOK_LOG;
+    process.env.SHELLTER_GIT_GUARDS = '';
+    Object.defineProperty(process, 'stdin', { value: fake, configurable: true });
+    process.exit = () => { exited = true; throw EXIT; };
+    process.stdout.write = (c) => { if (!exited) out += c; return true; };
+    try {
+      const m = new Module(BASH_HOOK, null);
+      m.filename = BASH_HOOK;
+      m.paths = Module._nodeModulePaths(HOOKS_DIR);
+      try { m._compile(hookSrc, BASH_HOOK); h.data(JSON.stringify({ tool_name: tool, tool_input: { command: cmd }, permission_mode: 'default', cwd: __dirname })); h.end(); }
+      catch (e) { if (e !== EXIT) return 'throw'; }
+    } finally {
+      process.exit = rx; process.stdout.write = rw; Object.defineProperty(process, 'stdin', d);
+      if (savedLog !== undefined) process.env.CLAUDE_HOOK_LOG = savedLog;
+      if (savedGuards === undefined) delete process.env.SHELLTER_GIT_GUARDS; else process.env.SHELLTER_GIT_GUARDS = savedGuards;
+    }
+    if (!out.trim()) return 'fallthrough';
+    try { return JSON.parse(out).hookSpecificOutput.permissionDecision; } catch { return 'bad'; }
+  };
+  const groups = {};
+  for (const [file, b64, t, want] of require(path.join(HOOKS_DIR, '..', 'test-probes.js'))) {
+    const cmd = Buffer.from(b64, 'base64').toString();
+    const got = inproc(cmd, t === 'P' ? 'PowerShell' : 'Bash');
+    const g = groups[file] = groups[file] || { n: 0, bad: [] };
+    g.n++;
+    if (got !== want) g.bad.push((t === 'P' ? '[PS] ' : '') + JSON.stringify(cmd).slice(0, 120) + ' expected=' + want + ' got=' + got);
+  }
+  for (const [file, g] of Object.entries(groups)) {
+    check('probes ' + file + ': ' + g.n + ' pinned verdicts hold' + (g.bad.length ? '\n         ' + g.bad.slice(0, 10).join('\n         ') : ''), g.bad.length, 0);
   }
 }
 
