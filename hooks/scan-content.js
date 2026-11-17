@@ -615,6 +615,45 @@ function scanInjection(text, opts) {
 const AGENT_INSTRUCTION_FILE = /(^|[\/\\])(CLAUDE(\.local)?\.md|AGENTS?\.md|GEMINI\.md|\.cursorrules|\.clinerules|\.windsurfrules|\.aider\.conf\.yml|copilot-instructions\.md|\.?mcp\.json)$|(^|[\/\\])\.claude[\/\\]/i;
 function isAgentInstructionFile(p) { return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p); }
 
+// One path component of a glob as an anchored, case-insensitive RegExp (null if unparseable).
+// A leading `*`/`?`/`[` never matches a leading dot, as in bash.
+function globComponentRe(comp) {
+  let re = /^[*?[]/.test(comp) ? '^(?!\\.)' : '^';
+  for (let i = 0; i < comp.length; i++) {
+    const c = comp[i];
+    if (c === '*') re += '.*';
+    else if (c === '?') re += '.';
+    else if (c === '[') {
+      const e = comp.indexOf(']', i + 2);
+      if (e < 0) { re += '\\['; continue; }
+      re += '[' + comp.slice(i + 1, e).replace(/^!/, '^').replace(/[\\\]]/g, (m) => '\\' + m) + ']';
+      i = e;
+    } else re += c.replace(/[.*+?^${}()|\\]/g, (m) => '\\' + m);
+  }
+  try { return new RegExp(re + '$', 'i'); } catch { return null; }
+}
+
+// Does a glob (`.en*`, `~/.s?h/id_r*a`, `.[e]nv`) expand to a secret file? Each component is
+// tried against canonical secret names and against ordinary decoys. 'secret' = some component
+// hits a secret and no decoy; 'dot' = a literal-dot component hits both (`.e*`, `.*`: the
+// caller should not auto-approve it); null = no glob or not secret-shaped (`*.md`, `src/*`).
+const GLOB_SECRETS = ['.env', '.env.local', '.netrc', '.npmrc', '.pgpass', '.ssh', '.aws', '.gnupg', '.git-credentials',
+  '.gitconfig', 'id_rsa', 'id_ed25519', 'id_ecdsa', 'credentials', 'x.pem', 'x.key'];
+const GLOB_DECOYS = ['.eslintrc', '.editorconfig', '.gitignore', '.nvmrc', 'README.md', 'index.js', 'notes.txt',
+  'package.json', 'src', 'docs', 'credits.md', 'keys.ts', 'environment.ts'];
+function globHitsSecret(tok) {
+  if (typeof tok !== 'string' || !/[*?[]/.test(tok)) return null;
+  let verdict = null;
+  for (const comp of tok.split(/[\\/]/)) {
+    if (!/[*?[]/.test(comp) || comp.length > 128) continue;
+    const rx = globComponentRe(comp);
+    if (!rx || !GLOB_SECRETS.some((n) => rx.test(n))) continue;
+    if (!GLOB_DECOYS.some((n) => rx.test(n))) return 'secret';
+    if (comp[0] === '.') verdict = 'dot';
+  }
+  return verdict;
+}
+
 function hasHigh(findings) { return findings.some(f => f.severity === SEVERITY.HIGH); }
 function highest(findings) {
   let best = null;
@@ -624,5 +663,5 @@ function highest(findings) {
 
 module.exports = {
   SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
-  scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces,
+  scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces, globHitsSecret, globComponentRe,
 };

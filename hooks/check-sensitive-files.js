@@ -259,11 +259,11 @@ process.stdin.on('data', chunk => { data += chunk; });
 process.stdin.on('end', () => {
   let input;
   try {
-    input = JSON.parse(data);
+    input = JSON.parse(data.replace(/^\uFEFF/, ''));
   } catch {
     process.exit(0);
   }
-  quietAsk = /^(?:bypassPermissions|auto)$/.test(input && input.permission_mode);
+  quietAsk = typeof input?.permission_mode === 'string' && /^(?:bypassPermissions|auto)$/.test(input.permission_mode);
 
   const tool = input?.tool_name || '';
 

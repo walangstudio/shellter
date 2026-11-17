@@ -178,6 +178,8 @@ const normRmPath = (s) => {
 // Kubernetes/CI). A PreToolUse hook that throws FAILS OPEN (Claude Code runs the tool
 // unprotected), so this must never escape. '' degrades every caller safely: the rm carve-out is
 // guarded on a non-empty home, and `~` expansion falls back to a relative join.
+const RM_SYSTEM_NAMES = ['home', 'root', 'etc', 'usr', 'var', 'boot', 'sys', 'proc', 'dev', 'lib', 'bin', 'sbin', 'System', 'Library', 'Applications', 'Users', 'Volumes', 'private', 'cores'];
+
 function safeHomedir() {
   try { return os.homedir() || ''; } catch (_) { return ''; }
 }
@@ -213,6 +215,11 @@ function rmTargetDanger(t) {
     if (nh && !/(?:^|\/)\.\.(?:\/|$)/.test(nt) && (nt + '/').startsWith(nh + '/')) return null;
   }
   if (RM_SYSTEM_PREFIX.test(t)) return 'system directory';
+  const g = /^\/([^\/]*[*?[][^\/]*)(?:\/|$)/.exec(t);
+  if (g) {
+    const rx = scan.globComponentRe(g[1]);
+    if (rx && RM_SYSTEM_NAMES.some((n) => rx.test(n))) return 'system directory (glob)';
+  }
   // /opt ROOT (slash/dot/star-only tail). Deep specific /opt paths stay allowed
   // (this tree lives under /opt/projs).
   if (/^\/opt(?:[\/.*]*)$/.test(t)) return '/opt root';
@@ -769,7 +776,7 @@ function parseShellCInvocation(segment) {
       i++;
     }
     if (i >= arg.length) return { innerCmd: null, opaque: true };
-    const inner = arg.slice(1, i);
+    const inner = arg.slice(1, i).replace(/\\(["\\$`])/g, (m, c) => c);
     if (/\$\(|`|\$\{|\$[A-Za-z_]/.test(inner)) {
       return { innerCmd: null, opaque: true };
     }
@@ -1043,6 +1050,7 @@ const ASK_NOTICE =
 // is either a prompt they did not want or (auto) an unconditional allow that skips the classifier.
 // Pass through instead: bypass runs it, auto lets its classifier judge. Denies are unaffected.
 let quietAsk = false;
+let isPoshTool = false;   // set in main; bash-only deny variants check it
 function ask(reason, snippet) {
   if (quietAsk) { audit('fallthrough', 'ask suppressed (bypass/auto mode): ' + reason, snippet); process.exit(0); }
   audit('ask', reason, snippet);
@@ -1119,7 +1127,7 @@ const READ_VERBS =
   'cat|less|more|head|tail|bat|vi|vim|nano|sed|awk|grep|rg|xxd|od|strings|base64|' +
   'base32|hexdump|nl|tac|rev|fold|cut|tr|paste|column|jq|yq|gpg|gpg2|dd';
 
-const READ_VERB_SET = new Set(READ_VERBS.split('|'));
+const READ_VERB_SET = new Set([...READ_VERBS.split('|'), 'sort', 'uniq', 'diff', 'comm', 'expand', 'fmt', 'shuf', 'join', 'tsort']);
 const SECRET_TOKENS_RE = new RegExp(SECRET_TOKENS, 'i');
 
 // ---- cross-segment variable indirection -------------------------------------
@@ -1568,7 +1576,7 @@ const ATTACHED_FILE_FLAG = /^-[A-Za-z]*f\S/;
 // Command wrappers the read verb can hide behind. The substring rule used to catch these
 // for free (it matched the verb anywhere in the segment); the tokenized rule looks at the
 // command word, so it has to step over them itself.
-const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'timeout', 'exec', 'builtin']);
+const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'command', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'timeout', 'exec', 'builtin', 'busybox']);
 // Wrapper flags that take a SEPARATE value token (`sudo -u root grep …`). Without these the
 // value ('root') is mistaken for the command word and the read verb behind it is never seen.
 const WRAPPER_VALUE_FLAGS = {
@@ -1660,11 +1668,12 @@ function stripUnquotedComment(s) {
 function pipeToWrappedInterpDanger(seg) {
   const stages = splitPipeStages(stripUnquotedComment(seg));
   for (let si = 1; si < stages.length; si++) {
-    const s = stages[si].replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
+    // A group runs its body in the pipe: `| (bash)`, `| { bash; }`.
+    const s = stages[si].replace(/^\s*[({]\s*/, '').replace(/[\s;)}]+$/, '').replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
     const toks = tokenizeArgs(s);
     if (!toks.length) continue;
     const at = stepWrappers(toks, 0, INTERP_SET);
-    const cmd = (toks[at] || '').replace(/^.*[\\/]/, '');
+    const cmd = /^\$\{?SHELL\}?$/.test(toks[at] || '') ? 'sh' : (toks[at] || '').replace(/^.*[\\/]/, '');
     if (!INTERP_SET.has(cmd)) continue;
     // Scan ALL option tokens after the interpreter, not just the first -- an interpreter takes
     // several separate flags before the exec flag (`bash -eu -c ...`, `ruby -w -e ...`,
@@ -1712,6 +1721,19 @@ function pipeToWrappedInterpDanger(seg) {
   return null;
 }
 
+// A token whose RAW text starts with `<` / `0<` (not `<<`, `<(`) reads the next word as stdin.
+// Raw matters: `echo "<.env"` is a string.
+function inputRedirectSecret(seg) {
+  const offs = [];
+  const toks = tokenizeArgs(seg, offs);
+  for (let k = 0; k < toks.length; k++) {
+    if (!/^0?<(?![<(])/.test(seg.slice(offs[k], offs[k] + 3))) continue;
+    const target = toks[k].replace(/^0?</, '') || toks[k + 1] || '';
+    if (SECRET_TOKENS_RE.test(target) || scan.globHitsSecret(target) === 'secret') return 'Reading sensitive file via input redirection blocked';
+  }
+  return null;
+}
+
 function tokenizedSensitiveRead(seg) {
   for (const stage of splitPipeStages(seg)) {
     const s = stage.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
@@ -1749,6 +1771,7 @@ function tokenizedSensitiveRead(seg) {
       }
       if (skipProgramArg) { skipProgramArg = false; continue; }
       if (SECRET_TOKENS_RE.test(toks[i])) return 'Reading sensitive file via shell (quote-obfuscated) blocked';
+      if (scan.globHitsSecret(toks[i]) === 'secret') return 'Reading sensitive file via a glob blocked';
     }
   }
   return null;
@@ -1759,7 +1782,7 @@ const DENY_PATTERNS = [
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
     'Encoded payload piped to shell blocked'],
-  [/\becho\s+.*\|\s*(base64|xxd)\s.*\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\b/i,
+  [/\becho\s+[^|]{0,4096}\|\s*(base64|xxd)\s[^|]{0,1024}\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\b/i,
     'Encoded execution chain blocked'],
 
   // eval of DECODED or DOWNLOADED content is the real threat -> hard deny. A plain
@@ -1790,16 +1813,23 @@ const DENY_PATTERNS = [
   // Data exfiltration: uploading a SENSITIVE file. Ordinary POSTs are approved by
   // the curl/wget rule lower down -- only an upload that references a secret is
   // blocked, so legit API calls aren't nagged.
-  [new RegExp('\\bcurl\\b[^|;]*(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)\\b[^|;]*' + SECRET_TOKENS, 'i'),
+  [new RegExp('\\bcurl\\b[^|;]*(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file|--json|--url-query)\\b[^|;]*' + SECRET_TOKENS, 'i'),
     'curl uploading a sensitive file blocked -- possible exfiltration'],
-  [new RegExp('\\bwget\\b[^|;]*--post-(?:data|file)\\b[^|;]*' + SECRET_TOKENS, 'i'),
+  // Bundled short flags (`-sT`, `-sd@f`). Case-sensitive: with /i, `-sf` would read as `-F`.
+  [new RegExp('\\bcurl\\b[^|;]*(?<![\\w-])-[A-Za-z]*[dFT][^|;]*' + SECRET_TOKENS),
+    'curl uploading a sensitive file blocked -- possible exfiltration'],
+  [new RegExp('\\bcurl\\b[^|;]{0,512}\\bfile:\\/\\/[^\\s\'"|;]{0,512}' + SECRET_TOKENS, 'i'),
+    'curl reading a sensitive local file blocked'],
+  [new RegExp('^(?=[^|;&]{0,1024}--no-index)\\s*git\\b[^|;&]{0,512}\\bdiff\\b[^|;&]{0,512}' + SECRET_TOKENS, 'i'),
+    'git diff --no-index on a sensitive file blocked'],
+  [new RegExp('\\bwget\\b[^|;]*(?:--post-(?:data|file)|--body-(?:data|file))\\b[^|;]*' + SECRET_TOKENS, 'i'),
     'wget uploading a sensitive file blocked -- possible exfiltration'],
   // Uploading a FILE (not inline data) to a remote URL -- data leaving the box is
   // review-worthy. Inline `-d '{json}'` API calls (no @file) stay approved; the
   // secret-file upload rules above hard-deny first.
   // `@` must LEAD the data value (curl reads a file only for `-d @file` /
   // `-F field=@file`), so inline JSON like `-d '{"email":"a@b.com"}'` is NOT flagged.
-  [/\bcurl\b(?=[^|;]*https?:\/\/)[^|;]*(?:(?:-T|--upload-file)\s+\S|(?:--data(?:-binary|-raw|-urlencode)?|-d)\s+['"]?@|(?:-F|--form)\s+['"]?[^=\s'"]*=['"]?@)/i,
+  [/\bcurl\b(?=[^|;]*https?:\/\/)[^|;]*(?:(?:(?<![\w-])-[A-Za-z]*T|--upload-file)\s*\S|(?:--data(?:-binary|-raw|-urlencode)?|--json|(?<![\w-])-[A-Za-z]*d)\s*['"]?@|(?:(?<![\w-])-[A-Za-z]*F|--form)\s*['"]?[^=\s'"]*=['"]?@)/,
     'curl uploading a file to a remote URL -- approve only if intended', 'ask'],
   [/\bwget\b(?=[^|;]*https?:\/\/)[^|;]*--post-file\b/i,
     'wget posting a file to a remote URL -- approve only if intended', 'ask'],
@@ -1881,18 +1911,18 @@ const DENY_PATTERNS = [
   // value only prints the setting, which is how you AUDIT for such a backdoor, so the
   // key must be followed by a value token (not end-of-segment, `;`, `&&`, a pipe or a
   // redirect) to deny.
-  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:(?:credential\.helper|core\.(?:hooksPath|sshCommand|fsmonitor|alternateRefsCommand)|init\.templateDir|uploadpack\.packObjectsHook|filter\.\S+\.(?:clean|smudge))(?=\s+[^\s;&|<>])|alias\.\S+\s+['"]?!)/i,
+  [/git\s+config\s+(?:(?:set|--\S+|-f\s+\S+)\s+){0,8}(?:(?:credential\.helper|core\.(?:hooksPath|sshCommand|fsmonitor|alternateRefsCommand)|init\.templateDir|uploadpack\.packObjectsHook|filter\.\S+\.(?:clean|smudge))(?=\s+[^\s;&|<>])|alias\.\S+\s+['"]?!)/i,
     'git config of a hook / credential-helper / exec key blocked -- possible backdoor'],
   // Hard-deny when an editor/pager/diff/gpg program value carries a shell command
   // (`;`/`&`/redirect, $(...), backtick, or sh/bash -c) -- that is RCE on the next git op.
   // A lone `|` is NOT hard-denied: a pager pipeline (`core.pager "diff-so-fancy | less"`,
   // `delta | less`) is the documented setup; it falls to the ask rule below. A plain
   // program name (vim / code --wait) also falls to the ask rule.
-  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:core\.(?:editor|pager)|sequence\.editor|diff\.external|gpg\.program)\s+.*(?:[;&`><]|\$\(|\bsh\s+-c\b|\bbash\s+-c\b)/i,
+  [/git\s+config\s+(?:(?:set|--\S+|-f\s+\S+)\s+){0,8}(?:core\.(?:editor|pager)|sequence\.editor|diff\.external|gpg\.program)\s+.*(?:[;&`><]|\$\(|\bsh\s+-c\b|\bbash\s+-c\b)/i,
     'git config sets an editor/pager/diff/gpg program to a shell command blocked -- RCE'],
   // ASK on the dual-use "program git runs" keys: legit for a dev (editor/pager/diff)
   // but RCE if a skill sets them to `sh -c ...`. Surface for approval, don't hard-block.
-  [/git\s+config\s+(?:--(?:global|system|local|add)\s+)?(?:core\.(?:editor|pager)|sequence\.editor|diff\.external|gpg\.program)/i,
+  [/git\s+config\s+(?:(?:set|--\S+|-f\s+\S+)\s+){0,8}(?:core\.(?:editor|pager)|sequence\.editor|diff\.external|gpg\.program)/i,
     'git config sets a program git will run (editor/pager/diff/gpg) -- approve only if you set this', 'ask'],
 
   // Environment exfiltration
@@ -1927,7 +1957,7 @@ const DENY_PATTERNS = [
   // as a VCS install, so those are exempt; any other raw URL is blocked.
   [/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:npm|yarn|pnpm|bun)\s+(?:-\S+\s+)*(?:install|add|i)\b(?![^|;&]*(?:git\+|github\.com|gitlab\.com|bitbucket\.org|\.git\b))[^|;&]*https?:\/\//i,
     'Installing a package from a raw URL blocked -- use a VCS URL or a package name'],
-  [/\b(curl|wget)\s+.*\.(sh|py|rb|pl)\b.*-o\s/i, 'Downloading executable script for later run -- review manually'],
+  [/\b(curl|wget)\s+[^;|&]{0,1024}\.(sh|py|rb|pl)\b[^;|&]{0,1024}-o\s/i, 'Downloading executable script for later run -- review manually'],
 
   // Container escape
   [/docker\s+run\s+.*--privileged/i, 'Privileged docker run blocked'],
@@ -1982,10 +2012,9 @@ const DENY_PATTERNS = [
   // Reading a secret via the shell's file-read substitution ( $(<secret) ).
   [new RegExp('\\$\\(\\s*<\\s*[\'"]?[^)\'"]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via $(<...) substitution blocked'],
-  // Leading-redirect read: `< .env cat` / `< ~/.aws/credentials base64` (token
-  // precedes the verb, so the verb-first rule above doesn't see it).
-  [new RegExp('(?:^|[;&|]\\s*)<\\s*[\'"]?[^\\s\'"]*' + SECRET_TOKENS, 'i'),
-    'Reading sensitive file via input redirection blocked'],
+  // Input redirect from a secret anywhere in the segment: `< .env cat`, `sort < .env`,
+  // `read -r L < .env`, `done < .env`.
+  [inputRedirectSecret, null],
   // openssl reading an SSH / cloud private key (`openssl rsa -in ~/.ssh/id_rsa`).
   // Deliberately narrow to the high-value key locations, NOT any `.key`/`.pem`:
   // openssl operating on a project key (`openssl rsa -in server.key -out x`) is its
@@ -2111,7 +2140,7 @@ const POSH_DENY_PATTERNS = [
   // the secret is a source being read -- a bare `.env` as the final (destination)
   // arg is NOT matched, which is why `cp .env.example .env` is allowed. Ambiguous
   // English words (copy/move/install) are excluded so commit messages don't trip.
-  [new RegExp('\\b(?:Copy-Item|cpi|Move-Item|mi|Rename-Item|rni|cp|mv|xcopy|robocopy|rsync)\\b[^;|]*' + SECRET_TOKENS + '[^;|]*\\s\\S', 'i'),
+  [new RegExp('\\b(?:Copy-Item|cpi|Move-Item|mi|Rename-Item|rni|cp|mv|ln|xcopy|robocopy|rsync)\\b[^;|]*' + SECRET_TOKENS + '[^;|]*\\s\\S', 'i'),
     'Copying/moving a sensitive file blocked -- possible exfiltration'],
   // Archiving a sensitive file/dir. Here the secret is usually the LAST arg
   // (`tar czf k.tgz ~/.ssh`), so it matches the secret anywhere -- otherwise these
@@ -2432,6 +2461,29 @@ function isSafeHeredocInvocation(rawCmd) {
 // `extraVariant` carries the cross-segment variable expansion (see expandSegments).
 // Only the top-level callers pass it: recursion works on sub-strings of the segment,
 // where the parent's expansion is not meaningful.
+// What bash makes of backslash escapes and `$'x'` OUTSIDE quotes (`.e\nv`, `.e$'n'v` -> `.env`).
+// Quoted text is left alone: `grep '\.env' src/` is a regex, not a path.
+function bashDeEscape(s) {
+  let out = '', q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      out += c;
+      if (c === q) q = null;
+      else if (q === '"' && c === '\\' && i + 1 < s.length) out += s[++i];
+      continue;
+    }
+    if (c === "'" || c === '"') { q = c; out += c; continue; }
+    if (c === '\\' && /[A-Za-z0-9._\/-]/.test(s[i + 1] || '')) continue;
+    if (c === '$' && s[i + 1] === "'") {
+      const e = s.indexOf("'", i + 2);
+      if (e > 0 && !s.slice(i + 2, e).includes('\\')) { out += s.slice(i + 2, e); i = e; continue; }
+    }
+    out += c;
+  }
+  return out;
+}
+
 function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (depth === undefined) depth = 0;
   if (mode === undefined) mode = 'hard';
@@ -2450,6 +2502,10 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (deobf !== seg) variants.push(deobf);
   const deobfStripped = normalizeObfuscation(stripped);
   if (deobfStripped !== stripped && deobfStripped !== deobf) variants.push(deobfStripped);
+  if (!isPoshTool) {
+    const de = bashDeEscape(seg);
+    if (!variants.includes(de)) variants.push(de);
+  }
   if (extraVariant && !variants.includes(extraVariant)) {
     variants.push(extraVariant);
     const xs = extraVariant.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
@@ -2513,6 +2569,10 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
   for (const inner of extractProcessSubstitutions(seg)) {
     for (const innerSeg of splitChainSegments(inner)) checkSegmentDeny(innerSeg, depth + 1, mode);
   }
+
+  // Every pipe stage is a command of its own (`ls | xargs sh -c '...'`).
+  const stages = splitPipeStages(seg);
+  if (stages.length > 1) for (const st of stages) checkSegmentDeny(st, depth + 1, mode);
 }
 
 // A segment carrying a heredoc writes its body: every redirect target and `tee` file must be a
@@ -2893,6 +2953,7 @@ function hasUnresolvedRead(seg, idx) {
     if (t.startsWith('-')) continue;
     if (skipProgramArg) { skipProgramArg = false; continue; }
     if (tokenHasOpaqueExpansion(t, known, false)) return true;
+    if (scan.globHitsSecret(t)) return true;   // `.e*` may expand to .env
   }
   return false;
 }
@@ -3129,11 +3190,11 @@ process.stdin.on('data', chunk => { data += chunk; });
 process.stdin.on('end', () => {
   let input;
   try {
-    input = JSON.parse(data);
+    input = JSON.parse(data.replace(/^\uFEFF/, ''));
   } catch {
     process.exit(0);
   }
-  quietAsk = /^(?:bypassPermissions|auto)$/.test(input && input.permission_mode);
+  quietAsk = typeof input?.permission_mode === 'string' && /^(?:bypassPermissions|auto)$/.test(input.permission_mode);
 
   let rawCmd = input?.tool_input?.command;
   // Some hosts pass the command as an argv array (`["rm","-rf","/"]`); join it so it is
@@ -3141,10 +3202,11 @@ process.stdin.on('end', () => {
   // (fallthrough to the normal permission prompt) rather than crashing. A crash exits
   // nonzero, which Claude Code treats as non-blocking, so the tool would run UNPROTECTED:
   // a bad-typed payload must fail safe, not open.
-  if (Array.isArray(rawCmd)) rawCmd = rawCmd.map((x) => (typeof x === 'string' ? x : '')).join(' ');
+  if (Array.isArray(rawCmd)) rawCmd = rawCmd.flat(Infinity).map((x) => (typeof x === 'string' ? x : '')).join(' ');
   if (typeof rawCmd !== 'string' || !rawCmd) process.exit(0);
 
   const isPosh = input?.tool_name === 'PowerShell';
+  isPoshTool = isPosh;
   const cwd = input?.cwd || process.cwd();
 
   // Join backslash-newline line continuations first, so a target/flag split across a
