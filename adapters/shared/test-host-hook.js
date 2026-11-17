@@ -63,5 +63,19 @@ check('view_file .env -> deny',     'agy', { toolCall: { name: 'view_file', args
 check('view_file id_rsa -> deny',   'agy', { toolCall: { name: 'view_file', args: { AbsolutePath: 'C:/Users/x/.ssh/id_rsa' } } }, 'deny');
 check('view_file README -> allow',  'agy', { toolCall: { name: 'view_file', args: { AbsolutePath: 'README.md' } } }, 'allow');
 
+// 0.11.0 (F-H4): write tools whose new text lives elsewhere, and patch blobs.
+const PP = join('<interact', 'ion-config role="x">');
+check('replace_file_content chunks injection -> deny', 'agy', { toolCall: { name: 'replace_file_content', args: { TargetFile: 'CLAUDE.md', ReplacementChunks: [{ TargetContent: 'a', ReplacementContent: INJECTION }] } } }, 'deny');
+check('multi_replace_file_content Class A -> deny', 'agy', { toolCall: { name: 'multi_replace_file_content', args: { TargetFile: 'n.md', ReplacementChunks: [{ ReplacementContent: PP }] } } }, 'deny');
+check('write_to_file AbsolutePath .env -> deny', 'agy', { toolCall: { name: 'write_to_file', args: { AbsolutePath: 'proj/.env', CodeContent: 'X=1' } } }, 'deny');
+check('search_replace is a write -> deny', 'codex', { tool_name: 'search_replace', tool_input: { path: 'CLAUDE.md', new_string: INJECTION } }, 'deny');
+check('edit_file injection -> deny', 'codex', { tool_name: 'edit_file', tool_input: { path: 'AGENTS.md', new_string: INJECTION } }, 'deny');
+const PATCH = (file, add) => '*** Begin Patch\n*** Update File: ' + file + '\n+' + add + '\n*** End Patch';
+check('apply_patch header .env -> deny', 'codex', { tool_name: 'apply_patch', tool_input: { input: PATCH('proj/.env', 'X=1') } }, 'deny');
+check('apply_patch header AGENTS.md injection -> deny', 'codex', { tool_name: 'apply_patch', tool_input: { patch: PATCH('AGENTS.md', INJECTION) } }, 'deny');
+check('apply_patch blob in command -> deny', 'codex', { tool_name: 'apply_patch', tool_input: { command: PATCH('AGENTS.md', INJECTION) } }, 'deny');
+check('apply_patch string tool_input -> deny', 'codex', { tool_name: 'apply_patch', tool_input: PATCH('proj/.env', 'X=1') }, 'deny');
+check('apply_patch benign -> allow', 'codex', { tool_name: 'apply_patch', tool_input: { input: PATCH('src/a.ts', 'const a = 1;') } }, 'allow');
+
 console.log(`\n${pass}/${total} shared host-hook checks passed`);
 process.exit(pass === total ? 0 : 1);

@@ -233,8 +233,12 @@ const GREP_SECRET_EXTRACTION = [
 // A `keyword = value` extraction (searching for a plaintext credential assignment). This is
 // a routine self-audit inside your own repo, so it is denied ONLY when the search path is a
 // broad off-project location (a home/system root) -- i.e. mass credential harvesting.
-const GREP_KEYWORD_EXTRACTION = /(password|secret|api.?key|token|credential|private.?key)\s*[:=]\s*[^${\s]/i;
-const BROAD_SEARCH_PATH = /^(?:~|\/(?:home|Users|etc|root|var|opt|usr|private|srv|mnt|mount)\b|\/$|[A-Za-z]:[\\\/]Users\b)/i;
+// Regex tokens between the keyword and the separator (`password\s*=\S`, `token.*:`) count as gap.
+const GREP_KEYWORD_EXTRACTION = /(password|secret|api.?key|token|credential|private.?key)(?:\s|\\[sSwW][*+?]?|\.[*+?]|\[\^?[^\]]{0,16}\][*+?]?){0,6}[:=](?:\s|\\[sS][*+?]?){0,4}[^${\s]/i;
+// A token SHAPE written as a regex (`AKIA[0-9A-Z]{16}`, `ghp_[A-Za-z0-9]{36}`, `BEGIN.*PRIVATE KEY`).
+// This repo's own source is full of those strings, so only a broad search path denies.
+const GREP_TOKEN_SHAPE = /AKIA|gh[pousr]_|xox[bpoa]|eyJ|PRIVATE.{0,8}KEY|BEGIN.{0,24}(?:RSA|OPENSSH|EC|DSA|PGP)/i;
+const BROAD_SEARCH_PATH = /^(?:~|\/(?:home|Users|etc|root|var|opt|usr|private|srv|mnt|mount)\b|\/$|[A-Za-z]:[\\\/]Users\b|[A-Za-z]:[\\\/]?$|(?:\.\.[\\\/]){2})/i;
 
 function pathMatchesAnySensitive(p) {
   if (!p) return null;
@@ -344,6 +348,9 @@ process.stdin.on('end', () => {
         if (hi) {
           deny('Prompt injection detected: ' + hi.signal + (hi.line ? ' (line ' + hi.line + ')' : ''), filePath);
         }
+        if (instructionSurface && inj.some(f => f.signal === 'decode-budget-exhausted')) {
+          pendingAsk = pendingAsk || { reason: 'Too many encoded tokens to inspect in an agent-instruction file', snippet: filePath };
+        }
         if (instructionSurface) {
           const med = inj.find(f => f.severity === 'medium' && f.category === 'injection');
           if (med) {
@@ -386,6 +393,18 @@ process.stdin.on('end', () => {
       if (BROAD_SEARCH_PATH.test(filePath) && GREP_KEYWORD_EXTRACTION.test(searchPattern)) {
         deny('Searching for plaintext credentials across a home/system path blocked', searchPattern);
       }
+      if (BROAD_SEARCH_PATH.test(filePath) && GREP_TOKEN_SHAPE.test(searchPattern)) {
+        deny('Searching for secret token shapes across a home/system path blocked', searchPattern);
+      }
+      // The file filter selects what gets read: `glob: "**/.env*"` reads every .env.
+      const gl = input?.tool_input?.glob;
+      if (typeof gl === 'string' && gl) {
+        for (const p of pathForms(filePath ? filePath + '/' + gl : gl)) {
+          if (pathMatchesAnySensitive(p) || SENSITIVE_GLOB.test(p) || scan.globHitsSecret(p) === 'secret') {
+            deny('Grep over sensitive files blocked', p);
+          }
+        }
+      }
       break;
     }
   }
@@ -406,7 +425,7 @@ process.stdin.on('end', () => {
     if (PERSONAL_HISTORY.test(p)) {
       pendingAsk = pendingAsk || { reason: 'Shell history / Claude config may hold tokens', snippet: p };
     }
-    if (tool === 'Glob' && SENSITIVE_GLOB.test(p)) {
+    if (tool === 'Glob' && (SENSITIVE_GLOB.test(p) || scan.globHitsSecret(p) === 'secret')) {
       deny('Glob pattern targeting sensitive files blocked', p);
     }
   }

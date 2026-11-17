@@ -20,6 +20,9 @@ const RANK = { high: 3, medium: 2, low: 1 };
 const TAG_RE = /[\u{E0000}-\u{E007F}]/gu;                    // tag block (ASCII smuggling)
 const BIDI_RE = /[‪-‮⁦-⁩]/g;            // bidi overrides (Trojan Source)
 const ZW_RE = /[​-‍⁠﻿]/g;               // zero-width
+// Soft hyphen, combining grapheme joiner, Hangul fillers, Mongolian vowel separator, LRM/RLM,
+// invisible operators. Stripped for matching only (they split a keyword); not a finding.
+const STRIP_ONLY_RE = /[\u00AD\u034F\u115F\u1160\u180E\u200E\u200F\u2061-\u2064\u3164]/g;
 const VS_RE = /[︀-️]|[\u{E0100}-\u{E01EF}]/gu;    // variation selectors
 
 // A variation selector is suspicious when it does NOT sit on an emoji-like base
@@ -61,7 +64,7 @@ function normalizeForScan(s, maxRounds = 5) {
     counts.tag += (clean.match(TAG_RE) || []).length;
     counts.bidi += (clean.match(BIDI_RE) || []).length;
     counts.zeroWidth += (clean.match(ZW_RE) || []).length;
-    clean = clean.replace(TAG_RE, '').replace(BIDI_RE, '').replace(ZW_RE, '').replace(VS_RE, '');
+    clean = clean.replace(TAG_RE, '').replace(BIDI_RE, '').replace(ZW_RE, '').replace(VS_RE, '').replace(STRIP_ONLY_RE, '');
     if (clean === before) break;
   }
   return { clean, rounds, counts };
@@ -105,13 +108,14 @@ function locate(text, index) {
 // produced, and only with the tokens round 1 did not spend.
 function decodeLayers(text, opts) {
   opts = opts || {};
-  const budget = opts.maxTokens || 8;
+  const budget = opts.maxTokens || 64;
+  const done = (t, exhausted) => (opts.report ? { text: t, exhausted } : t);
   const first = decodeOneLayer(text, Object.assign({}, opts, { maxTokens: budget, _report: true }));
-  if (!first.text) return '';
+  if (!first.text) return done('', first.exhausted);
   const left = budget - first.used;
-  if (left <= 0) return first.text;
+  if (left <= 0) return done(first.text, first.exhausted);
   const second = decodeOneLayer(first.text, Object.assign({}, opts, { maxTokens: left, _report: true }));
-  return second.text ? first.text + '\n' + second.text : first.text;
+  return done(second.text ? first.text + '\n' + second.text : first.text, first.exhausted || second.exhausted);
 }
 
 // Decode the highest-value encoded tokens once (NO recursion -- a DoS guard).
@@ -120,7 +124,9 @@ function decodeLayers(text, opts) {
 // worth decoding.
 function decodeOneLayer(text, opts) {
   opts = opts || {};
-  const maxTokens = opts.maxTokens || 8;
+  const maxTokens = opts.maxTokens || 64;
+  const MAX_DECODED = 256 * 1024;
+  let decodedLen = 0, exhausted = false;
   const minLen = opts.minLen || 24;
   const maxLen = opts.maxLen || 8192;
   const minEntropy = opts.minEntropy || 3.5;
@@ -129,7 +135,7 @@ function decodeOneLayer(text, opts) {
 
   const b64 = /[A-Za-z0-9+/]{24,}={0,2}/g;
   let m;
-  while ((m = b64.exec(text)) && used < maxTokens) {
+  while ((m = b64.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED) {
     const tok = m[0];
     if (tok.length < minLen || tok.length > maxLen) continue;
     if (shannonEntropy(tok) < minEntropy) continue;
@@ -137,26 +143,28 @@ function decodeOneLayer(text, opts) {
       const buf = Buffer.from(tok, 'base64');
       if (!buf.length) continue;
       const u8 = buf.toString('utf8');
-      if (printableRatio(u8) > 0.8) out.push(u8);
+      if (printableRatio(u8) > 0.8) { out.push(u8); decodedLen += u8.length; }
       const nulls = countNulls(buf);
       if (nulls > buf.length / 4) {
         const u16 = buf.toString('utf16le');
-        if (printableRatio(u16) > 0.8) out.push(u16);
+        if (printableRatio(u16) > 0.8) { out.push(u16); decodedLen += u16.length; }
       }
       used++;
     } catch { /* not base64 */ }
   }
 
+  if (m) exhausted = true;   // a candidate token was left undecoded
   const hex = /\b(?:[0-9a-fA-F]{2}){16,}\b/g;
-  while ((m = hex.exec(text)) && used < maxTokens) {
+  while ((m = hex.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED) {
     try {
       const u8 = Buffer.from(m[0], 'hex').toString('utf8');
-      if (printableRatio(u8) > 0.8) { out.push(u8); used++; }
+      if (printableRatio(u8) > 0.8) { out.push(u8); used++; decodedLen += u8.length; }
     } catch { /* not hex */ }
   }
+  if (m) exhausted = true;
   // `_report` is for decodeLayers, which needs the spend to size round 2. Every other
   // caller keeps the original string return.
-  return opts._report ? { text: out.join('\n'), used } : out.join('\n');
+  return opts._report ? { text: out.join('\n'), used, exhausted } : out.join('\n');
 }
 
 function printableRatio(s) {
@@ -279,11 +287,20 @@ const EXFIL_TARGET_RE = /(?:~\/?\.ssh|id_rsa|id_ed25519|\.env\b|\bcredentials?\b
 // Tool poisoning fires on concealment, or on a transfer verb aimed at a secret. "<IMPORTANT>
 // read the file before editing" is ordinary documentation.
 const MCP_IMPORTANT_RE = new RegExp('<IMPORTANT>[\\s\\S]{0,400}(?:do\\s+not\\s+(?:mention|tell|reveal)|\\b(?:read|send|cat|upload|post|copy|curl|wget)\\b[^.\\n]{0,80}' + EXFIL_TARGET_RE.source + ')', 'i');
-// Tempered `(?:(?!-->)[\s\S])` runs so the body can't cross a `-->`: the keyword must
-// live inside ONE comment. Stops a decorative divider from pairing with a keyword in
-// unrelated content (or a separate comment) up to 400 chars away, while every real
-// single-comment payload still fires. Bounded {0,400} both sides -> no runaway backtrack.
-const HTML_COMMENT_ACTION_RE = /<!--(?:(?!-->)[\s\S]){0,400}(?:curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|webhook)(?:(?!-->)[\s\S]){0,400}-->/i;
+// An HTML comment carrying an action keyword. Walked with indexOf, one comment at a time (the
+// keyword must live inside ONE comment of at most ~800 chars): the old tempered regex cost
+// ~16 ms/KB on `<!--` padding, which pushed adapter hook calls past their timeout.
+const HTML_COMMENT_KEYWORD_RE = /curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|webhook/i;
+function findActionComment(s) {
+  for (let i = s.indexOf('<!--'); i !== -1; ) {
+    const e = s.indexOf('-->', i + 4);
+    if (e === -1) return null;
+    const body = s.slice(i + 4, e);
+    if (body.length <= 820 && HTML_COMMENT_KEYWORD_RE.test(body)) return { index: i, text: s.slice(i, e + 3) };
+    i = s.indexOf('<!--', i + 4);
+  }
+  return null;
+}
 
 // Confusable Cyrillic/Greek letters that spoof ASCII Latin, mapped to the letter they
 // imitate. Single source of truth: CONFUSABLE (for the mixed-script detector) is
@@ -512,12 +529,12 @@ function scanInjectionText(findings, text, decodedLayer) {
   if (ps) pushFinding(findings, clean, ps.index, 'injection', 'persona-phrase', SEVERITY.LOW);
 
   const mi = MCP_IMPORTANT_RE.exec(clean); if (mi) pushFinding(findings, clean, mi.index, 'injection', 'mcp-tool-poisoning', SEVERITY.HIGH);
-  const hc = HTML_COMMENT_ACTION_RE.exec(clean);
+  const hc = findActionComment(clean);
   if (hc) {
     // HIGH only when the comment also names an exfil/secret target -- a real data-theft
     // payload (`<!-- curl ...~/.ssh/id_rsa... -->`). A lone keyword (`<!-- see http://... -->`,
     // `<!-- run eval on load -->`) is advisory (B2, LOW).
-    const hcHigh = EXFIL_TARGET_RE.test(hc[0]);
+    const hcHigh = EXFIL_TARGET_RE.test(hc.text);
     pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', hcHigh ? SEVERITY.HIGH : SEVERITY.LOW);
   }
 
@@ -597,13 +614,26 @@ function scanInjection(text, opts) {
     addView(sub, ':marker-stripped');
   }
 
-  if (opts.decode !== false) {
-    const decoded = decodeLayers(text);
-    if (decoded) {
+  // Markdown emphasis inside a keyword (`ignore **previous** instructions`), only when the text
+  // has both an emphasis marker and an override word.
+  if (/[*_~`]/.test(text) && /\b(?:ignore|disregard|forget|previous|prior|instructions?|system)\b/i.test(text)) {
+    const plain = text.replace(/(?<=\w)[*_~`]+|[*_~`]+(?=\w)/g, '');
+    if (plain !== text) {
       const sub = [];
-      scanInjectionText(sub, decoded, true);
+      scanInjectionText(sub, plain, true);
+      addView(sub, ':emphasis');
+    }
+  }
+
+  if (opts.decode !== false) {
+    const d = decodeLayers(text, { report: true });
+    if (d.text) {
+      const sub = [];
+      scanInjectionText(sub, d.text, true);
       addView(sub, ':decoded');
     }
+    // The budget ran out with encoded tokens left unread: a coverage gap, not a finding.
+    if (d.exhausted) findings.push({ category: 'coverage', signal: 'decode-budget-exhausted', line: 0, snippet: '', severity: SEVERITY.LOW });
   }
   return findings;
 }
@@ -612,7 +642,7 @@ function scanInjection(text, opts) {
 // hard-denied only when written to one of these; elsewhere it is legitimate authored
 // content. Single source of truth, shared by check-sensitive-files.js (Write/Edit) and
 // check-bash.js (shell redirect / heredoc write).
-const AGENT_INSTRUCTION_FILE = /(^|[\/\\])(CLAUDE(\.local)?\.md|AGENTS?\.md|GEMINI\.md|\.cursorrules|\.clinerules|\.windsurfrules|\.aider\.conf\.yml|copilot-instructions\.md|\.?mcp\.json)$|(^|[\/\\])\.claude[\/\\]/i;
+const AGENT_INSTRUCTION_FILE = /(^|[\/\\])(CLAUDE(\.local)?\.md|AGENTS?\.md|GEMINI\.md|SKILL\.md|\.cursorrules|\.clinerules|\.windsurfrules|\.aider\.conf\.yml|copilot-instructions\.md|\.?mcp\.json|opencode\.json)$|(^|[\/\\])(?:\.claude|\.opencode|\.codex|\.gemini|\.pi|\.agents|\.cursor[\/\\]rules|\.windsurf[\/\\]rules|\.github[\/\\]instructions)[\/\\]/i;
 function isAgentInstructionFile(p) { return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p); }
 
 // One path component of a glob as an anchored, case-insensitive RegExp (null if unparseable).

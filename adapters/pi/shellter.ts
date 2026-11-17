@@ -69,7 +69,7 @@ function runHook(hook: string, event: any) {
   const input = JSON.stringify(event);
   for (const exe of ["node", process.execPath]) {
     try {
-      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: 5000 });
+      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: 20000 });
     } catch (e: any) {
       if (e && e.code === "ENOENT") continue;        // runtime missing -> try next
       if (e && e.stdout) return e.stdout.toString();  // hook printed then exited nonzero

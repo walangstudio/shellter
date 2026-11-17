@@ -20,9 +20,14 @@ const cases: [string, string, any, boolean][] = [
   ["bash posh gc ssh key",    "bash",  { command: "gc ~/.ssh/id_rsa" },                  true],
   ["bash Get-Content readme",  "bash",  { command: "Get-Content README.md" },             false],
   ["read ssh private key",    "read",  { filePath: "C:/Users/alice/.ssh/id_rsa_kitty" }, true],
-  ["write prompt-injection",  "write", { filePath: "n.md", content: INJECTION },         true],
-  ["edit prompt-injection",   "edit",  { filePath: "n.md", newString: INJECTION },       true],
+  ["write prompt-injection",  "write", { filePath: "AGENTS.md", content: INJECTION },    true],
+  ["edit prompt-injection",   "edit",  { filePath: "AGENTS.md", newString: INJECTION },  true],
   ["read normal file",        "read",  { filePath: "README.md" },                        false],
+  ["multiedit injection",     "multiedit", { filePath: "AGENTS.md", edits: [{ oldString: "a", newString: INJECTION }] }, true],
+  ["multiedit on .env",       "multiedit", { filePath: "proj/.env", edits: [{ oldString: "a", newString: "b" }] }, true],
+  ["patch into .env",         "patch", { patchText: "*** Begin Patch\n*** Update File: proj/.env\n+X=1\n*** End Patch" }, true],
+  ["apply_patch injection",   "apply_patch", { patchText: "*** Begin Patch\n*** Add File: AGENTS.md\n+" + INJECTION + "\n*** End Patch" }, true],
+  ["patch benign",            "patch", { patchText: "*** Begin Patch\n*** Update File: src/a.ts\n+const a = 1;\n*** End Patch" }, false],
   ["unknown tool ignored",    "todowrite", { todos: [] },                                false],
 ];
 

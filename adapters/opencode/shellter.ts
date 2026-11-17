@@ -47,6 +47,12 @@ function mapTool(tool, args) {
       // check-sensitive-files.js reads an Edit's new text from `new_string` -- must
       // match that key or the content/injection scan on edits is silently skipped.
       return { hook: FILE_HOOK, name: "Edit", input: { file_path: a.filePath ?? a.path ?? "", new_string: a.newString ?? a.replacement ?? a.content ?? "" } };
+    case "multiedit":
+      // { filePath, edits: [{ oldString, newString }] }: every new string is scanned.
+      return { hook: FILE_HOOK, name: "Edit", input: { file_path: a.filePath ?? a.path ?? "", new_string: Array.isArray(a.edits) ? a.edits.map((e) => e?.newString ?? "").join("\n") : "" } };
+    case "patch":
+    case "apply_patch":
+      return patchWrites(a.patchText ?? a.patch ?? a.input ?? "");
     case "grep":
       return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
     case "glob":
@@ -56,13 +62,26 @@ function mapTool(tool, args) {
   }
 }
 
+// A patch blob as one Write check per `*** Add|Update|Delete File:` header, scanning the added
+// lines. Best-effort: the tool's argument shape is not verified against opencode.
+function patchWrites(text) {
+  const out = [];
+  let cur = null;
+  for (const line of String(text).split("\n")) {
+    const h = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$/.exec(line);
+    if (h) { cur = { hook: FILE_HOOK, name: "Write", input: { file_path: h[1], content: "" } }; out.push(cur); continue; }
+    if (cur && line.startsWith("+")) cur.input.content += line.slice(1) + "\n";
+  }
+  return out.length ? out : [{ hook: FILE_HOOK, name: "Write", input: { file_path: "", content: String(text) } }];
+}
+
 // Prefer node (the runtime shellter is tested under); fall back to whatever is
 // running opencode (bun) so the gate still works if node isn't on PATH.
 function runHook(hook, event) {
   const input = JSON.stringify(event);
   for (const exe of ["node", process.execPath]) {
     try {
-      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: 5000 });
+      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: 20000 });
     } catch (e: any) {
       if (e && e.code === "ENOENT") continue;        // runtime missing -> try next
       if (e && e.stdout) return e.stdout.toString();  // hook printed then exited nonzero
@@ -90,14 +109,16 @@ export const ShellterPlugin = async ({ directory, worktree }) => {
   dbg({ event: "loaded", cwd, hooks: HOOKS });
   return {
     "tool.execute.before": async (input, output) => {
-      const m = mapTool(input?.tool, output?.args);
-      if (!m) return;
-      const { decision, reason } = decide(runHook(m.hook, { tool_name: m.name, tool_input: m.input, cwd }));
-      dbg({ tool: input?.tool, argKeys: Object.keys(output?.args || {}), decision });
-      if (decision === "deny" || decision === "ask") {
-        // The reason already carries the guidance (incl. any trust command for a
-        // flagged script), so surface it verbatim rather than a fixed placeholder.
-        throw new Error(`shellter ${decision === "ask" ? "needs your approval for" : "blocked"} this ${m.name}: ${reason}`);
+      const mapped = mapTool(input?.tool, output?.args);
+      if (!mapped) return;
+      for (const m of Array.isArray(mapped) ? mapped : [mapped]) {
+        const { decision, reason } = decide(runHook(m.hook, { tool_name: m.name, tool_input: m.input, cwd }));
+        dbg({ tool: input?.tool, argKeys: Object.keys(output?.args || {}), decision });
+        if (decision === "deny" || decision === "ask") {
+          // The reason already carries the guidance (incl. any trust command for a
+          // flagged script), so surface it verbatim rather than a fixed placeholder.
+          throw new Error(`shellter ${decision === "ask" ? "needs your approval for" : "blocked"} this ${m.name}: ${reason}`);
+        }
       }
     },
   };
