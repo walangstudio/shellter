@@ -378,9 +378,9 @@ function scanBundle(root) {
     // A bundle is untrusted by definition, so BOTH injection tiers are reported here.
     // The agent-instruction-file gate the write path uses does not apply: every file in a
     // skill bundle is, in effect, an instruction file.
+    // B2 (LOW, advisory on the write path) stays medium here for the same reason.
     for (const f of scan.scanInjection(text, { decode: true })) {
-      if (f.severity === 'low') continue;
-      add({ rule: 'INJ', severity: f.severity, file: rel,
+      add({ rule: 'INJ', severity: f.severity === 'low' ? 'medium' : f.severity, file: rel,
             detail: f.signal + (f.line ? ' (line ' + f.line + ')' : '') });
     }
     // Shell rules belong on shell scripts. Gating on the extension alone let a hook script

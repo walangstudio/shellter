@@ -1060,6 +1060,7 @@ const SECRET_TOKENS = '(?:' + [
   '[\\\\/]credentials(?![\\w./])', 'credentials\\.(?:json|ya?ml|toml|ini|txt|xml|env|conf|cfg|properties|store)\\b', '\\.git-credentials\\b',
   '\\.ssh\\b', '\\.gnupg\\b', '\\.aws\\b', '\\.gcloud\\b', '\\.azure\\b',
   '\\.docker[\\\\/]config', '\\.gitconfig\\b',
+  '\\.kube[\\\\/]config', '\\.config[\\\\/]gh[\\\\/]hosts', '[\\\\/]proc[\\\\/][^\\\\/\\s]+[\\\\/]environ',
   // Unix credential stores: password hashes and the sudoers policy. Anchored to
   // `/etc/` so the bare word "shadow" (box-shadow, shadow DOM, a game asset) never
   // matches; `master.passwd` is the BSD/macOS shadow file. `/etc/passwd` is NOT here
@@ -1091,6 +1092,9 @@ const PERSIST_CI = [
   '\\bJenkinsfile\\b', '\\.drone\\.yml\\b', '\\.azure-pipelines\\.yml\\b', '\\.woodpecker\\.yml\\b', 'buildkite\\.yml\\b',
 ].join('|');
 const PERSIST_RC_RE = '(?:' + PERSIST_RC + ')';
+// A write whose destination is the matched path: redirect, tee, cp/mv/install/ln, in-place edit.
+const WRITE_INTO = '(?:>>?\\s*[\'"]?[^\\s|;&\'"<>]{0,256}|\\b(?:tee|cp|mv|install|ln)\\s[^\\n|;&]{0,512}|\\b(?:sed|perl)\\b[^|;&]{0,256}\\s-i\\S*\\s[^\\n|;&]{0,512})';
+const WRITE_TARGET_END = '[\'"]?(?=\\s*(?:$|[|;&)]))';
 const PERSIST_TARGETS = '(?:' + PERSIST_BACKDOOR + '|' + PERSIST_CI + ')';
 const PERSIST_TARGETS_NOCI = '(?:' + PERSIST_BACKDOOR + ')';
 
@@ -1950,6 +1954,12 @@ const DENY_PATTERNS = [
     'In-place edit of a shell rc file -- approve only if intended', 'ask'],
   [new RegExp('\\b(?:curl|wget)\\b[^|;]*(?:-o|-O|--output(?:-document)?)\\b[^|;]*' + PERSIST_RC_RE, 'i'),
     'Downloading a file onto a shell rc path -- approve only if intended', 'ask'],
+  // shellter's trust store (self-granted trust) and Claude Code's settings (allow rules,
+  // hooks) as a WRITE target: the path must end the write, so copying FROM them is not hit.
+  [new RegExp(WRITE_INTO + 'shellter-trust\\.json' + WRITE_TARGET_END, 'i'),
+    'Writing the shellter trust store blocked -- trust a script with `node shellter-trust.js add <path>`'],
+  [new RegExp(WRITE_INTO + '\\.claude[\\\\/]settings(?:\\.local)?\\.json' + WRITE_TARGET_END, 'i'),
+    'Writing Claude Code settings (allow rules, hooks) -- approve only if intended', 'ask'],
 
   // Destructive rm -- parsed flag-order-independently with quote stripping, so
   // `rm -r -f /`, `rm -rf "/"`, `rm -rf --no-preserve-root /`, `rm -r -f ~`, and
@@ -2872,7 +2882,7 @@ function checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs) {
   const hash = trust.sha256OfScan(r.buf, r.size);
   if (trust.isTrusted(hash)) { approve(); return; }
   const toolName = isPosh ? 'PowerShell' : 'Bash';
-  if (trust.commandAllowed(seg, cwd, toolName) || trust.commandAllowed(rawCmd, cwd, toolName)) {
+  if (trust.commandAllowed(seg, cwd, toolName) || trust.commandAllowed(rawCmd, cwd, toolName, true)) {
     approve();
     return;
   }

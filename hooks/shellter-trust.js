@@ -20,8 +20,15 @@ const crypto = require('crypto');
 
 const TRUST_SCAN_BYTES = 256 * 1024;
 
+// SHELLTER_TRUST_FILE counts only as an absolute path outside the working directory: a
+// relative one (or one inside the repo) would let a cloned repo ship its own trust store.
 function trustStorePath() {
-  return process.env.SHELLTER_TRUST_FILE || path.join(os.homedir(), '.claude', 'shellter-trust.json');
+  const env = process.env.SHELLTER_TRUST_FILE;
+  if (env && path.isAbsolute(env)) {
+    const rel = path.relative(process.cwd(), env);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) return env;
+  }
+  return path.join(os.homedir(), '.claude', 'shellter-trust.json');
 }
 
 function readTrustStore() {
@@ -104,14 +111,14 @@ function listEntries() {
 
 let _allowCache = null;
 
-function collectAllow(file, toolName, out) {
+function collectAllow(file, toolName, out, dir) {
   try {
     const obj = JSON.parse(fs.readFileSync(file, 'utf8'));
     const allow = obj && obj.permissions && Array.isArray(obj.permissions.allow) ? obj.permissions.allow : [];
     const prefix = toolName + '(';
     for (const rule of allow) {
       if (typeof rule === 'string' && rule.startsWith(prefix) && rule.endsWith(')')) {
-        out.push(rule.slice(prefix.length, -1));
+        out.push({ inner: rule.slice(prefix.length, -1), dir });
       }
     }
   } catch { /* missing/corrupt -> ignore */ }
@@ -122,10 +129,11 @@ function claudeAllowRules(cwd, toolName) {
   const rules = [];
   let dir = cwd ? path.resolve(cwd) : process.cwd();
   for (let i = 0; i < 40; i++) {
-    // Only settings.local.json (gitignored, user-authored) is honored for
-    // script-flag suppression -- NOT the committed project settings.json, which a
-    // cloned malicious repo controls and could use to whitelist its own payload.
-    collectAllow(path.join(dir, '.claude', 'settings.local.json'), toolName, rules);
+    // Only settings.local.json (user-authored, where "don't ask again" lands) is honored for
+    // script-flag suppression -- NOT the committed project settings.json, which a cloned
+    // malicious repo controls. A settings.local.json the repo COMMITS is ignored too
+    // (checked lazily, see localRulesTracked).
+    collectAllow(path.join(dir, '.claude', 'settings.local.json'), toolName, rules, dir);
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -139,20 +147,40 @@ function claudeAllowRules(cwd, toolName) {
   return rules;
 }
 
-function commandAllowed(cmd, cwd, toolName) {
+// git-tracked = shipped by the repo, not written by this user. Runs only when a rule from that
+// file actually matches a flagged script, so the hot path never spawns git. No git / not a
+// repo -> not tracked (honoured).
+const _tracked = new Map();
+function localRulesTracked(dir) {
+  if (!_tracked.has(dir)) {
+    let tracked = false;
+    try {
+      const r = require('child_process').spawnSync('git', ['-C', dir, 'ls-files', '--error-unmatch', '.claude/settings.local.json'], { stdio: 'ignore', timeout: 2000 });
+      tracked = r.status === 0;
+    } catch { /* no git */ }
+    _tracked.set(dir, tracked);
+  }
+  return _tracked.get(dir);
+}
+
+// `cmd` is one command segment. `exactOnly` is for the whole compound command line: a `:*`
+// prefix matched against it would wave through anything chained after the prefix.
+function commandAllowed(cmd, cwd, toolName, exactOnly) {
   if (!cmd) return false;
   const c = cmd.trim();
-  for (const inner of claudeAllowRules(cwd, toolName)) {
+  for (const { inner, dir } of claudeAllowRules(cwd, toolName)) {
+    let hit;
     if (inner.endsWith(':*')) {
       const pfx = inner.slice(0, -2);
       // A `:*` prefix only silences a script flag when it names a specific script
       // (contains a space or path separator). A bare-interpreter prefix like
       // `bash` or `sh` is too broad to auto-trust arbitrary script contents.
-      if (!/[ \t/\\]/.test(pfx)) continue;
-      if (c === pfx || c.startsWith(pfx)) return true;
-    } else if (c === inner) {
-      return true;
+      if (exactOnly || !/[ \t/\\]/.test(pfx)) continue;
+      hit = c === pfx || c.startsWith(pfx + ' ');
+    } else {
+      hit = c === inner;
     }
+    if (hit && !(dir && localRulesTracked(dir))) return true;
   }
   return false;
 }

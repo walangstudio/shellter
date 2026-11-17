@@ -25,6 +25,7 @@ const VS_RE = /[︀-️]|[\u{E0100}-\u{E01EF}]/gu;    // variation selectors
 // A variation selector is suspicious when it does NOT sit on an emoji-like base
 // (legit use is a single VS16/skin-tone on an emoji). Smuggling appends runs of
 // selectors, uses the VS17-256 supplement (E0100+), or attaches them to ASCII.
+const EMOJI_PRESENTATION_BASE = new Set([0xa9, 0xae, 0x203c, 0x2049, 0x2122, 0x2139, 0x3030, 0x303d, 0x3297, 0x3299]);
 function countSuspiciousVS(s) {
   const cp = Array.from(s);
   let n = 0;
@@ -34,11 +35,13 @@ function countSuspiciousVS(s) {
     if (!isVS) continue;
     if (c >= 0xe0100) { n++; continue; }            // supplement: no legit text use
     const prev = i > 0 ? cp[i - 1].codePointAt(0) : 0;
+    const next = i + 1 < cp.length ? cp[i + 1].codePointAt(0) : 0;
     const prevIsEmojiBase =
       (prev >= 0x1f000) ||                            // emoji & pictographs
       (prev >= 0x2190 && prev <= 0x2bff) ||           // arrows / misc symbols / dingbats
-      (prev >= 0xfe00 && prev <= 0xfe0f);             // already a selector (skin-tone run on emoji)
-    const next = i + 1 < cp.length ? cp[i + 1].codePointAt(0) : 0;
+      (prev >= 0xfe00 && prev <= 0xfe0f) ||           // already a selector (skin-tone run on emoji)
+      EMOJI_PRESENTATION_BASE.has(prev) ||            // (c) (R) TM info sign ...
+      (next === 0x20e3 && (prev === 0x23 || prev === 0x2a || (prev >= 0x30 && prev <= 0x39)));   // keycap 1-9 # *
     const nextIsVS = next >= 0xfe00 && next <= 0xfe0f;
     if (!prevIsEmojiBase || nextIsVS) n++;            // ASCII base, or a run -> bitstream
   }
@@ -263,19 +266,24 @@ const POLICY_PUPPETRY = [
 
 // Override-phrase family. Built with \s+ so the source isn't itself a clean
 // override sentence.
-const OVERRIDE_RE = /\b(?:ignore|disregard|forget|discard|cancel)\s+(?:all\s+|the\s+|any\s+|your\s+)?(?:previous|prior|earlier|above|current|the\s+system)\s+(?:instructions?|prompts?|rules?|commands?|guidelines?)\b|\bstop\s+following\s+(?:your\s+|the\s+)?(?:instructions?|rules?)\b|\byou\s+are\s+now\s+(?:a|an|the|in)\b|\bnew\s+(?:instructions?|system\s+prompt)\b/i;
-// Jailbreak / role-hijack phrase family. Class B (destination-gated): legitimate in security
+const OVERRIDE_RE = /\b(?:ignore|disregard|forget|discard|cancel)\s+(?:all\s+|the\s+|any\s+|your\s+)?(?:previous|prior|earlier|above|current|the\s+system)\s+(?:instructions?|prompts?|rules?|commands?|guidelines?)\b|\bstop\s+following\s+(?:your\s+|the\s+)?(?:instructions?|rules?)\b|\byou\s+are\s+now\s+(?:a|an|the)\b|\b(?:follow|obey|here\s+are|these\s+are)\s+(?:the\s+|your\s+|these\s+)?new\s+instructions?\b|\bnew\s+system\s+prompt\b/i;
+// Jailbreak / role-hijack phrase family. Class B1 (destination-gated): legitimate in security
 // write-ups and prompt datasets, but on an agent-instruction file it is a hijack. Built with
 // \s+ so this source file is not itself a clean instance.
-const ROLE_HIJACK_RE = /\byou\s+have\s+been\s+(?:jailbroken|liberated|freed)\b|\bdeveloper\s+mode\s+(?:on|enabled|activated)\b|\bDAN\s+mode\b|\bdo\s+anything\s+now\b|\bact\s+as\s+if\s+you\s+(?:are|were)\b|\bpretend\s+(?:that\s+)?you\s+(?:are|'re)\b|\bassume\s+the\s+role\s+of\b|\bfrom\s+now\s+on,?\s+you\s+(?:are|will|must)\b|\boverride\s+(?:the\s+)?system\s+prompt\b/i;
+const ROLE_HIJACK_RE = /\byou\s+have\s+been\s+(?:jailbroken|liberated|freed)\b|\bdeveloper\s+mode\s+(?:on|enabled|activated)\b|\bDAN\s+mode\b|\bdo\s+anything\s+now\b|\boverride\s+(?:the\s+)?system\s+prompt\b/i;
+// Persona phrases. Class B2 (LOW, advisory everywhere): routine wording in agent and command
+// definitions ("act as if you are the on-call engineer").
+const PERSONA_RE = /\bact\s+as\s+if\s+you\s+(?:are|were)\b|\bpretend\s+(?:that\s+)?you\s+(?:are|'re)\b|\bassume\s+the\s+role\s+of\b|\bfrom\s+now\s+on,?\s+you\s+(?:are|will|must)\b/i;
 const EXFIL_TARGET_RE = /(?:~\/?\.ssh|id_rsa|id_ed25519|\.env\b|\bcredentials?\b|mcp\.json|~\/?\.aws|\.git-credentials|private[_-]?key)/i;
 
-const MCP_IMPORTANT_RE = /<IMPORTANT>[\s\S]{0,400}(?:do\s+not\s+(?:mention|tell|reveal)|read\s|send\s|curl|wget|execute|\.env\b|credentials?|~\/?\.)/i;
+// Tool poisoning fires on concealment, or on a transfer verb aimed at a secret. "<IMPORTANT>
+// read the file before editing" is ordinary documentation.
+const MCP_IMPORTANT_RE = new RegExp('<IMPORTANT>[\\s\\S]{0,400}(?:do\\s+not\\s+(?:mention|tell|reveal)|\\b(?:read|send|cat|upload|post|copy|curl|wget)\\b[^.\\n]{0,80}' + EXFIL_TARGET_RE.source + ')', 'i');
 // Tempered `(?:(?!-->)[\s\S])` runs so the body can't cross a `-->`: the keyword must
 // live inside ONE comment. Stops a decorative divider from pairing with a keyword in
 // unrelated content (or a separate comment) up to 400 chars away, while every real
 // single-comment payload still fires. Bounded {0,400} both sides -> no runaway backtrack.
-const HTML_COMMENT_ACTION_RE = /<!--(?:(?!-->)[\s\S]){0,400}(?:curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|token|webhook|http)(?:(?!-->)[\s\S]){0,400}-->/i;
+const HTML_COMMENT_ACTION_RE = /<!--(?:(?!-->)[\s\S]){0,400}(?:curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|webhook)(?:(?!-->)[\s\S]){0,400}-->/i;
 
 // Confusable Cyrillic/Greek letters that spoof ASCII Latin, mapped to the letter they
 // imitate. Single source of truth: CONFUSABLE (for the mixed-script detector) is
@@ -467,14 +475,17 @@ function scanInjectionText(findings, text, decodedLayer) {
   //           tag/bidi/variation-selector smuggling, policy-puppetry, MCP tool-poisoning,
   //           and an override phrase co-located with an exfil target.
   //   MEDIUM = Class B -- legitimately appears in docs, tests, prompt datasets, and
-  //           AI-app source (role markers, a bare override phrase, a Q&A transcript, an
-  //           HTML-comment action, a homoglyph token). The caller hard-denies these ONLY
+  //           AI-app source (chat-template markers, a bare override phrase, jailbreak
+  //           phrases, a homoglyph token). The caller hard-denies these ONLY
   //           when the write target is an agent-instruction file that an agent auto-ingests
   //           (CLAUDE.md, AGENTS.md, .cursorrules, .mcp.json, ...); elsewhere they fall
   //           through. This is what stops shellter blocking a security write-up, a chatbot
   //           system-prompt string, or an example conversation.
+  //   LOW   = Class B2 -- advisory everywhere, including instruction files: `<system>` tags,
+  //           a Q&A transcript, a keyword-only HTML comment, persona phrasing.
   // Role markers (chatml/llama/`<system>`/`BEGIN SYSTEM PROMPT`) -> Class B.
-  for (const [re, sig] of ROLE_MARKERS) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.MEDIUM); }
+  // `<system>` / `<instructions>` tags are B2 (LOW): routine structure in agent definitions.
+  for (const [re, sig] of ROLE_MARKERS) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, sig === 'xml-system-tag' ? SEVERITY.LOW : SEVERITY.MEDIUM); }
   for (const [re, sig] of POLICY_PUPPETRY) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.HIGH); }
 
   // Override phrases are matched on confusable-folded text so a phrase spoofed with
@@ -497,15 +508,17 @@ function scanInjectionText(findings, text, decodedLayer) {
   // Jailbreak / role-hijack phrases -> Class B (MEDIUM): denied only on an agent-instruction file.
   const rh = ROLE_HIJACK_RE.exec(clean);
   if (rh) pushFinding(findings, clean, rh.index, 'injection', 'role-hijack', SEVERITY.MEDIUM);
+  const ps = PERSONA_RE.exec(clean);
+  if (ps) pushFinding(findings, clean, ps.index, 'injection', 'persona-phrase', SEVERITY.LOW);
 
   const mi = MCP_IMPORTANT_RE.exec(clean); if (mi) pushFinding(findings, clean, mi.index, 'injection', 'mcp-tool-poisoning', SEVERITY.HIGH);
   const hc = HTML_COMMENT_ACTION_RE.exec(clean);
   if (hc) {
     // HIGH only when the comment also names an exfil/secret target -- a real data-theft
     // payload (`<!-- curl ...~/.ssh/id_rsa... -->`). A lone keyword (`<!-- see http://... -->`,
-    // `<!-- auth token handling -->`) is Class B and destination-gated by the caller.
+    // `<!-- run eval on load -->`) is advisory (B2, LOW).
     const hcHigh = EXFIL_TARGET_RE.test(hc[0]);
-    pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', hcHigh ? SEVERITY.HIGH : SEVERITY.MEDIUM);
+    pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', hcHigh ? SEVERITY.HIGH : SEVERITY.LOW);
   }
 
   // Homoglyph mixed-script is the one display-spoof matcher that fires on the random
@@ -527,7 +540,7 @@ function scanInjectionText(findings, text, decodedLayer) {
   let rm; ROLE_LINE_RE.lastIndex = 0;
   let firstIdx = -1;
   while ((rm = ROLE_LINE_RE.exec(clean))) { seen.add(rm[1].toLowerCase()); if (firstIdx < 0) firstIdx = rm.index; }
-  if (seen.size >= 2) pushFinding(findings, clean, firstIdx, 'injection', 'fake-transcript-role-labels', SEVERITY.MEDIUM);
+  if (seen.size >= 2) pushFinding(findings, clean, firstIdx, 'injection', 'fake-transcript-role-labels', SEVERITY.LOW);
 }
 
 function scanInjection(text, opts) {
@@ -570,7 +583,9 @@ function scanInjection(text, opts) {
     const nfkc = text.normalize('NFKC');
     if (nfkc !== text) {
       const sub = [];
-      scanInjectionText(sub, nfkc, true);
+      // Selectors are already counted on the raw text. NFKC folds an emoji base (U+2122,
+      // U+2139) to ASCII, so counting them again here flags `TM` + VS16 as smuggling.
+      scanInjectionText(sub, nfkc.replace(VS_RE, ''), true);
       addView(sub, ':nfkc');
     }
   }

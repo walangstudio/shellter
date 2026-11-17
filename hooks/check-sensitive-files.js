@@ -88,20 +88,48 @@ function safeRealpath(p) {
   return abs;
 }
 
-// Strip invisible/steganographic characters. Returns separate counts so callers
-// can apply different policies: tag chars and bidi overrides have no legitimate
-// use anywhere; zero-widths are legit in emoji ZWJ sequences but suspicious in
-// source code.
+// One spelling for every path rule: `\` -> `/`, no NTFS stream suffix (`x::$DATA`,
+// `x:stream`), no trailing dots/spaces on a segment (Windows drops them; `.`/`..` stay).
+function canon(p) {
+  return p.replace(/\\/g, '/')
+    .replace(/^((?:[A-Za-z]:)?[^:]*[^\/:]):[^\/:]*(?::\$\w+)?$/, (m, name) => name)
+    .replace(/([^\/.\s])[. ]+(?=\/|$)/g, (m, c) => c);
+}
+// The path as given, its symlink/junction-resolved form, and both canonical spellings.
+function pathForms(p) {
+  if (typeof p !== 'string' || !p) return [];
+  const r = safeRealpath(p);
+  return [...new Set([p, canon(p), r, r && canon(r)])].filter(Boolean);
+}
+
+// Strip invisible/steganographic characters. Tag chars and bidi overrides have no legitimate
+// use anywhere (`danger`); zero-widths are counted separately by suspiciousZW.
 function stripInvisibles(s) {
-  if (typeof s !== 'string') return { clean: s, danger: 0, zwCount: 0 };
+  if (typeof s !== 'string') return { clean: s, danger: 0 };
   const tagCount = (s.match(/[\u{E0000}-\u{E007F}]/gu) || []).length;
   const bidiCount = (s.match(/[‪-‮⁦-⁩]/g) || []).length;
-  const zwCount = (s.match(/[​-‍⁠﻿]/g) || []).length;
   const clean = s
     .replace(/[\u{E0000}-\u{E007F}]/gu, '')
     .replace(/[‪-‮⁦-⁩]/g, '')
     .replace(/[​-‍⁠﻿]/g, '');
-  return { clean, danger: tagCount + bidiCount, zwCount };
+  return { clean, danger: tagCount + bidiCount };
+}
+
+// Zero-width characters that are not part of normal text: a ZWJ joins emoji (both neighbours
+// emoji-ish) and a BOM at offset 0 is an encoding mark; anything else counts.
+const emojiish = (c) => c >= 0x1f000 || (c >= 0x2190 && c <= 0x2bff) || c === 0xfe0f;
+function suspiciousZW(s) {
+  if (!/[​-‍⁠﻿]/.test(s)) return 0;
+  const cp = Array.from(s, (ch) => ch.codePointAt(0));
+  let n = 0;
+  for (let i = 0; i < cp.length; i++) {
+    const c = cp[i];
+    if (!((c >= 0x200b && c <= 0x200d) || c === 0x2060 || c === 0xfeff)) continue;
+    if (c === 0xfeff && i === 0) continue;
+    if (c === 0x200d && i > 0 && emojiish(cp[i - 1]) && emojiish(cp[i + 1] || 0)) continue;
+    n++;
+  }
+  return n;
 }
 
 const SOURCE_LIKE_EXT = /\.(js|ts|jsx|tsx|mjs|cjs|py|rs|go|rb|java|c|cc|cpp|h|hpp|kt|swift|sh|bash|zsh|json|yaml|yml|toml|ini|html|svelte|vue|css|scss|less|sql|php|pl|lua|nim|zig)$/i;
@@ -118,14 +146,21 @@ const SOURCE_LIKE_EXT = /\.(js|ts|jsx|tsx|mjs|cjs|py|rs|go|rb|java|c|cc|cpp|h|hp
 // here: it hard-denied any file containing "you are now a", "act as if", "<system>",
 // "[SYSTEM]", a `User:`/`Assistant:` transcript, or "<!-- ... http ... -->", which blocks
 // ordinary docs, tests, and AI-app source. The disciplined scanner below replaces it.
-const ENCODED_EVAL_PATTERN = /(eval|exec)\s*\(\s*(base64|atob|Buffer\.from)\s*\(/i;
+// A bare eval/exec of a decode denies. A METHOD `.exec(` over a decode asks: `re.exec(atob(x))`
+// (a regex match) and `cp.exec(atob(x))` (a shell) look the same here.
+const DECODE_CALL = '\\s*\\(\\s*(?:base64\\b[\\w.]*|atob|Buffer\\.from)\\s*\\(';
+const ENCODED_EVAL_PATTERN = new RegExp('(?<![.\\w$])(?:eval|exec)' + DECODE_CALL, 'i');
+const ENCODED_METHOD_EXEC = new RegExp('\\.\\s*(?:eval|exec)' + DECODE_CALL, 'i');
 
 // Fake tool-call injection (attacker-controlled file pretending to be an
 // assistant message).
 const TOOL_CALL_INJECTION_PATTERN = /<\/?(function_calls|invoke|tool_use|tool_call)\b|<invoke\s+name=/i;
 
 // Markdown-rendered XSS-style URLs.
-const MARKDOWN_DANGEROUS_URL = /\]\(\s*(javascript|data:text\/html|vbscript):/i;
+// Only where it renders (markdown / HTML, or a file an agent ingests); a sanitizer test in
+// `.js` legitimately carries the string.
+const MARKDOWN_DANGEROUS_URL = /\]\(\s*(?:javascript:|vbscript:|data:text\/html)/i;
+const RENDERED_DOC_EXT = /\.(?:md|mdx|markdown|html?)$/i;
 
 // ANSI escape sequences in source files (terminal-display obfuscation).
 const ANSI_ESCAPE_PATTERN = /\x1b\[[\d;]*[A-Za-z]/;
@@ -150,8 +185,8 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(?:env\s+)?(?:[\w.~\\/-]{0,128}[\\/])?(curl
 const SENSITIVE_EXTENSIONS = /\.(?:env(?!\.(?:example|sample|template|dist|defaults?)\b)|pem|key|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
 // .gitconfig deliberately excluded: tokens normally live in .git-credentials.
-const SENSITIVE_FILES = /(^|\/)(\.git-credentials|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
-const ENV_FILE = /(^|\/)\.env(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
+const SENSITIVE_FILES = /(^|\/)(\.git-credentials|_netrc|proc\/[^\/]+\/environ|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
+const ENV_FILE = /(^|\/)\.env(?:rc|[_-][A-Za-z0-9_-]+)?(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
 const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 // A source-code file inside a dir named credentials/secrets is code, not a secret
 // (`src/credentials/oauth.ts`), so it is exempt from the SECRETS_DIR match. Data files
@@ -164,7 +199,15 @@ const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
 
 // Wallet / crypto / browser cookie files.
 const WALLET_PATTERN = /\b(wallet\.dat|keystore\.json|UTC--\d{4}-\d{2}-\d{2}T)\b|(^|\/)\.electrum\/wallets\/|(^|\/)\.bitcoin\/wallet\.dat$/i;
-const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|google-chrome|mozilla)[^\/]*\/.*\/(Cookies|Cookies-journal|Login Data|Web Data)$/;
+const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|google-chrome|mozilla)[^\/]*\/.*\/(Cookies|Cookies-journal|Login Data|Web Data)$/i;
+// The user's own shell history and Claude config: plausibly holds a pasted token, but
+// reading it is also routine. Ask, never deny.
+// shellter's own trust store and installed hooks: a write there is the agent granting itself
+// trust or switching shellter off. The dev repo's `hooks/` (no `.claude` segment) is not matched.
+const SHELLTER_SELF = /(^|\/)shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|shellter-(?:trust|scan))\.js$/i;
+// Allow rules and hooks live here. The user edits it too, so ask, never deny.
+const CLAUDE_SETTINGS = /(^|\/)\.claude\/settings(?:\.local)?\.json$/i;
+const PERSONAL_HISTORY =/(^|\/)(?:\.(?:bash|zsh)_history|\.claude\.json)$/i;
 // macOS Keychain databases.
 const MACOS_KEYCHAIN = /(^|\/)(Library\/Keychains\/|login\.keychain(-db)?$|System\.keychain$)/i;
 // Windows credential / hive files. The bare hive names (SAM/SYSTEM/SECURITY) require a
@@ -209,6 +252,7 @@ function pathMatchesAnySensitive(p) {
 }
 
 let data = '';
+const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 let pendingAsk = null;   // a dual-use content signal, emitted only after every deny check
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { data += chunk; });
@@ -224,7 +268,7 @@ process.stdin.on('end', () => {
   const tool = input?.tool_name || '';
 
   // ---- content checks for Write / Edit / MultiEdit / NotebookEdit ----
-  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+  if (WRITE_TOOLS.has(tool)) {
     // `x || ''` keeps a non-string truthy value (a number), which then throws in the string
     // scanners -> nonzero exit -> Claude Code runs the tool UNPROTECTED. Only keep strings.
     const str = (v) => (typeof v === 'string' ? v : '');
@@ -246,7 +290,7 @@ process.stdin.on('end', () => {
     // write costs some CPU but never creates a blind spot.
 
     if (content) {
-      const { clean, danger, zwCount } = stripInvisibles(content);
+      const { clean, danger } = stripInvisibles(content);
       const flat = clean.replace(/\n/g, ' ');
 
       const isBinary = /\.(woff2?|ttf|otf|eot|png|jpe?g|gif|webp|ico|pdf|zip|gz|bz2|xz|7z|tar|wasm|exe|dll|so|dylib|bin|node)$/i.test(filePath);
@@ -254,12 +298,12 @@ process.stdin.on('end', () => {
         if (danger > 0) {
           deny('Tag-character / bidi-override Unicode detected -- steganographic prompt injection', filePath);
         }
-        if (zwCount > 0 && SOURCE_LIKE_EXT.test(filePath)) {
+        if (SOURCE_LIKE_EXT.test(filePath) && suspiciousZW(content) > 0) {
           deny('Zero-width characters in source file -- possible steganographic injection', filePath);
         }
       }
 
-      const instructionSurface = scan.isAgentInstructionFile(filePath);
+      const instructionSurface = pathForms(filePath).some(scan.isAgentInstructionFile);
 
       // A fake tool-call tag is legitimate content when documenting an agent framework,
       // so it hard-denies only when written to a file an agent auto-ingests.
@@ -270,13 +314,17 @@ process.stdin.on('end', () => {
       if (ENCODED_EVAL_PATTERN.test(flat)) {
         deny('Encoded eval/exec pattern in file content blocked', filePath);
       }
+      if (ENCODED_METHOD_EXEC.test(flat)) {
+        pendingAsk = pendingAsk || { reason: 'exec/eval method call on decoded data in file content', snippet: filePath };
+      }
 
-      if (MARKDOWN_DANGEROUS_URL.test(flat)) {
+      if ((instructionSurface || RENDERED_DOC_EXT.test(filePath)) && MARKDOWN_DANGEROUS_URL.test(flat)) {
         deny('Markdown javascript:/data:/vbscript: URL blocked', filePath);
       }
 
       if (ANSI_TARGET_EXTENSIONS.test(filePath) && ANSI_ESCAPE_PATTERN.test(content)) {
-        deny('ANSI escape sequence in source file blocked', filePath);
+        if (instructionSurface) deny('ANSI escape sequence in an agent-instruction file blocked', filePath);
+        pendingAsk = pendingAsk || { reason: 'ANSI escape sequence in source file', snippet: filePath };
       }
 
       // Deferred: an ask must never pre-empt a deny, so this is emitted only after every deny
@@ -344,14 +392,19 @@ process.stdin.on('end', () => {
 
   if (!filePath) { if (pendingAsk) ask(pendingAsk.reason, pendingAsk.snippet); process.exit(0); }
 
-  // Check the path as given AND its symlink-resolved form.
-  const resolved = safeRealpath(filePath);
-  const candidates = resolved !== filePath ? [filePath, resolved] : [filePath];
-
-  for (const p of candidates) {
+  for (const p of pathForms(filePath)) {
     const reason = pathMatchesAnySensitive(p);
     if (reason) {
       deny('Access to sensitive file/path blocked: ' + reason, p);
+    }
+    if (WRITE_TOOLS.has(tool) && SHELLTER_SELF.test(p)) {
+      deny('Writing shellter\'s own trust store or hooks blocked', p);
+    }
+    if (WRITE_TOOLS.has(tool) && CLAUDE_SETTINGS.test(p)) {
+      pendingAsk = pendingAsk || { reason: 'Editing Claude Code settings (allow rules, hooks)', snippet: p };
+    }
+    if (PERSONAL_HISTORY.test(p)) {
+      pendingAsk = pendingAsk || { reason: 'Shell history / Claude config may hold tokens', snippet: p };
     }
     if (tool === 'Glob' && SENSITIVE_GLOB.test(p)) {
       deny('Glob pattern targeting sensitive files blocked', p);
