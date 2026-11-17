@@ -639,6 +639,15 @@ function splitChainSegments(cmd) {
         segmentStart = i;
         continue;
       }
+      // A single `&` backgrounds the command before it and starts the next one. Not a
+      // separator: `&&`, `&>`, `>&2`, `2>&1`, `|&`, and the `:|:& }` fork-bomb body (kept
+      // whole for FORK_BOMB_RE).
+      if (ch === '&' && next !== '>' && !/[<>|&]/.test(cmd[i - 1] || '') && !/^\s*\}/.test(cmd.slice(i + 1, i + 8))) {
+        segments.push(cmd.slice(segmentStart, i));
+        i++;
+        segmentStart = i;
+        continue;
+      }
     }
 
     i++;
@@ -1389,6 +1398,42 @@ function blankSingleQuoted(s) {
 // is expanded, matching shell order -- `X=a; echo $X` expands in segment 1, and
 // `X=a echo $X` (env-prefix form) correctly does not, because bash expands $X
 // before the assignment takes effect there.
+// Leading `NAME=value` words, quote- and substitution-aware, in one linear pass (the old
+// persists regex backtracked exponentially on `X=a=a=...`). `bad` = a value that cannot be
+// delimited.
+function splitAssignPrefix(seg) {
+  const assigns = [];
+  let i = 0;
+  for (;;) {
+    while (i < seg.length && /\s/.test(seg[i])) i++;
+    const m = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]\s]*\])?\+?=/.exec(seg.slice(i, i + 300));
+    if (!m) break;
+    let j = i + m[0].length, q = null;
+    if (seg[j] === '(') {                        // array literal X=(a b)
+      const r = extractParenContent(seg, j);
+      if (!r) return { assigns, rest: seg.slice(i).trim(), bad: true };
+      j = r.end;
+    }
+    for (; j < seg.length; j++) {
+      const c = seg[j];
+      if (q === "'") { if (c === "'") q = null; continue; }
+      if (c === '\\') { j++; continue; }
+      if (c === '$' && seg[j + 1] === '(') {
+        const r = extractParenContent(seg, j + 1);
+        if (!r) return { assigns, rest: seg.slice(i).trim(), bad: true };
+        j = r.end - 1; continue;
+      }
+      if (c === '`') { const e = seg.indexOf('`', j + 1); if (e === -1) return { assigns, rest: seg.slice(i).trim(), bad: true }; j = e; continue; }
+      if (q === '"') { if (c === '"') q = null; continue; }
+      if (c === "'" || c === '"') { q = c; continue; }
+      if (/[\s;&|<>()]/.test(c)) break;
+    }
+    assigns.push({ name: m[0].replace(/(?:\[[^\]]*\])?\+?=$/, ''), raw: seg.slice(i + m[0].length, j) });
+    i = j;
+  }
+  return { assigns, rest: seg.slice(i).trim() };
+}
+
 function expandSegments(segments, cwd, isPosh) {
   const out = new Array(segments.length).fill(null);
   varEnv = new Map();
@@ -1454,7 +1499,8 @@ function expandSegments(segments, cwd, isPosh) {
 
     let body = seg.replace(/^\s*\{\s*/, '');
     body = body.replace(/^\s*(?:export|declare|typeset|readonly|local)\s+/, '');
-    const persists = /^\s*(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|)]*)\s*)+$/.test(body);
+    const pa = splitAssignPrefix(body);
+    const persists = pa.assigns.length > 0 && pa.rest === '' && !pa.bad;
     if (!persists) continue;
 
     ASSIGN_RE.lastIndex = 0;
