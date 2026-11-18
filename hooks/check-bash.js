@@ -2755,6 +2755,29 @@ const EXEC_FLAGS = {
   // git takes any unique prefix of a long option (`--ex`, `--upl=`); `--exit-code`, `--exclude` differ.
   git: /^--(?:exe?c?(?:=|$)|ext|upl|rece|op)|^ext::/,
 };
+// Commands whose flags or arguments can run something: for them every argument must be readable.
+const EXEC_ARG = new Set([...Object.keys(EXEC_FLAGS), 'find', 'xargs', 'curl', 'wget', 'less', 'tmux', 'sed']);
+const MSG_FLAG = /^(?:-m|--message|-b|--body|-t|--title|--notes)$/;
+// A word whose text the hook can read: literal (or resolved / derived by argvVariants), only integer
+// or environment expansions, a quoted expansion behind a literal prefix that is not a flag, a quoted
+// message-flag value, or a quoted word after a literal `--` (not for find).
+function argReadable(words, k, w0, vals) {
+  const w = words[k];
+  if (w.lit) return true;
+  let sub = 0, ints = true, der = false;
+  for (const m of w.text.matchAll(/\$\(_\)|\$\{[^}]*\}|\$(?:[A-Za-z_]\w*|[0-9@*?$!#-])|[<>]\(_\)/g)) {
+    if (m[0] === '$(_)') { if (!intProducer(w.subs[sub++], vals)) ints = false; continue; }
+    const n = /^\$\{?([A-Za-z_]\w*)\}?$/.exec(m[0]);
+    if (n && (vals.get(n[1]) || [0]).length === 0) { der = true; continue; }   // a derived name: file names
+    if (!n || !intName(outerTypes, n[1])) ints = false;
+  }
+  const pre = w.text.slice(0, w.text.indexOf('$'));
+  if (ints && (!der || (pre && !pre.startsWith('-')))) return true;
+  if (w.uexp) return false;
+  if (pre && !pre.startsWith('-')) return true;
+  if (k > 1 && words[k - 1].lit && MSG_FLAG.test(words[k - 1].text)) return true;
+  return w0 !== 'find' && words.slice(1, k).some((x) => x.lit && x.text === '--');
+}
 function hasExecFlag(toks) {
   const w = base(toks[0]);
   const re = EXEC_FLAGS[w];
@@ -3754,6 +3777,15 @@ function producerPipeline(st) {
     const names = (w0 === 'grep' || w0 === 'rg') && fl.some((t) => /^-[A-Za-z]*[lL]|^--files/.test(t));
     const git = w0 === 'git' && (fl.includes('ls-files') || fl.includes('--name-only') || fl.includes('--show-toplevel'));
     if (k === 0 ? !(PRODUCER.test(w0) || names || git) : !(SELECTOR.test(w0) || names)) return false;
+    // find prints names only with these; a selector must not rewrite, print a part, or read patterns.
+    if (k === 0 && w0 === 'find') {
+      for (let j = 0; j < fl.length; j++) {
+        if (/^-(?:name|iname|path|ipath|type|maxdepth|mindepth|newer|mtime|size)$/.test(fl[j])) { j++; continue; }
+        if (/^[-!()]/.test(fl[j]) && !/^(?:-not|!|-o|-a|\(|\)|-prune|-print0?)$/.test(fl[j])) return false;
+      }
+    }
+    if (k > 0 && (fl.some((t) => /^(?:-[A-Za-z]*[rof][A-Za-z]*|--replace(?:=.*)?|--only-matching|--file(?:=.*)?|--pre(?:=.*)?|--output(?:=.*)?)$/.test(t)) ||
+      fl.filter((t) => t === '-e' || t === '--regexp').length > 1)) return false;
     if (s.words.some((w) => SECRET_TOKENS_RE.test(w.text) || scan.globHitsSecret(w.text))) return false;
   }
   return true;
@@ -3857,14 +3889,17 @@ function walk(l, vals, cb, conditional) {
         if (!walkMaybe(st.cond, v, cb) || !walkMaybe(st.body, v, cb)) return false;
       } else if (st.type === 'for') {
         dropAssigned(st.body, v);
-        let lits = st.words && st.words.length ? [] : null;
+        let lits = st.words && st.words.length ? [] : null, der = false;
         for (const w of st.words || []) {
           // An unquoted glob is the matching file names: a derived word unless it can reach a secret.
-          if (w.glob && w.lit) { if (SECRET_TOKENS_RE.test(w.text) || scan.globHitsSecret(w.text)) { lits = null; break; } continue; }
+          const gs = w.glob && literalValue(w, v);
+          if (gs) { if (gs.some((t) => SECRET_TOKENS_RE.test(t) || scan.globHitsSecret(t))) { lits = null; break; } der = true; continue; }
           const f = wordFields(w, v);
           if (f) lits.push(...f.flat());
-          else if (!derivedWord(w, v)) { lits = null; break; }
+          else if (derivedWord(w, v)) der = true;
+          else { lits = null; break; }
         }
+        if (lits && der && lits.length) lits.push('_derived_');
         if (lits && lits.length <= VALS_MAX) v.set(st.name, lits); else v.delete(st.name);
         if (envTaints(st.name)) v.set(' taint', [...(v.get(' taint') || []), { name: st.name, raw: (st.words || []).map((w) => w.text).join(' ') || '$', persisted: true }]);
         if (!walkMaybe(st.body, v, cb)) return false;
@@ -3912,6 +3947,7 @@ function protectedWrite(p, baseOnly) {
   if (/(?:^|\/)\.claude\/settings(?:\.local)?\.json$/.test(c) || RC_BASE.test(b)) return 'ask';
   return null;
 }
+const PLAIN_READER = /^(?:ls|cat|head|tail|grep|rg|stat|wc|diff|file|find|test|\[|cd|echo|printf|less|bat|tree|du|realpath|readlink|dirname|basename|sha256sum|md5sum|cmp|jq|git)$/;
 function writeTargets(st, vals) {
   const out = [];
   for (const r of st.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>|>&)$/.test(r.op)) out.push(r.target);
@@ -3930,7 +3966,7 @@ function writeTargets(st, vals) {
     if (destOnly) { if (ops.length > 1) out.push(ops[ops.length - 1]); } else out.push(...ops);
   }
   const res = [];
-  for (const w of out) for (const t of (w.lit ? [w.text] : subst(w.text, vals) || [])) res.push(t);
+  for (const w of out) res.push(...(w.lit ? [w.text] : subst(w.text, vals) || [w.text]));   // unresolved: its raw text
   return res;
 }
 function heredocTargetsUnsafe(node) {
@@ -3968,6 +4004,9 @@ function approveArgv(words, vals, depth, approvedScripts) {
     if (a === undefined || a.text === '' || a.text === '-' || /^-[lp]$/.test(a.text)) return true;
     return a.lit && approveText(a.text, vals, depth + 1);
   }
+  if ((EXEC_ARG.has(w0) && w0 !== 'sed') || (w0 === 'gh' && toks[1] === 'api')) {
+    for (let k = 1; k < words.length; k++) if (!argReadable(words, k, w0, vals)) return false;
+  }
   if (w0 === 'find') {
     for (let k = 1; k < toks.length; k++) {
       if (!words[k].lit && /^-/.test(toks[k])) return false;
@@ -3996,6 +4035,8 @@ function approveArgv(words, vals, depth, approvedScripts) {
       if (/^-[InPdEsL]./.test(t) || /^-[0prtxo]+$/.test(t)) continue;
       return false;
     }
+    // stdin supplies the trailing arguments, unread: the command must not be one they can steer.
+    if (at < toks.length && EXEC_ARG.has(base(toks[at]))) return false;
     return at >= toks.length || approveArgv(sub0(words, at), vals, depth + 1, approvedScripts);
   }
   if (SHELL_SET.has(w0)) {
@@ -4010,6 +4051,13 @@ function approveArgv(words, vals, depth, approvedScripts) {
   if (w0 === 'gh' && ghApiWrites(toks)) return false;
   if (secretArg(words, w0)) return false;
 
+  if (!PLAIN_READER.test(w0) && !(w0 === 'sed' && !toks.some((t) => /^-[A-Za-z]*i|^--in-place/.test(t)))) {
+    const home = os.homedir();
+    for (const t of w0 === 'cp' ? writeTargets({ redirs: [], words }, vals) : toks.slice(1)) {
+      const p = t.replace(/^--?[\w-]+=/, '').replace(/^~(?=[\\/]|$)/, home);
+      if (/[\\/]\.claude[\\/](?:hooks|plugins)(?:[\\/]|$)/.test(p) || protectedWrite(path.resolve(p))) return false;
+    }
+  }
   resolvableAt[0] = new Set([...vals.keys()].filter((k) => k[0] !== ' '));
   if (hasUnresolvedRead(text, 0)) return false;
   // A pattern approves only when its match spans the whole command word (`test/x.sh` is not `test`).
@@ -4024,7 +4072,11 @@ function approveStage(st, vals, depth, approvedScripts) {
   if (st.type !== 'simple') return true;                    // compound: its pipelines are visited on their own
   if (heredocTargetsUnsafe(st)) return false;
   // An input redirect reads a file: its name must be literal or resolved, like any read argument.
-  for (const r of st.redirs) if (r.target && (r.op === '<' || r.op === '<>') && !r.target.lit && !subst(r.target.text, vals)) return false;
+  for (const r of st.redirs) {
+    if (!r.target || (r.op !== '<' && r.op !== '<>')) continue;
+    const ts = r.target.lit ? [r.target.text] : subst(r.target.text, vals);
+    if (!ts || ts.some((t) => SECRET_TOKENS_RE.test(t) || scan.globHitsSecret(t))) return false;
+  }
   if (!st.words.length) return true;
   const w0 = st.words[0].text;
   // `IFS=.. read` scopes IFS to that read; anywhere else IFS changes how later words split.
@@ -4797,7 +4849,7 @@ if (MAIN) watchdog.input((data) => {
         }
         for (const t of writeTargets(st, v)) {
           const abs = path.resolve(dir, t.replace(/^~(?=[\\/]|$)/, home));
-          let hit = protectedWrite(abs, !known && !/^[~\\/]|^[A-Za-z]:/.test(t));
+          let hit = protectedWrite(abs, (!known || t.includes('$')) && !/^[~\\/]|^[A-Za-z]:/.test(t) || /^\$/.test(t));
           const last = t.replace(/^.*[\\/]/, '');
           if (!hit && /[*?[]/.test(last)) {   // a glob operand: test it against the protected names
             const rx = scan.globComponentRe(last);

@@ -3606,6 +3606,38 @@ console.log('\n--- 0.11.0 r3 step 8: one table of what sets a name, one definiti
   testBash('R2: printf -vx %s .env; cat $x does not approve', join('x=a; printf -vx %s .e', 'nv; cat $x'), 'fallthrough');
 }
 
+console.log('\n--- 0.11.0 r3 step 9: an unread argument does not approve an exec-capable command (G3) ---');
+{
+  // B F3: an unresolved argument of an EXEC_ARG command
+  for (const c of ['f=$(cat a.txt); find . -name "$f"', 'o=$(cat a.txt); sort "$o" f', 'x=$(cat a.txt); curl "$x" https://example.com',
+    'x=$(cat a.txt); tar "$x" -cf a.tar d', 'x=$(cat a.txt); git "$x" status', 'x=$(cat a.txt); gh api "$x"'])
+    testBash('F3: ' + c + ' does not approve', c, 'fallthrough');
+  for (const c of ['git commit -m "$(cat <<\'EOF\'\nfix: x\nEOF\n)"', 'f=$(cat a.txt); git diff -- "$f"', 'T=$(cat t); curl -H "Authorization: Bearer $T" https://example.com',
+    'for f in $(git diff --name-only); do wc -l $f; done', 'git log -n "$N"'])
+    testBash('F3 twin: ' + c.replace(/\n/g, ' ') + ' allows', c, 'allow');
+  // xargs: stdin supplies unread trailing arguments
+  for (const c of ['ls | xargs sort', 'ls | xargs git', 'ls | xargs find', 'ls | xargs tar'])
+    testBash('xargs: ' + c + ' does not approve', c, 'fallthrough');
+  for (const c of ['ls | xargs wc -l', 'git ls-files | xargs grep -n TODO'])
+    testBash('xargs twin: ' + c + ' allows', c, 'allow');
+  // B R1: name producers print names only
+  for (const c of ["cat $(find . -maxdepth 0 -printf 'x')", "cat $(ls | sed 's/a/b/')", 'cat $(ls | grep -o x)', 'cat $(ls | grep -f p.txt)'])
+    testBash('R1: ' + c + ' does not approve', c, 'fallthrough');
+  for (const c of ['cat $(find . -name x.md)', 'wc -l $(git ls-files | grep "\\.js$")', 'for f in a $(ls); do wc -l $f; done'])
+    testBash('R1 twin: ' + c + ' allows', c, 'allow');
+  // B R3: an input redirect is a read operand
+  testBash('R3: cat < .e* does not approve', join('cat < .e', '*'), 'fallthrough');
+  for (const c of ['sort < notes.txt', 'while read l; do echo "$l"; done < f.txt'])
+    testBash('R3 twin: ' + c + ' allows', c, 'allow');
+  // B R4: a protected path as an argument; an unresolved write target by base name
+  testBash('R4: cp a.json $D/shellter-trust.json denies', 'cp a.json $D/shellter-trust.json', 'deny');
+  testBash('R4: echo x >& ~/.claude/shellter-trust.json denies', 'echo x >& ~/.claude/shellter-trust.json', 'deny');
+  for (const c of ['curl -o ~/.claude/hooks/x https://example.com', 'sort -o ~/.bashrc x', 'tar -C ~/.claude/plugins -xf a.tar', 'mv ~/.claude/hooks y'])
+    testBash('R4: ' + c + ' does not approve', c, 'fallthrough');
+  for (const c of ['ls ~/.claude/hooks', 'cat ~/.claude/settings.json', 'cp fixtures/a.json test/tmp/shellter-trust.json'])
+    testBash('R4 twin: ' + c + ' allows', c, 'allow');
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a
