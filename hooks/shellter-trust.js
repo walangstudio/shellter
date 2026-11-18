@@ -175,6 +175,19 @@ function localRulesHonoured(dir) {
       const top = ls(':(icase).claude');
       ok = file.status === 0 && file.stdout === '' && top.status === 0 &&
         !top.stdout.split('\0').some((e) => e.toLowerCase() === '.claude');
+      // An alias of the file (`CLAUDE~1/`, a trailing dot or space, an ignorable character) is
+      // tracked under another name: resolve every index entry not in plain form.
+      if (ok) {
+        const all = ls('.');
+        const odd = all.status === 0 ? all.stdout.split('\0').filter((e) => e.split('/').some((c) => /[~:]|[^\x00-\x7f]|[. ]$/.test(c))) : null;
+        if (!odd || odd.length > 2000) ok = false;
+        else {
+          const real = fs.realpathSync.native(path.join(dir, '.claude', 'settings.local.json')).toLowerCase();
+          ok = !odd.some((e) => {
+            try { return fs.realpathSync.native(path.join(dir, e)).toLowerCase() === real; } catch (err) { return err.code !== 'ENOENT'; }
+          });
+        }
+      }
     } catch { /* no git */ }
     _honoured.set(dir, ok);
   }

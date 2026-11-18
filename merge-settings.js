@@ -118,6 +118,11 @@ const filesHook = path.join(hooksDir, 'check-sensitive-files.js');
 const scanHook = path.join(hooksDir, 'scan-content.js');
 const trustHook = path.join(hooksDir, 'shellter-trust.js');
 const watchdogHook = path.join(hooksDir, 'watchdog.js');
+const patchHook = path.join(hooksDir, 'patch-targets.js');
+// The nearest package.json decides how node loads the hooks: pin it beside an installed check-bash.js.
+if (fs.existsSync(bashHook)) try { fs.writeFileSync(path.join(hooksDir, 'package.json'), '{"type":"commonjs"}\n'); } catch (e) {
+  console.warn('WARNING: could not write ' + path.join(hooksDir, 'package.json') + ': ' + e.message);
+}
 
 function sha256(p) {
   try {
@@ -127,7 +132,7 @@ function sha256(p) {
   }
 }
 
-for (const p of [bashHook, filesHook, scanHook, trustHook, watchdogHook]) {
+for (const p of [bashHook, filesHook, scanHook, trustHook, watchdogHook, patchHook]) {
   if (!fs.existsSync(p)) {
     console.warn('WARNING: Hook not found:', p);
     console.warn('  Copy it: cp ' + path.basename(p) + ' ' + hooksDir + '/');

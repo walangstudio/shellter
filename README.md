@@ -71,7 +71,7 @@ old `walangstudio/shellter` marketplace (pre-0.4.1)? Remove it first
 ```bash
 mkdir -p ~/.claude/hooks
 cp hooks/check-bash.js hooks/check-sensitive-files.js ~/.claude/hooks/
-cp hooks/scan-content.js hooks/shellter-trust.js hooks/watchdog.js ~/.claude/hooks/
+cp hooks/scan-content.js hooks/shellter-trust.js hooks/watchdog.js hooks/patch-targets.js hooks/package.json ~/.claude/hooks/
 node merge-settings.js
 ```
 
@@ -80,12 +80,13 @@ node merge-settings.js
 ```powershell
 mkdir -Force "$env:USERPROFILE\.claude\hooks"
 Copy-Item hooks\check-bash.js,hooks\check-sensitive-files.js "$env:USERPROFILE\.claude\hooks\"
-Copy-Item hooks\scan-content.js,hooks\shellter-trust.js,hooks\watchdog.js "$env:USERPROFILE\.claude\hooks\"
+Copy-Item hooks\scan-content.js,hooks\shellter-trust.js,hooks\watchdog.js,hooks\patch-targets.js,hooks\package.json "$env:USERPROFILE\.claude\hooks\"
 node merge-settings.js "$env:USERPROFILE\.claude\settings.json"
 ```
 
-`scan-content.js`, `shellter-trust.js` and `watchdog.js` are runtime deps of the two hooks - install all
-five. `merge-settings.js` is idempotent and writes forward-slash paths.
+`scan-content.js`, `shellter-trust.js` and `watchdog.js` are runtime deps of the two hooks, `patch-targets.js` is
+the codex/agy/opencode patch parser, and `package.json` pins the hooks to CommonJS - install all seven.
+`merge-settings.js` is idempotent and writes forward-slash paths.
 
 ## Other agents
 

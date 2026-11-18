@@ -9,6 +9,7 @@
 // hooks/ next to it as ../shellter-hooks/ (or set SHELLTER_HOOKS_DIR).
 import { execFileSync } from "node:child_process";
 import { existsSync, appendFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -62,16 +63,13 @@ function mapTool(tool, args) {
   }
 }
 
-// A patch blob as one Write check per `*** Add|Update|Delete File:` header, scanning the added
-// lines. Best-effort: the tool's argument shape is not verified against opencode.
+// A patch blob as one Write check per file it writes, scanning the added lines: the parser the
+// codex/agy shim uses, loaded from the hooks dir. Without it (older hooks) the whole blob is one
+// check with no path. Best-effort: the tool's argument shape is not verified against opencode.
+let patchTargets = (_t: string): { file_path: string; content: string }[] => [];
+try { patchTargets = createRequire(import.meta.url)(join(HOOKS, "patch-targets.js")).patchTargets; } catch {}
 function patchWrites(text) {
-  const out = [];
-  let cur = null;
-  for (const line of String(text).split("\n")) {
-    const h = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$/.exec(line);
-    if (h) { cur = { hook: FILE_HOOK, name: "Write", input: { file_path: h[1], content: "" } }; out.push(cur); continue; }
-    if (cur && line.startsWith("+")) cur.input.content += line.slice(1) + "\n";
-  }
+  const out = patchTargets(String(text)).map((input) => ({ hook: FILE_HOOK, name: "Write", input }));
   return out.length ? out : [{ hook: FILE_HOOK, name: "Write", input: { file_path: "", content: String(text) } }];
 }
 

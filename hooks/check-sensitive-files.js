@@ -6,6 +6,9 @@
 
 'use strict';
 
+// The nearest package.json decides how node loads this file: pin it beside the hooks (create-if-missing,
+// so a manual install heals on its first run). A module-type ancestor then cannot switch the hooks off.
+try { require('fs').writeFileSync(require('path').join(__dirname, 'package.json'), '{"type":"commonjs"}\n', { flag: 'wx' }); } catch (_) { /* present */ }
 if (!module.parent && require('./watchdog.js').parent(__filename, 'check-sensitive-files')) return;
 const fs = require('fs');
 const path = require('path');
@@ -203,7 +206,7 @@ const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|googl
 // shellter's own trust store and installed hooks: a write there is the agent granting itself
 // trust or switching shellter off. The dev repo's `hooks/` (no `.claude` segment) is not matched,
 // and a fixture that merely shares the store's file name is not the store (see isTrustStore).
-const SHELLTER_SELF = /(^|\/)\.claude\/shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|watchdog|shellter-(?:trust|scan))\.js$/i;
+const SHELLTER_SELF = /(^|\/)\.claude\/shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|watchdog|patch-targets|shellter-(?:trust|scan))\.js$/i;
 // The plugin's installed copy: a write anywhere in it can switch shellter off.
 const SHELLTER_PLUGIN_CACHE = /(^|\/)\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^\/]+\/)*shellter\//i;
 // Allow rules and hooks live here. The user edits it too, so ask, never deny.
@@ -274,6 +277,9 @@ function globNamesSecret(g) {
     const parts = f.replace(/\\/g, '/').replace(/\[([^\]\\])\]/g, '$1').split('/');
     if (parts.slice(0, -1).some((c) => /^\.(?:ssh|aws|gnupg)$/i.test(c))) return true;
     const last = parts[parts.length - 1];
+    // A literal prefix of a secret name and one `*` (`.en*`, `id_r*`): 3+ characters with a dot, else 4+.
+    const pm = /^([^*?[\]]+)\*$/.exec(last);
+    if (pm && pm[1].length >= (pm[1][0] === '.' ? 3 : 4) && SECRET_NAMES.some((s) => s.startsWith(pm[1].toLowerCase()))) return true;
     // Without `*`, a `?` or a class stands for one character: `.e?v`, `id_rs?` name the secret itself.
     if (!last.includes('*')) { const rx = scan.globComponentRe(last); if (rx && SECRET_NAMES.some((s) => rx.test(s))) return true; }
     // No `[` after the last `]` can close: split there so the class scan stays linear.
@@ -282,6 +288,7 @@ function globNamesSecret(g) {
   });
 }
 
+const HOOKS_PKG = canon(path.join(__dirname, 'package.json')).toLowerCase();
 // The real trust store, resolved: a fixture that shares its file name is not it.
 function isTrustStore(p) {
   let store = '';
@@ -467,7 +474,7 @@ watchdog.input((data) => {
       deny('Access to sensitive file/path blocked: ' + reason, p);
     }
     if (WRITE_TOOLS.has(tool) && (SHELLTER_SELF.test(p) || isTrustStore(p) || SHELLTER_PLUGIN_CACHE.test(p) ||
-        (/(^|\/)\.claude\/hooks\/package\.json$/i.test(p) && /"type"\s*:\s*"module"/.test(writtenText)))) {
+        /(^|\/)\.claude\/hooks\/package\.json$/i.test(p) || canon(p).toLowerCase() === HOOKS_PKG)) {   // any content: it decides how node loads the hooks
       deny('Writing shellter\'s own trust store or hooks blocked', p);
     }
     if (WRITE_TOOLS.has(tool) && CLAUDE_SETTINGS.test(p)) {

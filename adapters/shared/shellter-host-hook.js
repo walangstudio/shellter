@@ -36,28 +36,11 @@ const first = (...vals) => vals.find((v) => v !== undefined && v !== null && v !
 const asCommand = (c) => (Array.isArray(c) ? c.join(' ') : typeof c === 'string' ? c : '');
 
 // A patch blob (`*** Begin Patch` / `*** Update File: x`) as one Write check per file: the
-// header path is checked, and the added (`+`) lines are what gets scanned.
-function patchWrites(text) {
-  const out = [];
-  let cur = null;
-  let prev = '';
-  for (const line of String(text).split('\n')) {
-    // `*** Add|Update|Delete File:` (indented or not), the rename target `*** Move to:`, and a
-    // unified diff's `+++ b/path` all name a file the patch writes. A `+++` line is a header only
-    // right after a `--- ` line (else it is added content), and a tab starts its timestamp.
-    const h = /^\s*\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+?)\s*$/.exec(line) ||
-      (prev.startsWith('--- ') && /^\+\+\+ (?:b\/)?([^\t]+?)\s*(?:\t.*)?$/.exec(line));
-    prev = line;
-    if (h) {
-      const moved = /Move to:/.test(line) && cur;
-      cur = { hook: FILE_HOOK, name: 'Write', input: { file_path: h[1], content: moved ? cur.input.content : '' } };
-      out.push(cur);
-      continue;
-    }
-    if (cur && line.startsWith('+')) cur.input.content += line.slice(1) + '\n';
-  }
-  return out;
-}
+// header path is checked, and the added (`+`) lines are what gets scanned. The parser lives beside
+// the hooks; without it the blob takes the generic write path below (whole blob, its `path` key).
+let patchTargets = () => [];
+try { ({ patchTargets } = require(path.join(HOOKS, 'patch-targets.js'))); } catch { /* older hooks dir */ }
+const patchWrites = (text) => patchTargets(text).map((input) => ({ hook: FILE_HOOK, name: 'Write', input }));
 
 // Host payload -> [{ hook, name, input }] in shellter's Claude-Code shape (empty when this
 // isn't a tool we gate). Tool shapes are best-effort: only the adapter side is verified.
@@ -107,10 +90,10 @@ function mapTool(ev) {
   // Without this, an agent reads .env via its own read tool, bypassing the shell rules.
   const isRead = /(^|[_-])(view_file|read_file|readfile|read_many_files|cat_file|open_file|view|read|view_code_item|view_line_range|view_content_chunk)([_-]|$)/.test(lname);
   if (isRead) {
-    if (Array.isArray(args.paths)) return args.paths.filter((p) => typeof p === 'string' && p).map((file_path) => ({ hook: FILE_HOOK, name: 'Read', input: { file_path } }));
-    const file_path = String(first(args.path, args.file_path, args.AbsolutePath, args.absolute_path, args.filePath, args.target_file, args.TargetFile, '') || '');
-    if (!file_path) return [];
-    return [{ hook: FILE_HOOK, name: 'Read', input: { file_path } }];
+    // Both keys: a host may pass `paths` and `path` together.
+    const one = first(args.path, args.file_path, args.AbsolutePath, args.absolute_path, args.filePath, args.target_file, args.TargetFile);
+    return [...(Array.isArray(args.paths) ? args.paths : []), one].filter((p) => typeof p === 'string' && p)
+      .map((file_path) => ({ hook: FILE_HOOK, name: 'Read', input: { file_path } }));
   }
 
   const isSearch = /(^|[_-])(grep|grep_search|search|ripgrep|rg)([_-]|$)/.test(lname);

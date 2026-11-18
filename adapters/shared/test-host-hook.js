@@ -93,5 +93,11 @@ check('added +++ line does not re-attribute later lines -> deny', 'codex', { too
 check('+++ header with a tab timestamp -> deny', 'codex', { tool_name: 'apply_patch', tool_input: { input: '--- a/CLAUDE.md\t2024-01-01 00:00:00\n+++ b/CLAUDE.md\t2024-01-01 00:00:00\n@@ -1 +1 @@\n+' + OV } }, 'deny');
 check('grep_search Includes *.ts -> allow', 'agy', { toolCall: { name: 'grep_search', args: { Query: 'x', SearchDirectory: '.', Includes: ['*.ts'] } } }, 'allow');
 
+// 0.11.0 r3 (F M-2): in a *** blob, `--- x` / `+++ y` are a removed and an added line; `paths` and `path` both count.
+check('*** blob: --- / +++ lines do not re-attribute -> deny', 'codex', { tool_name: 'apply_patch', tool_input: { input: '*** Begin Patch\n*** Update File: CLAUDE.md\n@@\n--- x\n+++ notes.txt\n+' + OV + '\n*** End Patch' } }, 'deny');
+check('read_file paths [] plus path .env -> deny', 'codex', { tool_name: 'read_file', tool_input: { paths: [], path: join('proj/.e', 'nv') } }, 'deny');
+check('read_file paths [README] plus path .env -> deny', 'codex', { tool_name: 'read_file', tool_input: { paths: ['README.md'], path: join('proj/.e', 'nv') } }, 'deny');
+check('unified diff with a real +++ b/ header, benign -> allow', 'codex', { tool_name: 'apply_patch', tool_input: { input: '--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+const a = 1;' } }, 'allow');
+
 console.log(`\n${pass}/${total} shared host-hook checks passed`);
 process.exit(pass === total ? 0 : 1);

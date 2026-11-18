@@ -10,6 +10,9 @@
 
 'use strict';
 
+// The nearest package.json decides how node loads this file: pin it beside the hooks (create-if-missing,
+// so a manual install heals on its first run). A module-type ancestor then cannot switch the hooks off.
+try { require('fs').writeFileSync(require('path').join(__dirname, 'package.json'), '{"type":"commonjs"}\n', { flag: 'wx' }); } catch (_) { /* present */ }
 if (!module.parent && require('./watchdog.js').parent(__filename, 'check-bash')) return;
 const fs = require('fs');
 const path = require('path');
@@ -3963,7 +3966,7 @@ function protectedWrite(p, baseOnly) {
   let store = '';
   try { store = trust.trustStorePath().replace(/\\/g, '/').toLowerCase(); } catch (_) { /* no home */ }
   if ((store && c === store) || /\/\.claude\/shellter-trust\.json$/.test(c) || (baseOnly && b === 'shellter-trust.json')) return 'deny';
-  if (/\/\.claude\/(?:hooks|plugins)\/(?:.*\/)?(?:check-bash|check-sensitive-files|scan-content|watchdog|shellter-(?:trust|scan))\.js$/.test(c) ||
+  if (/\/\.claude\/(?:hooks|plugins)\/(?:.*\/)?(?:check-bash|check-sensitive-files|scan-content|watchdog|patch-targets|shellter-(?:trust|scan))\.js$/.test(c) ||
       /\/\.claude\/hooks\/package\.json$/.test(c) || /\/\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^/]+\/)*shellter\//.test(c)) return 'deny';
   if (/(?:^|\/)\.claude\/settings(?:\.local)?\.json$/.test(c) || RC_BASE.test(b)) return 'ask';
   return null;

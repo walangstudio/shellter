@@ -685,7 +685,10 @@ function scanInjection(text, opts) {
 // content. Single source of truth, shared by check-sensitive-files.js (Write/Edit) and
 // check-bash.js (shell redirect / heredoc write).
 const AGENT_INSTRUCTION_FILE = /(^|[\/\\])(CLAUDE(\.local)?\.md|AGENTS?\.md|GEMINI\.md|SKILL\.md|\.cursorrules|\.clinerules|\.windsurfrules|\.aider\.conf\.yml|copilot-instructions\.md|\.?mcp\.json|opencode\.json)$|(^|[\/\\])(?:\.claude|\.opencode|\.codex|\.gemini|\.pi|\.agents|\.cursor[\/\\]rules|\.windsurf[\/\\]rules|\.github[\/\\]instructions|\.clinerules|\.roo[\/\\]rules|\.kiro[\/\\]steering)[\/\\]/i;
-function isAgentInstructionFile(p) { return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p); }
+// An agent worktree (`.claude/worktrees/<name>/`) is a checkout: its own CLAUDE.md counts, its source does not.
+function isAgentInstructionFile(p) {
+  return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p.replace(/(^|[\/\\])\.claude[\/\\]worktrees[\/\\][^\/\\]+[\/\\]/gi, '$1'));
+}
 
 // One path component of a glob as an anchored, case-insensitive RegExp (null if unparseable).
 // A leading `*`/`?`/`[` never matches a leading dot, as in bash.
