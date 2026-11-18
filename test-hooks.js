@@ -3254,6 +3254,10 @@ console.log('\n--- 0.11.0 r2 step 7: write targets on the AST, script scan from 
   testBash('W-1: dd of= the trust store denies', 'dd if=x.json of=' + T, 'deny');
   testBash('W-1: ln -sf into the trust store denies', 'ln -sf /tmp/t.json ' + T, 'deny');
   testBash('W-1: cd then a relative write into the trust store denies', 'cd ~/.claude && echo {} > shellter' + '-trust.json', 'deny');
+  for (const c of ['cd -P ~/.claude && echo {} > shellter' + '-trust.json', 'pushd ~/.claude && echo {} > shellter' + '-trust.json',
+                   'cd -- ~/.claude && cp a shellter' + '-trust.json', 'builtin cd ~/.claude && cp a shellter' + '-trust.json']) {
+    testBash('W-1: a cd spelling then a relative write into the trust store denies: ' + c.split(' ')[0] + ' ' + c.split(' ')[1], c, 'deny');
+  }
   testBash('W-1: a glob write over the trust store denies', 'cp x.json ~/.claude/shellter-tru*.json', 'deny');
   testBash('W-1: writing package.json beside the installed hooks denies', join('echo {"type":"mod', 'ule"} > ~/.claude/hooks/package.json'), 'deny');
   testBash('W-1: writing into the plugin cache denies', 'echo {} > ~/.claude/plugins/cache/walangstudio/shellter/0.11.0/hooks/hooks.json', 'deny');
@@ -3392,6 +3396,17 @@ console.log('\n--- 0.11.0 r2: probe gaps left after the parser (A-5 tail, PS spe
   testBash('find -name secret -exec cat denies', "find . -name '" + E + "' -exec cat {} +", 'deny');
   testBash('xargs over a secret name with a reader denies', 'echo ' + E + ' | xargs cat', 'deny');
   testBash('find twin: find -name *.ts -exec wc -l allows', "find . -name '*.ts' -exec wc -l {} +", 'allow');
+  // bash does not join a backslash-newline in a comment or a quoted heredoc body: the next line runs.
+  const BN = String.fromCharCode(92, 10);
+  testBash('continuation in a comment does not hide the next line', 'ls # x' + BN + M, 'fallthrough');
+  testBash('continuation in a lone comment does not hide the next line', '# note' + BN + M, 'fallthrough');
+  testBash('continuation before a quoted heredoc terminator does not hide a line', "cat <<'EOF'\nx" + BN + 'EOF\n' + M + '\nEOF', 'fallthrough');
+  testBash('same, through the cat > file fast path', "cat > notes.md <<'EOF'\nx" + BN + 'EOF\n' + M + '\nEOF', 'fallthrough');
+  testBash('same, inside a commit message substitution', "git commit -m \"$(cat <<'EOF'\nx" + BN + 'EOF\n' + M + '\nEOF\n)"', 'fallthrough');
+  testBash('continuation twin: a split command line allows', 'ls -la' + BN + '  src', 'allow');
+  testBash("continuation twin: inside single quotes it is literal text", "echo 'a" + BN + "b'", 'allow');
+  testBash('sed: a command after an i\\ text line is still walked', "sed '1i" + BN + "x\n1e " + M + "' f", 'fallthrough');
+  testBash('sed twin: c\\ + newline + text allows', "sed 'c" + BN + "foo' f", 'allow');
   testPosh('PS: a block comment is not modelled', 'echo <# x #> hi', 'fallthrough');
   testPosh('PS: a typographic quote is not modelled', 'echo ' + String.fromCharCode(0x27) + 'a' + String.fromCharCode(0x2019) + ' | ' + M + ' #' + String.fromCharCode(0x27), 'fallthrough');
   testPosh('PS: an alias word must end the name (cat-evil)', 'cat-evil x', 'fallthrough');

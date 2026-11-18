@@ -2432,6 +2432,8 @@ function isSafeHeredocInvocation(rawCmd) {
   if (dash === '' && endPad !== '') return false;
   if (/<<-?\s*['"]?[A-Za-z_]\w*['"]?/.test(trailing)) return false;
   if (!quoted && /\$\(|`|\$\{|\$[A-Za-z_]/.test(body)) return false;
+  // Unquoted, bash joins a body line ending in `\` with the next, so the terminator may not be where it looks.
+  if (!quoted && /\\\r?$/m.test(body)) return false;
 
   let postMarkerTarget = null;
   if (postMark.trim() !== '') {
@@ -3134,8 +3136,8 @@ function parseBash(src0, depth) {
   const bad = () => { throw PF; };
   const blanks = () => {
     for (;;) {
-      while (i < n && (src[i] === ' ' || src[i] === '\t')) i++;
-      if (src[i] === '#') { while (i < n && src[i] !== '\n') i++; } else return;
+      while (i < n && (src[i] === ' ' || src[i] === '\t' || (src[i] === '\\' && src[i + 1] === '\n'))) i += src[i] === '\\' ? 2 : 1;
+      if (src[i] === '#') { while (i < n && src[i] !== '\n') i++; } else return;   // a `\` in a comment is literal
     }
   };
   const newline = () => {                      // src[i] === '\n': heredoc bodies start here
@@ -3152,7 +3154,8 @@ function parseBash(src0, depth) {
         lines.push(line);
       }
       h.body = lines.join('\n');
-      if (!h.quoted && /\$\(|`|\$\[/.test(h.body)) bad();
+      // Unquoted, bash joins a line ending in `\` with the next before looking for the terminator.
+      if (!h.quoted && /\$\(|`|\$\[|\\$/m.test(h.body)) bad();
     }
     pending = [];
   };
@@ -3234,7 +3237,11 @@ function parseBash(src0, depth) {
         }
         continue;
       }
-      if (c === '\\') { if (i + 1 >= n) bad(); w.text += src[i + 1]; i += 2; w.bare = false; continue; }
+      if (c === '\\') {
+        if (i + 1 >= n) bad();
+        if (src[i + 1] !== '\n') { w.text += src[i + 1]; w.bare = false; }   // `\`-newline is a line continuation
+        i += 2; continue;
+      }
       if (c === '$') { if (src[i + 1] === '"') { i++; continue; } dollar(w, false); continue; }
       if (c === '`') { backtick(w); continue; }
       if ((c === '<' || c === '>') && src[i + 1] === '(') {
@@ -3849,7 +3856,17 @@ function sedWalkUnsafe(s) {
       i += f.length;
       continue;
     }
-    if (/[aic]/.test(c)) { if (!eol()) return true; continue; }
+    if (/[aic]/.test(c)) {   // text to the end of the line; a line ending in `\` continues it (`c\` + newline + text)
+      for (;;) {
+        const s0 = i;
+        if (!eol()) return true;
+        let b = 0;
+        for (let k = i - 1; k >= s0 && s[k] === '\\'; k--) b++;
+        if (b % 2 === 0 || i >= n) break;
+        i++;
+      }
+      continue;
+    }
     if (/[btT:]/.test(c)) { while (i < n && s[i] !== ';' && s[i] !== '\n' && s[i] !== '}') { if (s[i] === PH) return true; i++; } continue; }
     if (/[dDgGhHlnNpPqQxz=F]/.test(c)) { while (i < n && /[0-9 \t]/.test(s[i])) i++; continue; }
     return true;                                // e, w, W, r, R, and anything unknown
@@ -4295,8 +4312,11 @@ if (MAIN) process.stdin.on('end', () => {
   // Join backslash-newline line continuations first, so a target/flag split across a
   // continuation (`rm -rf \<nl>/`) is seen as one command instead of fragmenting past the
   // rm guard. Matches what the script-content scanner already does for logical lines.
-  const cmd = normalizeUnicode(rawCmd).replace(/\\\r?\n/g, '');
-  let work = cmd;
+  // The parser and the heredoc fast path read the unjoined text: bash does not join a
+  // backslash-newline inside a comment, single quotes or a quoted heredoc body.
+  const unjoined = normalizeUnicode(rawCmd);
+  const cmd = unjoined.replace(/\\\r?\n/g, '');
+  let work = cmd, workRaw = unjoined;
 
   // Heredoc invocations (bash-only): a single safe `python|cat|tee << MARKER`
   // followed by auto-approved trailing commands is approved as a whole. This
@@ -4308,8 +4328,8 @@ if (MAIN) process.stdin.on('end', () => {
   // audit entry so the operator can diagnose.
   if (!isPosh) {
     try {
-      const h = isSafeHeredocInvocation(cmd);
-      if (h) { if (!h.trailing.trim()) approve(rawCmd); work = h.trailing; }
+      const h = isSafeHeredocInvocation(unjoined);
+      if (h) { if (!h.trailing.trim()) approve(rawCmd); workRaw = h.trailing; work = h.trailing.replace(/\\\r?\n/g, ''); }
     } catch (err) {
       noteGap('heredoc-parse');
       audit('fallthrough', 'heredoc-check-threw: ' + (err && err.message), rawCmd);
@@ -4387,7 +4407,7 @@ if (MAIN) process.stdin.on('end', () => {
   };
   let ast = null;
   if (!isPosh) {
-    try { ast = parseBash(work); } catch (_) { ast = null; }
+    try { ast = parseBash(workRaw); } catch (_) { ast = null; }
     if (ast) {
       const gi = coverageGaps.indexOf('quote-parse');
       if (gi !== -1) coverageGaps.splice(gi, 1);   // the parser is the authority on quoting
@@ -4417,10 +4437,15 @@ if (MAIN) process.stdin.on('end', () => {
     astWalk((p, v) => {
       for (const st of p.stages) {
         if (st.type !== 'simple' || !st.words.length) continue;
-        if (st.words[0].text === 'cd' && p.stages.length === 1) {
+        // `cd X` resolves; any other directory change (`cd -P`, `pushd`, `builtin cd`, `cd -`) makes
+        // the directory unknown, and a relative write then counts by its basename.
+        const w0 = st.words[0].text;
+        const CD = /^(?:cd|pushd|popd)$/;
+        if (CD.test(w0) || (/^(?:builtin|command)$/.test(w0) && CD.test((st.words[1] || {}).text))) {
           const a = st.words[1];
-          const t = a ? (a.lit ? [a.text] : subst(a.text, v)) : [home];
-          if (t && t.length === 1) dir = path.resolve(dir, t[0].replace(/^~(?=\/|$)/, home)); else known = false;
+          const t = w0 === 'cd' && st.words.length <= 2 ? (a ? (a.lit ? [a.text] : subst(a.text, v)) : [home]) : null;
+          if (p.stages.length === 1 && t && t.length === 1 && !t[0].startsWith('-')) dir = path.resolve(dir, t[0].replace(/^~(?=\/|$)/, home));
+          else known = false;
           continue;
         }
         for (const t of writeTargets(st, v)) {
