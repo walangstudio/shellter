@@ -3275,6 +3275,11 @@ console.log('\n--- 0.11.0 r2 step 7: write targets on the AST, script scan from 
     }
     fs.writeFileSync(path.join(sd, 'clean.sh'), 'echo hi\n');
     testBashCwd('M-3 twin: a clean script behind a pipe is not flagged', 'git status | bash ./clean.sh', sd, 'fallthrough', none);
+    // A FIFO as the script: opening it would block the hook until its timeout (fail open).
+    if (process.platform !== 'win32') {
+      execFileSync('mkfifo', [path.join(sd, 'p.sh')]);
+      testBashCwd('M-3: a FIFO script does not hang the hook', 'bash ./p.sh', sd, 'fallthrough', none);
+    }
   } finally { fs.rmSync(sd, { recursive: true, force: true }); }
 }
 
@@ -3539,13 +3544,14 @@ for (const c of [
   // 0.11.0 r2: shapes the fail-closed parser approves (they prompted before)
   "f=$(grep -ln \"X\" *.sql | tail -1); sed -n 1,40p $f",
   "for f in a.md b.md; do grep -n x $f; done",
-  "sed -n 1,20p \"$TEMP/x.log\"",
   "true && W=/p/x; head -3 $W/f",
   "npm test |& tail -5",
   "# it's a comment\nls",
   "for p in 5192 5193; do curl -s -o /dev/null http://localhost:$p/ && break; sleep 1; done",
   "pnpm --filter web build",
 ]) testBash('corpus: ' + corpusLabel(c), c, 'allow');
+// $TEMP is seeded from the environment, which Linux and macOS do not set.
+testBashCwd('corpus: sed -n 1,20p "$TEMP/x.log"', 'sed -n 1,20p "$TEMP/x.log"', undefined, 'allow', { TEMP: os.tmpdir() });
 for (const c of [
   "Get-ChildItem",
   "Get-ChildItem -Recurse -Filter *.ts | Select-Object -First 10",

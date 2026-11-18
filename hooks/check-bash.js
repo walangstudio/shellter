@@ -4169,6 +4169,9 @@ function resolveScriptPath(token, cwd) {
 function readBoundedForScan(absPath) {
   let fd;
   try {
+    // A FIFO, tty or /dev/stdin is not a script file: opening one can block the hook, and its
+    // content is stdin (as `-` is).
+    if (!fs.statSync(absPath).isFile()) return null;
     fd = fs.openSync(absPath, 'r');
     const buf = Buffer.alloc(trust.TRUST_SCAN_BYTES);
     const n = fs.readSync(fd, buf, 0, trust.TRUST_SCAN_BYTES, 0);
@@ -4390,30 +4393,28 @@ if (MAIN) process.stdin.on('end', () => {
       if (gi !== -1) coverageGaps.splice(gi, 1);   // the parser is the authority on quoting
     }
   }
-  const structuralPass = (mode) => {
+  // A walker failure means "not understood": no approve, and the passes after it still run.
+  const astWalk = (cb) => {
     if (!ast) return;
-    try {
-      walk(ast, hostSeed(), (p, v) => {
-        const text = p.stages.map(canonStage).join(' | ');
-        const xs = expansions(text, v);
-        checkSegmentDeny(text, 0, mode, xs[0]);
-        for (const x of xs.slice(1)) checkSegmentDeny(x, 0, mode);
-        return true;
-      }, false);
-    } catch (e) {
+    try { walk(ast, hostSeed(), cb, false); } catch (e) {
       if (!(e instanceof Error)) throw e;   // process.exit stubs (in-process replay) pass through
-     
-      ast = null;   // a walker failure means "not understood": no approve
+      ast = null;
     }
   };
+  const structuralPass = (mode) => astWalk((p, v) => {
+    const text = p.stages.map(canonStage).join(' | ');
+    const xs = expansions(text, v);
+    checkSegmentDeny(text, 0, mode, xs[0]);
+    for (const x of xs.slice(1)) checkSegmentDeny(x, 0, mode);
+    return true;
+  });
   structuralPass('hard');
 
   // W-1 on the AST: deny in the hard phase, ask in the ask phase.
   const writePass = (mode) => {
-    if (!ast) return;
     let dir = cwd, known = true;
     const home = safeHomedir();
-    walk(ast, hostSeed(), (p, v) => {
+    astWalk((p, v) => {
       for (const st of p.stages) {
         if (st.type !== 'simple' || !st.words.length) continue;
         if (st.words[0].text === 'cd' && p.stages.length === 1) {
@@ -4437,7 +4438,7 @@ if (MAIN) process.stdin.on('end', () => {
         }
       }
       return true;
-    }, false);
+    });
   };
   writePass('hard');
 
@@ -4463,16 +4464,14 @@ if (MAIN) process.stdin.on('end', () => {
       audit('fallthrough', 'script-scan-threw: ' + (err && err.message), seg);
     }
   }
-  if (ast) {
-    walk(ast, hostSeed(), (p) => {
-      for (const st of p.stages) {
-        if (st.type !== 'simple' || !st.words.length) continue;
-        const text = st.words.map(canonWord).join(' ');
-        try { checkSegmentScript(text, rawCmd, cwd, false, approvedScriptSegs); } catch (err) { if (!(err instanceof Error)) throw err; noteGap('script-scan'); }
-      }
-      return true;
-    }, false);
-  }
+  astWalk((p) => {
+    for (const st of p.stages) {
+      if (st.type !== 'simple' || !st.words.length) continue;
+      const text = st.words.map(canonWord).join(' ');
+      try { checkSegmentScript(text, rawCmd, cwd, false, approvedScriptSegs); } catch (err) { if (!(err instanceof Error)) throw err; noteGap('script-scan'); }
+    }
+    return true;
+  });
 
   // Tier-2 ask pass: dev-workflow guards (sudo / git push / DROP TABLE / ...)
   // surface for in-session approval. Runs after hard deny + script scan so those
