@@ -3542,6 +3542,27 @@ console.log('\n--- 0.11.0 r3 step 4: watchdog (B D1, F H-1: a hook always answer
   testFile('watchdog twin: Read README.md still falls through', 'Read', { file_path: 'README.md' }, 'fallthrough');
 }
 
+console.log('\n--- 0.11.0 r3 step 6: the parser reads words as bash does (G2) ---');
+{
+  const M = 'node x.js';
+  // B F1: `${ }` ends at the first unquoted `}`
+  testBash('F1: echo ${x:-{} ; M #} does not approve', 'echo ${x:-{} ; ' + M + ' #}', 'fallthrough');
+  for (const c of ['echo "${dir:-$PWD}"', 'echo "${x:-"d"}"', 'echo "${f##*/}"', 'VAR=${VAR:-default}; echo $VAR']) testBash('F1 twin: ' + c + ' allows', c, 'allow');
+  // B F3: word splitting, brace expansion, NUL
+  testBash('F3: X="-exec M ;"; find . $X does not approve', 'X="-exec ' + M + ' ;"; find . $X', 'fallthrough');
+  testBash('F3: find . {-exec,node,x.js,{},+} does not approve', 'find . {-exec,node,x.js,{},+}', 'fallthrough');
+  testBash("F3: find . $'-exec\\0x' does not approve", "find . $'-exec\\0x' " + M + " ';'", 'fallthrough');
+  for (const c of ['W=/p/x; git -C $W status', 'mkdir -p build/{debug,release}', 'cp config.{yml,yml.bak}', 'ls dist/{js,css}', 'for i in {1..3}; do echo $i; done']) testBash('F3 twin: ' + c + ' allows', c, 'allow');
+  // B F7: CR is an ordinary character, `\` CR LF is not a line continuation
+  testBash('F7: echo hi \\ CR LF M does not approve', 'echo hi \\\r\n' + M, 'fallthrough');
+  testBash('F7 twin: LF continuation still allows', 'echo hi \\\nthere', 'allow');
+  // B R2: `${x:=w}` assigns
+  testBash('R2: x=; : ${x:=.env}; cat $x does not approve', join('x=; : ${x:=.e', 'nv}; cat $x'), 'fallthrough');
+  // `>&` to a file is a write target
+  testBash('>&: echo x >& ~/.bashrc does not approve', 'echo x >& ~/.bashrc', 'ask');
+  testBash('>& twin: echo x >&2 allows', 'echo x >&2', 'allow');
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a

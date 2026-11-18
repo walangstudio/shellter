@@ -3178,10 +3178,62 @@ const RESERVED = /^(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|in|
 const PARSE_MAX_NEST = 64;     // nested lists ($( ), { }, if, loops): deeper is not parsed
 const PARSE_MAX_WORDS = 4096;  // words in one command line: more is not parsed
 
+// bash brace expansion of one word: null when the word holds no brace expression, false when it
+// expands to more than BRACE_MAX words, else the words (empty ones included; the caller drops them).
+// A `{` starts an expression when its matching `}` encloses a top-level comma or a sequence
+// `{a..b[..step]}` of integers or of single letters; anything else stays literal.
+const BRACE_MAX = 64;
+function braceSeq(body) {
+  const m = /^(?:(-?\d+)\.\.(-?\d+)|([A-Za-z])\.\.([A-Za-z]))(?:\.\.(-?\d+))?$/.exec(body);
+  if (!m) return null;
+  const step = Math.abs(parseInt(m[5] || '1', 10)) || 1;
+  const a = m[1] !== undefined ? parseInt(m[1], 10) : m[3].charCodeAt(0);
+  const b = m[1] !== undefined ? parseInt(m[2], 10) : m[4].charCodeAt(0);
+  if (Math.abs(b - a) / step >= BRACE_MAX) return false;
+  const width = m[1] !== undefined && (/^-?0\d/.test(m[1]) || /^-?0\d/.test(m[2])) ? Math.max(m[1].length, m[2].length) : 0;
+  const out = [];
+  for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
+    if (m[1] === undefined) { out.push(String.fromCharCode(v)); continue; }
+    const t = String(Math.abs(v)).padStart(width - (v < 0 ? 1 : 0), '0');
+    out.push(v < 0 ? '-' + t : t);
+  }
+  return out;
+}
+function braceExpand(s) {
+  if (!s.includes('{') || !s.includes('}')) return null;
+  // One pass pairs every brace (a stack pairs them as bash's depth count does) and records the
+  // commas at each pair's own depth, so a long run of braces costs linear time.
+  const close = new Map(), commas = new Map(), stack = [];
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === '{') stack.push(k);
+    else if (s[k] === '}' && stack.length) close.set(stack.pop(), k);
+    else if (s[k] === ',' && stack.length) { const t = stack[stack.length - 1]; if (!commas.has(t)) commas.set(t, []); commas.get(t).push(k); }
+  }
+  for (let a = s.indexOf('{'); a !== -1; a = s.indexOf('{', a + 1)) {
+    const e = close.get(a);
+    if (e === undefined) continue;
+    let alts;
+    if (commas.has(a)) { alts = []; let p = a + 1; for (const c of [...commas.get(a), e]) { alts.push(s.slice(p, c)); p = c + 1; } }
+    else alts = e - a < 64 ? braceSeq(s.slice(a + 1, e)) : null;
+    if (alts === false) return false;
+    if (!alts) continue;
+    const out = [];
+    for (const alt of alts) {
+      const x = braceExpand(s.slice(0, a) + alt + s.slice(e + 1));
+      if (x === false) return false;
+      out.push(...(x || [s.slice(0, a) + alt + s.slice(e + 1)]));
+      if (out.length > BRACE_MAX) return false;
+    }
+    return out;
+  }
+  return null;
+}
+
 function parseBash(src0, depth) {
   depth = depth || 0;
   if (depth > 8 || typeof src0 !== 'string') return null;
-  const src = src0.replace(/\r\n/g, '\n');
+  // bash reads a CR as an ordinary character (`\` CR is an escaped CR, not a line continuation).
+  const src = src0;
   if (/[\r\0]/.test(src)) return null;
   let i = 0;
   const n = src.length;
@@ -3238,18 +3290,47 @@ function parseBash(src0, depth) {
     }
     if (c === '(') { i += 2; w.subs.push(subList(')')); w.text += '$(_)'; w.lit = false; return; }
     if (c === '{') {
-      let j = i + 2, d = 1;
-      for (; j < n && d; j++) { if (src[j] === '{') d++; else if (src[j] === '}') d--; else if (src[j] === '\n') bad(); }
-      if (d) bad();
-      const body = src.slice(i + 2, j - 1);
-      const pm = /^([!#]?)([\w@*#?]+)(?:\[([\w@*$]*)\])?([:%#\/^,+=?-][^`$"'\\]*)?$/.exec(body);
-      if (!pm || /^\w+@|@[A-Za-z]/.test(pm[2])) bad();      // ${x@P} and friends: transformations are not modelled
+      // bash ends `${` at the first unquoted `}`: the name, an operator, then a word read with the quote,
+      // `$( )`, `${ }` and backtick rules of a word (substitutions inside land in w.subs).
+      const i0 = i;
+      const pm = /^\$\{([!#]?)([A-Za-z_]\w*|\d+|[@*#?$!-])(?:\[([\w@*$]*)\])?/.exec(src.slice(i, i + 256));
+      if (!pm) bad();
+      i += pm[0].length;
+      let op = '';
+      if (src[i] !== '}') {
+        const om = /^(?::?[-=?+]|##?|%%?|\/[\/#%]?|\^\^?|,,?|:)/.exec(src.slice(i, i + 2));
+        if (!om) bad();                          // ${x@P} and other transformations are not modelled
+        op = om[0]; i += op.length;
+      }
+      const argStart = i;
+      const inner = { text: '', lit: true, subs: w.subs, bare: true };
+      for (;;) {
+        if (i >= n || src[i] === '\n') bad();
+        const d = src[i];
+        if (d === '}') break;
+        if (d === '\\') { i += 2; continue; }
+        if (d === "'") { const e = src.indexOf("'", i + 1); if (e === -1) bad(); i = e + 1; continue; }
+        if (d === '"') {
+          for (i++; src[i] !== '"'; ) {
+            if (i >= n) bad();
+            if (src[i] === '\\') i += 2; else if (src[i] === '$') dollar(inner, true); else if (src[i] === '`') backtick(inner); else i++;
+          }
+          i++; continue;
+        }
+        if (d === '$') { dollar(inner, dq); continue; }
+        if (d === '`') { backtick(inner); continue; }
+        i++;
+      }
+      const arg = src.slice(argStart, i);
+      i++;
+      if (inner.sets) (w.sets = w.sets || []).push(...inner.sets);
       // Arithmetic contexts bash evaluates (a variable holding `a[$(cmd)]` runs cmd there): a subscript,
       // a `${s:off:len}` offset, and the name behind `${!x}` indirection.
       if (pm[3] && !/^[@*]$/.test(pm[3])) arith.push(pm[3]);
-      if (pm[4] && pm[4][0] === ':' && !/^:[-=?+]/.test(pm[4])) arith.push(pm[4].slice(1));
+      if (op === ':') arith.push(arg);
       if (pm[1] === '!') arith.push(pm[2]);
-      w.text += '${' + body + '}'; w.lit = false; i = j; return;
+      if (/^:?=$/.test(op)) (w.sets = w.sets || []).push(pm[2]);   // ${x:=w} assigns x
+      w.text += src.slice(i0, i); w.lit = false; return;
     }
     if (c === "'" && !dq) {                    // ANSI-C quoting
       let j = i + 2, out = '';
@@ -3257,7 +3338,11 @@ function parseBash(src0, depth) {
         if (src[j] !== '\\') { out += src[j]; continue; }
         const e = src[++j];
         const m = /^(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|U([0-9a-fA-F]{1,8})|([0-7]{1,3}))/.exec(src.slice(j, j + 9));
-        if (m) { out += String.fromCodePoint(parseInt(m[1] || m[2] || m[3], m[4] ? 8 : 16) || parseInt(m[4] || '0', 8)); j += m[0].length - 1; }
+        if (m) {
+          const cp = m[4] ? parseInt(m[4], 8) : parseInt(m[1] || m[2] || m[3], 16);
+          if (!cp || cp > 0x10ffff) bad();       // bash ends the word at a NUL
+          out += String.fromCodePoint(cp); j += m[0].length - 1;
+        }
         else if ('ntr\\\'"abefv'.includes(e)) out += { n: '\n', t: '\t', r: '\r', a: '', b: '', e: '\x1b', f: '', v: '' }[e] ?? e;
         else bad();
       }
@@ -3280,16 +3365,18 @@ function parseBash(src0, depth) {
     w.subs.push(ast); w.text += '$(_)'; w.lit = false; i = e + 1;
   };
   // A word. text = what bash passes, with expansions left as raw `$X` / `${..}` / `$(_)`.
-  // lit = no expansion at all, so text is exactly the argument.
+  // lit = no expansion at all, so text is exactly the argument. u = the text with every quoted,
+  // escaped or expanded part replaced by \x02 (what brace and pathname expansion can see);
+  // uexp = an expansion outside double quotes (bash word-splits its value).
   const word = (stop) => {
     if (++words > PARSE_MAX_WORDS) bad();
-    const w = { text: '', lit: true, subs: [], bare: true };
+    const w = { text: '', lit: true, subs: [], bare: true, u: '' };
     const start = i;
     while (i < n) {
       const c = src[i];
-      if (c === "'") { const e = src.indexOf("'", i + 1); if (e === -1) bad(); w.text += src.slice(i + 1, e); i = e + 1; w.bare = false; continue; }
+      if (c === "'") { const e = src.indexOf("'", i + 1); if (e === -1) bad(); w.text += src.slice(i + 1, e); i = e + 1; w.bare = false; w.u += '\x02'; continue; }
       if (c === '"') {
-        i++; w.bare = false;
+        i++; w.bare = false; w.u += '\x02';
         for (;;) {
           if (i >= n) bad();
           const d = src[i];
@@ -3303,20 +3390,33 @@ function parseBash(src0, depth) {
       }
       if (c === '\\') {
         if (i + 1 >= n) bad();
-        if (src[i + 1] !== '\n') { w.text += src[i + 1]; w.bare = false; }   // `\`-newline is a line continuation
+        if (src[i + 1] !== '\n') { w.text += src[i + 1]; w.bare = false; w.u += '\x02'; }   // `\`-newline is a line continuation
         i += 2; continue;
       }
-      if (c === '$') { if (src[i + 1] === '"') { i++; continue; } dollar(w, false); continue; }
-      if (c === '`') { backtick(w); continue; }
+      if (c === '$') {
+        if (src[i + 1] === '"') { i++; continue; }
+        if (src[i + 1] !== "'") w.uexp = true;
+        dollar(w, false); w.u += '\x02'; continue;
+      }
+      if (c === '`') { backtick(w); w.uexp = true; w.u += '\x02'; continue; }
       if ((c === '<' || c === '>') && src[i + 1] === '(') {
         if (i > start) break;                    // `echo<(ls)`: the process substitution is its own word
-        i += 2; w.subs.push(subList(')')); w.text += c + '(_)'; w.lit = false; continue;
+        i += 2; w.subs.push(subList(')')); w.text += c + '(_)'; w.lit = false; w.u += '\x02'; continue;
       }
       if (/[\s;&|<>()]/.test(c) || (stop && stop.includes(c))) break;
-      w.text += c; i++;
+      w.text += c; w.u += c; i++;
     }
     if (i === start) bad();
+    w.glob = /[*?[]/.test(w.u);
     return w;
+  };
+  // Brace expansion, which bash performs before any other: a fully bare literal word becomes its
+  // words; a brace pattern next to quotes or expansions is not modelled.
+  const braced = (w) => {
+    const x = braceExpand(w.u);
+    if (x === null) return [w];
+    if (x === false || w.u !== w.text || x.every((t) => t === '')) bad();
+    return x.filter((t) => t !== '').map((t) => ({ text: t, lit: true, subs: [], bare: true, u: t, glob: /[*?[]/.test(t) }));
   };
 
   const redirect = (node) => {                 // returns true when one was consumed
@@ -3339,7 +3439,9 @@ function parseBash(src0, depth) {
       i += /^(?:\d+-?|-)/.exec(src.slice(i, i + 8))[0].length;
       return true;
     }
-    node.redirs.push({ op, target: word() });
+    const target = word();
+    if (op !== '<<<' && braceExpand(target.u) !== null) bad();   // a brace pattern in a redirect target
+    node.redirs.push({ op, target });
     return true;
   };
 
@@ -3358,14 +3460,14 @@ function parseBash(src0, depth) {
           const as = { name: a[1], append: !!a[3] || !!a[2], value: null, array: null };
           if (src[i] === '(') {
             i++; as.array = [];
-            for (;;) { blanks(); if (src[i] === '\n') { newline(); continue; } if (src[i] === ')') { i++; break; } if (i >= n) bad(); as.array.push(word()); }
+            for (;;) { blanks(); if (src[i] === '\n') { newline(); continue; } if (src[i] === ')') { i++; break; } if (i >= n) bad(); as.array.push(...braced(word())); }
           } else if (i < n && !/[\s;&|<>()]/.test(src[i])) as.value = word();
           else as.value = { text: '', lit: true, subs: [], bare: true };
           node.assigns.push(as);
           continue;
         }
       }
-      node.words.push(word());
+      node.words.push(...braced(word()));
     }
     if (!node.words.length && !node.assigns.length && !node.redirs.length) bad();
     return node;
@@ -3409,7 +3511,7 @@ function parseBash(src0, depth) {
       let words = null;
       if (reserved() === 'in') {
         i += 2; words = [];
-        for (;;) { blanks(); if (i >= n || /[\n;]/.test(src[i])) break; if (/[&|()<>]/.test(src[i])) bad(); words.push(word()); }
+        for (;;) { blanks(); if (i >= n || /[\n;]/.test(src[i])) break; if (/[&|()<>]/.test(src[i])) bad(); words.push(...braced(word())); }
       }
       blanks();
       if (src[i] === ';') i++;
@@ -3550,6 +3652,8 @@ const VALS_MAX = 32;
 const SETS_VARS = /^(?:read|mapfile|readarray|getopts|let|eval|source|\.)$/;
 const setsVars = (st) => SETS_VARS.test(base(st.words[0].text)) || (st.words[0].text === 'printf' && st.words.some((w) => w.text === '-v'));
 function wordSubs(w) { return w ? w.subs : []; }
+// Names a ${x:=w} / ${x=w} in a stage's words, assignment values or redirect targets assigns.
+const wordSets = (st) => [...st.words, ...st.assigns.flatMap((a) => a.array || [a.value]), ...st.redirs.map((r) => r.target)].flatMap((w) => (w && w.sets) || []);
 function nodeSubs(st) {
   const out = [];
   const add = (w) => { for (const s of wordSubs(w)) out.push(s); };
@@ -3566,6 +3670,7 @@ function assignedNames(l, out) {
   for (const p of l.items) for (const st of p.stages) {
     if (st.type === 'simple') {
       for (const a of st.assigns) out.add(a.name);
+      for (const n of wordSets(st)) out.add(n);
       if (st.words.length && setsVars(st)) out.add('*');
       if (st.words.length && /^(?:export|declare|typeset|readonly|local|unset)$/.test(st.words[0].text)) out.add('*');
     } else if (st.type === 'for') { out.add(st.name); assignedNames(st.body, out); }
@@ -3624,22 +3729,47 @@ function derivedWord(w, vals) {
   if (pre !== '') { const p = subst(pre, vals); if (!p || !p.every((x) => x.endsWith('/') && !SECRET_TOKENS_RE.test(x))) return false; }
   return producerOk(w.subs[0]);
 }
+// The fields a word can become: one array of strings per value, or null when it is not read.
+// An unquoted expansion is split on blanks (standalone IFS= is refused, so the set is fixed); a
+// value holding a glob character, or blanks in a word that also has quotes, is not modelled.
+function wordFields(w, vals) {
+  const lv = literalValue(w, vals);
+  if (!lv || !w.uexp) return lv && lv.map((t) => [t]);
+  if ([...w.text.matchAll(/\$\{?([A-Za-z_]\w*)/g)].some((m) => vals.get(m[1]).some((x) => /[*?[]/.test(x)))) return null;
+  if (!w.bare) return lv.some((t) => /[ \t\n]/.test(t)) ? null : lv.map((t) => [t]);
+  return lv.map((t) => t.split(/[ \t\n]+/).filter(Boolean));
+}
 function argvVariants(words, vals) {
   let out = [[]];
   for (const w of words) {
-    let alts = [w];
+    let alts = [[w]];
     if (!w.lit) {
-      const lv = subst(w.text, vals);
-      if (lv) alts = lv.map((t) => ({ text: t, lit: true, subs: [] }));
-      else if (derivedWord(w, vals)) alts = [{ text: '_derived_', lit: true, subs: [] }];
+      const f = wordFields(w, vals);
+      if (f) alts = f.map((ts) => ts.map((t) => ({ text: t, lit: true, subs: [] })));
+      else if (derivedWord(w, vals)) alts = [[{ text: '_derived_', lit: true, subs: [] }]];
     }
-    if (alts.length === 1) { for (const o of out) o.push(alts[0]); continue; }   // in place: linear
+    if (alts.length === 1) { for (const o of out) o.push(...alts[0]); continue; }   // in place: linear
     const next = [];
-    for (const o of out) for (const a of alts) next.push([...o, a]);
-    if (next.length > 64) return [words];
+    for (const o of out) for (const a of alts) next.push([...o, ...a]);
+    if (next.length > 64) { structIncomplete = true; return [words]; }
     out = next;
   }
   return out;
+}
+// A body that may not run: inside it values flow in order; after it a name holds a value from either
+// path (a name unset before counts as empty, as an assignment after && does).
+function walkMaybe(body, v, cb) {
+  const w = new Map(v);
+  if (!walk(body, w, cb, false)) return false;
+  for (const k of new Set([...v.keys(), ...w.keys()])) {
+    const a = v.get(k), b = w.get(k);
+    if (a === b) continue;
+    if (k === ' taint') { v.set(k, b); continue; }
+    if (!b || (a && (!a.length || !b.length))) { v.delete(k); continue; }
+    const u = b.length ? [...new Set([...(a || ['']), ...b])] : b;
+    if (u.length > VALS_MAX) v.delete(k); else v.set(k, u);
+  }
+  return true;
 }
 function walk(l, vals, cb, conditional) {
   for (const p of l.items) {
@@ -3656,6 +3786,7 @@ function walk(l, vals, cb, conditional) {
     for (const st of p.stages) {
       const v = piped || st.type === 'subshell' ? new Map(vals) : vals;   // a pipe stage / subshell cannot set ours
       if (st.type === 'simple') {
+        for (const n of wordSets(st)) v.delete(n);
         const w0 = st.words.length ? st.words[0].text : null;
         const declare = w0 !== null && /^(?:export|declare|typeset|readonly|local)$/.test(w0);
         if (w0 === null) {
@@ -3675,25 +3806,26 @@ function walk(l, vals, cb, conditional) {
             if (w0 !== 'unset' && m[2] !== undefined && w.lit && !cond) v.set(m[1], [m[2]]); else v.delete(m[1]);
           }
         } else if (setsVars(st)) clearVals(v);
-      } else if (st.type === 'group') { if (!walk(st.body, v, cb, cond)) return false; }
-      else if (st.type === 'subshell') { if (!walk(st.body, v, cb, cond)) return false; }
+      } else if (st.type === 'group' || st.type === 'subshell') { if (!(cond ? walkMaybe(st.body, v, cb) : walk(st.body, v, cb, false))) return false; }
       else if (st.type === 'if') {
-        for (const part of st.parts) if (!walk(part, v, cb, true)) return false;
+        for (const part of st.parts) if (!walkMaybe(part, v, cb)) return false;
       } else if (st.type === 'case') {
-        for (const arm of st.arms) if (!walk(arm.body, v, cb, true)) return false;
+        for (const arm of st.arms) if (!walkMaybe(arm.body, v, cb)) return false;
       } else if (st.type === 'loop') {
         dropAssigned(st.cond, v); dropAssigned(st.body, v);
-        if (!walk(st.cond, v, cb, true) || !walk(st.body, v, cb, true)) return false;
+        if (!walkMaybe(st.cond, v, cb) || !walkMaybe(st.body, v, cb)) return false;
       } else if (st.type === 'for') {
         dropAssigned(st.body, v);
         let lits = st.words && st.words.length ? [] : null;
         for (const w of st.words || []) {
-          const lv = literalValue(w, v);
-          if (lv) lits.push(...lv);
+          // An unquoted glob is the matching file names: a derived word unless it can reach a secret.
+          if (w.glob && w.lit) { if (SECRET_TOKENS_RE.test(w.text) || scan.globHitsSecret(w.text)) { lits = null; break; } continue; }
+          const f = wordFields(w, v);
+          if (f) lits.push(...f.flat());
           else if (!derivedWord(w, v)) { lits = null; break; }
         }
         if (lits && lits.length <= VALS_MAX) v.set(st.name, lits); else v.delete(st.name);
-        if (!walk(st.body, v, cb, true)) return false;
+        if (!walkMaybe(st.body, v, cb)) return false;
         v.delete(st.name);
       }
     }
@@ -3740,7 +3872,7 @@ function protectedWrite(p, baseOnly) {
 }
 function writeTargets(st, vals) {
   const out = [];
-  for (const r of st.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>)$/.test(r.op)) out.push(r.target);
+  for (const r of st.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>|>&)$/.test(r.op)) out.push(r.target);
   const w0 = st.words.length && st.words[0].lit ? base(st.words[0].text) : '';
   if (WRITE_OPERANDS.test(w0) && (w0 !== 'sed' || st.words.some((w) => /^-[A-Za-z]*i|^--in-place/.test(w.text)))) {
     // cp / mv / install / ln / rsync write only their destination: the last operand or -t DIR.
@@ -4437,7 +4569,7 @@ if (MAIN) watchdog.input((data) => {
   // The parser and the heredoc fast path read the unjoined text: bash does not join a
   // backslash-newline inside a comment, single quotes or a quoted heredoc body.
   const unjoined = normalizeUnicode(rawCmd);
-  const cmd = unjoined.replace(/\\\r?\n/g, '');
+  const cmd = unjoined.replace(/\\\n/g, '');
   let work = cmd, workRaw = unjoined;
 
   // Heredoc invocations (bash-only): a single safe `python|cat|tee << MARKER`

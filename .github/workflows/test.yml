@@ -31,4 +31,5 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: node test-hooks.js
       - run: node test-perf.js
+      - run: node test-parser-fuzz.js
       - run: node adapters/shared/test-host-hook.js
