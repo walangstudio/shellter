@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.11.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-1923%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-2539%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -123,6 +123,7 @@ heredocs, comments, pipelines, `&&`, `||`, `;`, `&`, `if`, `while`, `until`, `fo
 `{ }`, `( )`, `[[ ]]`. A command it does not fully read (`((..))`, functions, `select`, more than 64
 nesting levels or 4,096 words) is never auto-approved. One walker visits every pipeline at every depth
 with the values variables can hold, and feeds three passes: structural deny, structural ask, approve.
+`test-parser-fuzz.js` checks the parser's word model against real bash (bash 4+, skipped otherwise).
 
 | Shape | Behaviour |
 | --- | --- |
@@ -134,7 +135,14 @@ with the values variables can hold, and feeds three passes: structural deny, str
 | `$( )`, backticks, `<( )`, `>( )` | every body is deny-checked and must itself approve |
 | `for f in a b`, `A=x; B=$A/y` | a loop variable holds its literal words and known values compose, so `for f in .env; do cat $f; done` denies like `cat .env` |
 | known tools (`sed`, `awk`, `curl`, `gh api`, env prefixes, ...) | known flags only; an unknown flag means no approve |
-| PowerShell `( )`, `$( )`, `{ }`, pipe stages | every group body and every stage must approve; here-strings and comments are not modelled |
+| an argument of `find`, `xargs`, `curl`, `git`, `tar`, ... the hook cannot read | no approve (an integer, an environment name or a quoted value behind a literal prefix is read) |
+| PowerShell `( )`, `$( )`, `{ }`, pipe stages | every group body and every stage must approve; a `#` comment is removed for the approve path; here-strings are not modelled |
+
+Each hook analyses on a worker thread. With no answer within `SHELLTER_BUDGET_MS` (default and
+maximum 8000, minimum 1000) an input under 16 KB is analysed once more; then the hook asks, or denies
+in bypassPermissions and auto mode, where an ask is silent. A command your own allow rules cover
+(`~/.claude/settings.json` or an untracked `.claude/settings.local.json`, the whole command) or a
+script you trusted falls through instead, and the deny says how to add that rule.
 
 ## Script trust
 
@@ -314,6 +322,7 @@ tried once and reverted as a confirmed security regression.
 - **Hook not firing** — plugin: check `/plugin list`; manual: `~/.claude/settings.json` needs the `hooks` key with absolute OS-correct paths.
 - **False positive** — set `CLAUDE_HOOK_LOG`, reproduce, read the matched reason, adjust the regex or add a project allow rule.
 - **Crash / no output** — non-zero exit (except 2) or empty output falls through to the prompt; `CLAUDE_HOOK_DEBUG=1` mirrors decisions to stderr.
+- **"could not finish analysing"** - the watchdog budget ran out twice. Allow the exact command in `~/.claude/settings.json` (the message names the rule), or trust the script with `node ~/.claude/hooks/shellter-trust.js add <script>`.
 
 ```bash
 echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | node ~/.claude/hooks/check-bash.js
@@ -324,7 +333,7 @@ node test-hooks.js
 
 See [CHANGELOG.md](CHANGELOG.md). Current: 0.11.0 - security-fix release: bash auto-approve is
 fail-closed (one parser reads the command; what it cannot read is never auto-approved), secret reads see through globs and escapes, Windows backslash paths are canonicalised,
-and the trust store ignores repo-committed allow rules. Previously 0.10.0 - never asks in bypass or auto mode
+the trust store ignores repo-committed allow rules, and a hook always answers within its budget. Previously 0.10.0 - never asks in bypass or auto mode
 (denies still block), stops false "could not fully analyze" prompts on heredocs, nested `$( … )`
 quoting (found in real sessions), analyzes Python fed through a heredoc, narrows the
 data-file polyglot rule from a hard deny to an ask on remote fetches only, and adds the

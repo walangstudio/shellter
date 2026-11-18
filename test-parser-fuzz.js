@@ -24,7 +24,9 @@ function findBash() {
   if (process.env.BASH_EXE) return process.env.BASH_EXE;
   // On Windows `bash` on PATH may be WSL's launcher: use Git Bash only.
   if (process.platform === 'win32') return ['C:/Program Files/Git/bin/bash.exe', 'C:/Program Files (x86)/Git/bin/bash.exe'].find((p) => fs.existsSync(p)) || null;
-  return spawnSync('bash', ['-c', 'exit 0']).status === 0 ? 'bash' : null;
+  // An absolute path: the run below clears PATH.
+  const r = spawnSync('bash', ['-c', 'printf %s "$BASH"'], { encoding: 'utf8' });
+  return r.status === 0 && r.stdout.startsWith('/') ? r.stdout : null;
 }
 const BASH = findBash();
 if (!BASH) { console.log('test-parser-fuzz: no bash found, skipped'); process.exit(0); }

@@ -120,10 +120,12 @@ function mapTool(ev) {
 
 // The shim is always invoked as `node <shim>`, so node is on PATH by definition
 // (no bun/process.execPath fallback needed, unlike the in-process adapters).
+// Above the watchdog's worst case (hooks/watchdog.js BUDGET_MAX_MS): a hook always answers before this.
+const ADAPTER_TIMEOUT_MS = 25000;
 function runHook(hook, name, input, cwd) {
   const payload = JSON.stringify({ tool_name: name, tool_input: input, cwd: cwd || process.cwd() });
   try {
-    return execFileSync('node', [hook], { input: payload, encoding: 'utf8', timeout: 20000 });
+    return execFileSync('node', [hook], { input: payload, encoding: 'utf8', timeout: ADAPTER_TIMEOUT_MS });
   } catch (e) {
     if (e && e.stdout) return e.stdout.toString(); // hook printed then exited nonzero
     // True spawn failure (missing hook file, timeout, node not found). check-bash

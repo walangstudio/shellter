@@ -10,8 +10,9 @@
 
 'use strict';
 
-// The nearest package.json decides how node loads this file: pin it beside the hooks (create-if-missing,
-// so a manual install heals on its first run). A module-type ancestor then cannot switch the hooks off.
+// The nearest package.json decides how node loads this file: pin it beside the hooks on the first run
+// (merge-settings.js writes it too), so a module-type ancestor added later cannot switch the hooks off.
+// A hook already under one fails to parse before this line; only the installer heals that.
 try { require('fs').writeFileSync(require('path').join(__dirname, 'package.json'), '{"type":"commonjs"}\n', { flag: 'wx' }); } catch (_) { /* present */ }
 if (!module.parent && require('./watchdog.js').parent(__filename, 'check-bash')) return;
 const fs = require('fs');
@@ -223,7 +224,7 @@ function rmTargetDanger(t) {
   const g = /^\/([^\/]*[*?[][^\/]*)(?:\/|$)/.exec(t);
   if (g) {
     const rx = scan.globComponentRe(g[1]);
-    if (rx && RM_SYSTEM_NAMES.some((n) => rx.test(n))) return 'system directory (glob)';
+    if (!rx || RM_SYSTEM_NAMES.some((n) => rx.test(n))) return 'system directory (glob)';
   }
   // /opt ROOT (slash/dot/star-only tail). Deep specific /opt paths stay allowed
   // (this tree lives under /opt/projs).
@@ -3849,7 +3850,8 @@ function argvVariants(words, vals) {
   return out;
 }
 // A body that may not run: inside it values flow in order; after it a name holds a value from either
-// path (a name unset before counts as empty, as an assignment after && does).
+// path. A name not known before (unset, or from the environment) is unknown after it when approving,
+// and empty-or-the-body's-value for the deny passes.
 function walkMaybe(body, v, cb) {
   const w = new Map(v);
   if (!walk(body, w, cb, false)) return false;
@@ -3857,7 +3859,7 @@ function walkMaybe(body, v, cb) {
     const a = v.get(k), b = w.get(k);
     if (a === b) continue;
     if (k === ' taint') { v.set(k, b); continue; }
-    if (!b || (a && (!a.length || !b.length))) { v.delete(k); continue; }
+    if (!b || (a ? !a.length || !b.length : approving)) { v.delete(k); continue; }
     const u = b.length ? [...new Set([...(a || ['']), ...b])] : b;
     if (u.length > VALS_MAX) v.delete(k); else v.set(k, u);
   }
@@ -3971,7 +3973,29 @@ function protectedWrite(p, baseOnly) {
   if (/(?:^|\/)\.claude\/settings(?:\.local)?\.json$/.test(c) || RC_BASE.test(b)) return 'ask';
   return null;
 }
-const PLAIN_READER = /^(?:ls|cat|head|tail|grep|rg|stat|wc|diff|file|find|test|\[|cd|echo|printf|less|bat|tree|du|realpath|readlink|dirname|basename|sha256sum|md5sum|cmp|jq|git)$/;
+const PLAIN_READER = /^(?:ls|cat|head|tail|grep|rg|stat|wc|diff|file|find|test|\[|cd|echo|printf|less|bat|tree|du|realpath|readlink|dirname|basename|sha256sum|md5sum|cmp|jq)$/;
+// Set while approving the commands after a `cd` into a `.claude` directory: there a relative or
+// absent argument can be a protected file (`cd ~/.claude/hooks && tar xf x.tar`).
+let cdProtected = false, approving = false;
+// git subcommands that only read (or stage) the paths they name: a plain reader unless `--output`.
+function gitReads(toks) {
+  let k = 1;
+  while (k < toks.length && /^-/.test(toks[k])) k += /^-[Cc]$/.test(toks[k]) ? 2 : 1;
+  return /^(?:status|log|show|diff|add|blame|ls-files|grep)$/.test(toks[k] || '') && !toks.some((t) => /^--output/.test(t));
+}
+function noteCd(st, vals) {
+  if (st.type !== 'simple' || !st.words.length) return;
+  const ws = /^(?:builtin|command)$/.test(st.words[0].text) ? st.words.slice(1) : st.words;
+  if (!ws.length || !/^(?:cd|pushd)$/.test(ws[0].text)) return;
+  const a = ws.find((w, k) => k > 0 && !/^-[LPe@]+$/.test(w.text));
+  const ts = !a ? [] : a.lit ? [a.text] : subst(a.text, vals) || [a.text];
+  const claudeDir = (c) => {
+    if (!/[*?[]/.test(c)) return /^\.claude$/i.test(c);
+    const rx = scan.globComponentRe(c);
+    return !rx || rx.test('.claude');
+  };
+  if (ts.some((t) => t.split(/[\\/]/).some(claudeDir))) cdProtected = true;
+}
 function writeTargets(st, vals) {
   const out = [];
   for (const r of st.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>|>&)$/.test(r.op)) out.push(r.target);
@@ -4075,7 +4099,8 @@ function approveArgv(words, vals, depth, approvedScripts) {
   if (w0 === 'gh' && ghApiWrites(toks)) return false;
   if (secretArg(words, w0)) return false;
 
-  if (!PLAIN_READER.test(w0) && !(w0 === 'sed' && !toks.some((t) => /^-[A-Za-z]*i|^--in-place/.test(t)))) {
+  if (!PLAIN_READER.test(w0) && !(w0 === 'git' && gitReads(toks)) && !(w0 === 'sed' && !toks.some((t) => /^-[A-Za-z]*i|^--in-place/.test(t)))) {
+    if (cdProtected) return false;
     const home = os.homedir();
     for (const t of w0 === 'cp' ? writeTargets({ redirs: [], words }, vals) : toks.slice(1)) {
       const p = t.replace(/^--?[\w-]+=/, '').replace(/^~(?=[\\/]|$)/, home);
@@ -4195,10 +4220,10 @@ function arithOk(ast, t) {
 function approveAst(ast, vals, depth, approvedScripts) {
   const t = nameTypes(ast);
   if (!arithOk(ast, t)) return false;
-  const saved = outerTypes;
-  outerTypes = t;
-  try { return walk(ast, vals, (p, v) => p.stages.every((st) => approveStage(st, v, depth, approvedScripts)), false); }
-  finally { outerTypes = saved; }
+  const saved = outerTypes, savedCd = cdProtected, savedAp = approving;
+  outerTypes = t; approving = true;
+  try { return walk(ast, vals, (p, v) => p.stages.every((st) => { noteCd(st, v); return approveStage(st, v, depth, approvedScripts); }), false); }
+  finally { outerTypes = saved; cdProtected = savedCd; approving = savedAp; }
 }
 
 // ---- argument models for the fail-closed approve ------------------------------------------
@@ -4831,24 +4856,17 @@ if (MAIN) watchdog.input((data) => {
       ast = null;
     }
   };
-  // Each text is checked once per mode, and at most STRUCT_BYTES of variant text per command: past
+  // At most STRUCT_BYTES of variant text per command (checkSegmentDeny checks each text once): past
   // that the pass stops expanding (the command text itself is still checked) and nothing approves.
   const STRUCT_BYTES = 256 * 1024;
-  const structSeen = { hard: new Set(), ask: new Set() };
   let structBytes = 0;
-  const structCheck = (mode, t, extra) => {
-    const key = t + '\0' + (extra || '');
-    if (structSeen[mode].has(key)) return;
-    structSeen[mode].add(key);
-    checkSegmentDeny(t, 0, mode, extra);
-  };
   const structuralPass = (mode) => astWalk((p, v) => {
     const text = p.stages.map(canonStage).join(' | ');
     const xs = structBytes > STRUCT_BYTES ? [] : expansions(text, v, STRUCT_BYTES - structBytes);
     for (const x of xs) structBytes += x.length;
     if (structBytes > STRUCT_BYTES) { structIncomplete = true; xs.length = 0; }
-    structCheck(mode, text, xs[0]);
-    for (const x of xs.slice(1)) structCheck(mode, x);
+    checkSegmentDeny(text, 0, mode, xs[0]);
+    for (const x of xs.slice(1)) checkSegmentDeny(x, 0, mode);
     return true;
   });
   structuralPass('hard');
@@ -4878,7 +4896,7 @@ if (MAIN) watchdog.input((data) => {
           if (!hit && /[*?[]/.test(last)) {   // a glob operand: test it against the protected names
             const rx = scan.globComponentRe(last);
             for (const n of ['shellter-trust.json', 'settings.json', 'settings.local.json', 'package.json', '.bashrc', '.zshrc', '.profile']) {
-              if (rx && rx.test(n)) hit = hit || protectedWrite(path.join(path.dirname(abs), n));
+              if (!rx || rx.test(n)) hit = hit || protectedWrite(path.join(path.dirname(abs), n));
             }
           }
           if (hit === 'deny' && mode === 'hard') deny('Writing shellter\'s own trust store or installed files blocked', t);

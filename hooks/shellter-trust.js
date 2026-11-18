@@ -164,21 +164,27 @@ function claudeAllowRules(cwd, toolName) {
 // timeout, or GIT_* steering the call elsewhere -> not honoured. Runs only when a rule from that
 // file matches a flagged script, so the hot path never spawns git.
 const _honoured = new Map();
+// The watchdog's allow check sets a deadline for all git calls together; past it a directory is not
+// honoured (and not cached).
+let gitDeadline = Infinity;
+function setGitDeadline(at) { gitDeadline = at; }
 function localRulesHonoured(dir) {
   if (!_honoured.has(dir)) {
+    if (gitDeadline - Date.now() < 50) return false;
     let ok = !insideGitCheckout(path.join(dir, '.claude', 'settings.local.json'));
     if (!ok) try {
       const env = {};
       for (const [k, v] of Object.entries(process.env)) if (!/^GIT_/i.test(k)) env[k] = v;
-      const ls = (spec) => require('child_process').spawnSync('git', ['-C', dir, 'ls-files', '-z', '--', spec], { env, encoding: 'utf8', timeout: 2000 });
+      const ls = (spec) => require('child_process').spawnSync('git', ['-C', dir, 'ls-files', '-z', '--', spec], { env, encoding: 'utf8', timeout: Math.max(1, Math.min(2000, gitDeadline - Date.now())), maxBuffer: 16 * 1024 * 1024 });
       const file = ls(':(icase).claude/settings.local.json');
       const top = ls(':(icase).claude');
       ok = file.status === 0 && file.stdout === '' && top.status === 0 &&
         !top.stdout.split('\0').some((e) => e.toLowerCase() === '.claude');
       // An alias of the file (`CLAUDE~1/`, a trailing dot or space, an ignorable character) is
-      // tracked under another name: resolve every index entry not in plain form.
+      // tracked under another name: resolve every entry not in plain form two levels down (dir/file,
+      // the only shape that can name it).
       if (ok) {
-        const all = ls('.');
+        const all = ls(':(glob)*/*');
         const odd = all.status === 0 ? all.stdout.split('\0').filter((e) => e.split('/').some((c) => /[~:]|[^\x00-\x7f]|[. ]$/.test(c))) : null;
         if (!odd || odd.length > 2000) ok = false;
         else {
@@ -217,6 +223,7 @@ function commandAllowed(cmd, cwd, toolName, exactOnly) {
 }
 
 module.exports = {
+  setGitDeadline,
   TRUST_SCAN_BYTES, trustStorePath, readTrustStore, writeTrustStore, isTrusted,
   sha256OfScan, sha256OfFileBounded, addPath, removeKey, listEntries,
   claudeAllowRules, commandAllowed,

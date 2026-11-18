@@ -659,7 +659,9 @@ function scanInjection(text, opts) {
   // has both an emphasis marker and an override word.
   if (/[*_~`<\[]/.test(text) && /\b(?:ignore|disregard|forget|previous|prior|instructions?|system)\b/i.test(text)) {
     const plain = text.replace(/<\/?[A-Za-z][\w-]{0,16}>/g, '').replace(/\[([^\]\n]{1,64})\]\([^)\s]{0,256}\)/g, (m, t) => t)
-      .replace(/(?<=\w)[*_~]{1,4}|[*_~]{1,4}(?=\w)|(?<=\w)`+(?=\w)/g, '');   // a code span stays a mention
+      // A marker run touching a word goes, whatever its length; one pass over each run keeps it linear.
+      .replace(/[*_~]+/g, (m, at, s) => (/\w/.test(s[at - 1] || '') || /\w/.test(s[at + m.length] || '') ? '' : m))
+      .replace(/(?<=\w)`+(?=\w)/g, '');   // a code span stays a mention
     if (plain !== text) {
       const sub = [];
       scanInjectionText(sub, plain, true);
@@ -690,25 +692,29 @@ function isAgentInstructionFile(p) {
   return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p.replace(/(^|[\/\\])\.claude[\/\\]worktrees[\/\\][^\/\\]+[\/\\]/gi, '$1'));
 }
 
-// One path component of a glob as an anchored, case-insensitive RegExp (null if unparseable).
-// A leading `*`/`?`/`[` never matches a leading dot, as in bash.
-// Callers test it against short names: a component of 512+ characters after a run of `*` becomes
-// one `*` needs 256+ characters to match, so it is null too.
+// One path component of a glob as an anchored, case-insensitive RegExp (null if unparseable: callers
+// treat that as a match). A leading `*`/`?`/`[` never matches a leading dot, as in bash.
+// Callers test it against short names, so a component whose shortest match is over 64 characters
+// matches none of them: it gets a regex that never matches. A class counts as one character.
+const GLOB_NEVER = /(?!)/;
 function globComponentRe(comp) {
   comp = comp.replace(/\*+/g, '*');
-  if (comp.length > 512) return null;
-  let re = /^[*?[]/.test(comp) ? '^(?!\\.)' : '^';
+  const lastClose = comp.lastIndexOf(']');
+  let re = /^[*?[]/.test(comp) ? '^(?!\\.)' : '^', units = 0;
   for (let i = 0; i < comp.length; i++) {
+    if (units > 64) return GLOB_NEVER;
     const c = comp[i];
+    if (c !== '*') units++;
     if (c === '*') re += '.*';
     else if (c === '?') re += '.';
     else if (c === '[') {
-      const e = comp.indexOf(']', i + 2);
+      const e = lastClose < i + 2 ? -1 : comp.indexOf(']', i + 2);
       if (e < 0) { re += '\\['; continue; }
       re += '[' + comp.slice(i + 1, e).replace(/^!/, '^').replace(/[\\\]]/g, (m) => '\\' + m) + ']';
       i = e;
     } else re += c.replace(/[.*+?^${}()|\\]/g, (m) => '\\' + m);
   }
+  if (units > 64) return GLOB_NEVER;
   try { return new RegExp(re + '$', 'i'); } catch { return null; }
 }
 
@@ -723,11 +729,11 @@ const GLOB_DECOYS = ['.eslintrc', '.editorconfig', '.gitignore', '.nvmrc', 'READ
 function globHitsSecret(tok) {
   if (typeof tok !== 'string' || !/[*?[]/.test(tok)) return null;
   let verdict = null;
-  // A run of `*` is one `*`: after that, a component over 128 characters needs 64+ to match.
-  for (const comp of tok.replace(/\*+/g, '*').split(/[\\/]/)) {
-    if (!/[*?[]/.test(comp) || comp.length > 128) continue;
+  for (const comp of tok.split(/[\\/]/)) {
+    if (!/[*?[]/.test(comp)) continue;
     const rx = globComponentRe(comp);
-    if (!rx || !GLOB_SECRETS.some((n) => rx.test(n))) continue;
+    if (!rx) return 'secret';
+    if (!GLOB_SECRETS.some((n) => rx.test(n))) continue;
     if (!GLOB_DECOYS.some((n) => rx.test(n))) return 'secret';
     if (comp[0] === '.') verdict = 'dot';
   }

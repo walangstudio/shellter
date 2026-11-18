@@ -6,8 +6,9 @@
 
 'use strict';
 
-// The nearest package.json decides how node loads this file: pin it beside the hooks (create-if-missing,
-// so a manual install heals on its first run). A module-type ancestor then cannot switch the hooks off.
+// The nearest package.json decides how node loads this file: pin it beside the hooks on the first run
+// (merge-settings.js writes it too), so a module-type ancestor added later cannot switch the hooks off.
+// A hook already under one fails to parse before this line; only the installer heals that.
 try { require('fs').writeFileSync(require('path').join(__dirname, 'package.json'), '{"type":"commonjs"}\n', { flag: 'wx' }); } catch (_) { /* present */ }
 if (!module.parent && require('./watchdog.js').parent(__filename, 'check-sensitive-files')) return;
 const fs = require('fs');
@@ -277,11 +278,12 @@ function globNamesSecret(g) {
     const parts = f.replace(/\\/g, '/').replace(/\[([^\]\\])\]/g, '$1').split('/');
     if (parts.slice(0, -1).some((c) => /^\.(?:ssh|aws|gnupg)$/i.test(c))) return true;
     const last = parts[parts.length - 1];
-    // A literal prefix of a secret name and one `*` (`.en*`, `id_r*`): 3+ characters with a dot, else 4+.
+    // A literal prefix of a secret name and one `*` (`.en*`, `id_r*`): 3+ characters with a dot, else 4+, and
+    // at least half the name (`.git*` is the git files, not `.git-credentials`).
     const pm = /^([^*?[\]]+)\*$/.exec(last);
-    if (pm && pm[1].length >= (pm[1][0] === '.' ? 3 : 4) && SECRET_NAMES.some((s) => s.startsWith(pm[1].toLowerCase()))) return true;
+    if (pm && pm[1].length >= (pm[1][0] === '.' ? 3 : 4) && SECRET_NAMES.some((s) => s.startsWith(pm[1].toLowerCase()) && 2 * pm[1].length >= s.length)) return true;
     // Without `*`, a `?` or a class stands for one character: `.e?v`, `id_rs?` name the secret itself.
-    if (!last.includes('*')) { const rx = scan.globComponentRe(last); if (rx && SECRET_NAMES.some((s) => rx.test(s))) return true; }
+    if (!last.includes('*')) { const rx = scan.globComponentRe(last); if (!rx || SECRET_NAMES.some((s) => rx.test(s))) return true; }
     // No `[` after the last `]` can close: split there so the class scan stays linear.
     const k = last.lastIndexOf(']') + 1;
     return SECRET_STEM.test(last.slice(0, k).replace(/\[[^\]]*\]|[*?]+/g, '') + last.slice(k).replace(/[*?]+/g, ''));

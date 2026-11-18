@@ -65,11 +65,13 @@ function mapTool(toolName: string, input: any) {
 
 // Prefer node (shellter's tested runtime); fall back to whatever runs pi (bun)
 // so the gate still works if node isn't on PATH.
+// Above the watchdog's worst case (hooks/watchdog.js BUDGET_MAX_MS): a hook always answers before this.
+const ADAPTER_TIMEOUT_MS = 25000;
 function runHook(hook: string, event: any) {
   const input = JSON.stringify(event);
   for (const exe of ["node", process.execPath]) {
     try {
-      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: 20000 });
+      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: ADAPTER_TIMEOUT_MS });
     } catch (e: any) {
       if (e && e.code === "ENOENT") continue;        // runtime missing -> try next
       if (e && e.stdout) return e.stdout.toString();  // hook printed then exited nonzero

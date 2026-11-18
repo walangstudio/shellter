@@ -100,10 +100,10 @@ log against the previous release) gate every change on not adding prompts.
 | F-C1 `:*` rule matched against the whole compound command | allow | segment only |
 | F-C2 Windows backslash paths | fallthrough | deny |
 | F-H1 repo-committed `settings.local.json` | allow | inside a git checkout: ignored when git reports it tracked, in any letter case, and when git cannot answer. Outside any checkout: honoured (the user's own `~/.claude`) |
-| F-H2 agent writes its own trust / hooks / relative `SHELLTER_TRUST_FILE` | fallthrough / allow | deny for the trust store, installed shellter hook files, the plugin cache subtree and a `package.json` beside the hooks that switches them to ESM; `SHELLTER_TRUST_FILE` inside any git checkout ignored. Settings edits are ask-only, silent in bypass and auto mode |
+| F-H2 agent writes its own trust / hooks / relative `SHELLTER_TRUST_FILE` | fallthrough / allow | deny for the trust store, installed shellter hook files, the plugin cache subtree and any write to the `package.json` beside the hooks (the hooks create it as CommonJS when missing, so a parent `package.json` is irrelevant); `SHELLTER_TRUST_FILE` inside any git checkout ignored. Settings edits are ask-only, silent in bypass and auto mode |
 | F-H3 Grep `glob`, token-shape regexes | fallthrough | deny for explicit secret-name globs; token shapes only over a broad path. Adapters pass include globs through |
 | F-H4 adapter write tools unscanned | allow | scanned (best-effort shapes) |
-| F-H5 adapters time out on 300 KB comment padding | fail open | linear comment scan (250 KB of openers under 2.5 s), 20 s timeout; agy asks on a timeout |
+| F-H5 adapters time out on 300 KB comment padding | fail open | linear comment scan, 25 s adapter timeout; since the fifth review a hook that does not finish within its budget answers ask (deny in bypass / auto) |
 | F-H6 installer with a space in the home path | fail open | quoted |
 | F-M1 junction / `::$DATA` / other hosts' instruction files | fallthrough | deny |
 | F-M2 invisible format characters, Markdown emphasis | fallthrough | deny on instruction files: default-ignorable code points, combining marks and the braille blank are stripped by class; HTML tags and link wrappers seen through |
@@ -168,17 +168,27 @@ classes.
 ### Accepted limits (v0.11.0)
 
 - **An unparsed command is never auto-approved, and in bypass mode it runs.** `((..))`, `for ((..))`,
-  functions, `select`, `coproc`, PowerShell here-strings and comments are not modelled.
+  functions, `select`, `coproc`, PowerShell here-strings, `${ }` and block comments are not modelled.
+  Self-protection against an unmodelled command (`node -e` writing the hooks dir) is not a sandbox.
+- **Arithmetic over file content** (`x=$(cat f); echo $((x+1))`, `read -r n < f; echo $((n+1))`)
+  prompts: bash evaluates the value as an expression; only producers that print digits are trusted.
+- **A standalone `IFS=..`** prompts: it changes how every later bare expansion splits.
+- **An unread value as an argument of an exec-capable command** (`gh api ../$id` with the id from an
+  unread `--jq`, `git -C $P` with `P` from `read`) prompts.
+- **A cloned directory with no `.git`** (zip, tarball, template copy) honours its `settings.local.json`:
+  there is no index to ask.
+- **CR in a command** (CRLF line ends) prompts; the parser refuses every CR.
 - **Derived-name and recursive reads.** A name produced by `find`, `ls`, `grep -l`, `git ls-files`
   counts as resolved for the approve floor, and `grep -r` / `--include` over a tree is allowed: the
   same reach as recursive content search, which is the tool's purpose.
-- **Glob forms that are not a literal secret stem** (`*env`, `**/*nv`, `*ssh/*`) in Grep and
-  Glob fall through: any rule that catches them re-creates the false denies.
+- **Glob forms that are not a literal secret stem or prefix** (`*env`, `**/*nv`, `**/?env`, `**/.e*v`,
+  `**/id_*`, `**/*.pe?`, `*ssh/*`, `**/.s*/id*`) in Grep and Glob fall through: any rule that catches
+  them re-creates the false denies.
 - **One-character regex evasions** of the token-shape Grep rule (`AK[I]A`): it is a tripwire for mass
   harvesting, not a boundary.
 - **Write-then-run chains** (a heredoc `package.json` then `npm test`): project-trust model.
-- **`cp /dev/stdin <dest> <<EOF`, `sort -o`** to destinations other than rc files and shellter's own
-  files: general write-target classification is deferred.
+- **`cp /dev/stdin <dest> <<EOF`, `sort -o`** to destinations other than rc files, Claude settings and
+  shellter's own files: general write-target classification is deferred.
 - **`time X=v cmd`, and an app variable in prefix form before a read-only tool** fall through.
 - **PowerShell has no full parser.** `poshScan` rejects what it does not model.
 
@@ -202,14 +212,63 @@ classes.
   tools cover.
 - **MCP tools (`mcp__*`) are a known bypass.** A filesystem or shell MCP server reads and runs what
   it is asked; shellter does not know its tool shapes, and a generic sniff would false-deny.
-- **Adapters other than agy fail open on a timeout.** The cause (a superlinear comment scan) is
-  fixed and the scan is linear; agy asks, and failing closed elsewhere would turn a slow machine into
-  a false block.
+- **A hook that cannot finish** within `SHELLTER_BUDGET_MS` (at most 8 s; one retry under 16 KB) asks in
+  default, acceptEdits and plan mode and denies in bypassPermissions and auto mode (`TIMEOUT_DECISION` in
+  `hooks/watchdog.js`), unless the user's own allow rule or trust store covers the whole command: that
+  falls through. `test-perf.js` keeps the known paddings far under that budget. Adapters time out after
+  25 s, above the watchdog's worst case; agy asks then, the others fail open. The file hook's timeout
+  has no allow override. A patch blob runs one hook per target in turn, so a blob of many targets can
+  still exceed codex's 30 s.
 - **`ls` / `list` on `~/.ssh`** through the opencode and pi adapters: filenames only.
 - **Host tool shapes** for codex / agy / opencode patch and multi-edit tools are best-effort; only
   the adapter side is verified.
 - **Triple encoding, and codex treating `ask` as silent**: unchanged, documented above.
 - **`tmux send-keys`, git commit hooks, `npm run` scripts**: project-trust model.
+
+## Fifth review - bounded time, bash's words (v0.11.0, 2026-11-18)
+
+Two reviews of round 2 found six root causes: no bound on analysis time, the parser's words not being
+bash's words, unread arguments treated as ordinary, four definitions of "sets a variable" and of
+"integer", a second decision path beside the parser (the heredoc fast path), and caps that failed
+open. Each is fixed once, where every caller routes through. A differential fuzz
+(`test-parser-fuzz.js`) and a performance gate (`test-perf.js`) now run in `npm test` and CI.
+
+| Finding | v0.11.0 round 2 | v0.11.0 |
+| --- | --- | --- |
+| B F1 `${x:-{}` ends at the first `}` | allow | fallthrough |
+| B F2 heredoc fast path approves before any deny pass (critical) | allow | the heredoc goes through the parser; fallthrough / deny |
+| B F3 exec flags through word splitting, brace expansion, NUL, `$( )` arguments, `xargs find` | allow | fallthrough |
+| B F4 sed line-number placeholder that is not an integer | allow | fallthrough |
+| B F5 arithmetic in heredoc bodies, `trap`, `bash -c`, `[[ -v ]]`, name positions, `declare -i/-n` | allow | fallthrough |
+| B F6 `PATH` set by `for`, `read`, `printf -v`, `${:=}`; `hash -p` | allow | fallthrough |
+| B F7 backslash CR LF (Linux bash) | allow | fallthrough (any CR) |
+| B F8 `test/x.sh`, `echo-x`, `ls.bat` matched as `test`, `echo`, `ls` | allow | fallthrough |
+| B F9 PowerShell `$var.Method()` in argument mode; quote mis-pairing | allow | fallthrough |
+| B D1 / F H-1 / F H-4 quadratic scans: no answer | fail open | worker-thread watchdog; perf gate |
+| B P1 21 everyday commands lost their allow | fallthrough | allow (19); 2 accepted (file-content arithmetic) |
+| B R1 name producers that print text (`find -printf`, `grep -o`) | allow | fallthrough |
+| B R2 `${x:=.env}`, `printf -vx` stale values | allow | fallthrough |
+| B R3 `cat < .e*` | allow | fallthrough |
+| B R4 protected path as an argument; unresolved write target | allow / fallthrough | fallthrough / deny |
+| F H-2 50-match cap on quoted phrases | fallthrough | deny |
+| F H-3 any write to the hooks' `package.json` switches both hooks off | fallthrough | deny; the hooks pin it |
+| F M-1 `settings.local.json` shipped as `CLAUDE~1/` | allow | not honoured (ask) |
+| F M-2 shim: `+++` inside a `***` blob, `paths` hides `path` | allow | deny |
+| F M-3 opencode patch shapes | allowed | blocked (one parser, `hooks/patch-targets.js`) |
+| F M-5 literal prefix plus one `*` (`.en*`, `id_r*`) | fallthrough | deny |
+| F L-4 agent worktree source scanned as an instruction surface | deny | fallthrough |
+| CR1 a bracket class over 512 characters made the glob unreadable: read as "no secret" | allow | deny |
+| CR2 `cd ~/.claude/hooks && tar xf x.tar`: a cd hid the protected directory | allow | fallthrough |
+| CR3 `git -C <shellter checkout> pull`: git counted as a plain reader | allow | fallthrough (reading subcommands still allow) |
+| CR4 a name unknown before `if false; then X=a; fi` read as `a` after it | allow | fallthrough |
+| CR5 patch: a ` *** ` context line hid later `+++` headers; `+++ "b/.env"` kept its quotes | allow | deny |
+| CR6 Glob `.git*` denied as a prefix of `.git-credentials` | deny | fallthrough |
+| CR7 emphasis runs of 5+ markers inside an override phrase | fallthrough | deny |
+| CR8 trust check listed the whole index (1 MB, 2 s): big repos lost their local rules | rules ignored | honoured (two levels listed, 16 MB) |
+| CR9 `SHELLTER_BUDGET_MS` above the adapters' kill | fail open | clamped to 8 s, allow check 4 s, adapters at 25 s |
+
+Corrections to earlier text: PowerShell member calls were not closed by round 2 (F9); `?env` falls
+through, it does not deny.
 
 ## Read the verdict labels precisely
 
