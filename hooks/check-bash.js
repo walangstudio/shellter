@@ -25,7 +25,7 @@ function audit(decision, reason, snippet) {
     hook: 'check-bash',
     decision,
     reason,
-    snippet: String(snippet || '').slice(0, 500),
+    snippet: String(snippet || '').slice(0, 4000),
   });
   if (log) {
     try { fs.appendFileSync(log, line + '\n'); } catch {}

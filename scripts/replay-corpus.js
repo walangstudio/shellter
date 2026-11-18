@@ -110,7 +110,8 @@ if (args['only-moved']) {
     let r;
     try { r = JSON.parse(line); } catch { continue; }
     if (!r || r.hook !== 'check-bash' || !/^(?:allow|fallthrough)$/.test(r.decision)) continue;
-    if (typeof r.snippet === 'string' && r.snippet.length < 500) seen.add(r.snippet);   // the log truncates at 500
+    // The log truncates at 4000 characters (at 500 before 0.11.0): a snippet of either length may be cut.
+    if (typeof r.snippet === 'string' && r.snippet.length < 4000 && r.snippet.length !== 500) seen.add(r.snippet);
   }
   cmds = [...seen];
 }

@@ -3172,6 +3172,18 @@ console.log('\n--- 0.11.0 r2 step 3: the fix reviewers\' probes, pinned (in-proc
   for (const [file, g] of Object.entries(groups)) {
     check('probes ' + file + ': ' + g.n + ' pinned verdicts hold' + (g.bad.length ? '\n         ' + g.bad.slice(0, 10).join('\n         ') : ''), g.bad.length, 0);
   }
+
+  console.log('\n--- everyday idioms ---');
+  // A verdict may be better than the pinned one, never worse; '=' rows are exact. A 'todo' row must
+  // still miss its verdict: when it starts to pass, drop the mark so the row guards from then on.
+  const rank = { deny: 0, ask: 1, fallthrough: 2, allow: 3 };
+  for (const [cmd, t, want, flag = ''] of require(path.join(HOOKS_DIR, '..', 'test-idioms.js'))) {
+    const got = inproc(cmd, t === 'P' ? 'PowerShell' : 'Bash');
+    const ok = flag.includes('=') ? got === want : rank[got] >= rank[want];
+    const label = 'idiom' + (t === 'P' ? ' ps' : '') + (flag.includes('todo') ? ' (todo)' : '') + ': ' + JSON.stringify(cmd).slice(0, 90);
+    if (flag.includes('todo')) check(label + ' still misses ' + want + ' (got ' + got + ')', ok, false);
+    else check(label + ' -> ' + want + (ok ? '' : ' (got ' + got + ')'), ok, true);
+  }
 }
 
 console.log('\n--- 0.11.0 r2 steps 4-6: fail-closed bash approve (parser, walker, argv, argument models) ---');
