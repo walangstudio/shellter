@@ -12,7 +12,7 @@
 //               in-process (about a minute). Use it to confirm the moved rows: a stubbed
 //               process.exit throws, and a try/catch in a hook can swallow that throw.
 //
-// Exit 1 when a moved row (allow -> anything else, fallthrough -> ask/deny) is untriaged or a
+// Exit 1 when a moved row (allow or deny -> anything else, fallthrough -> ask/deny) is untriaged or a
 // regression, or when a gain (fallthrough -> allow) is tagged attack. The log holds private
 // paths, so neither it nor the triage file is ever committed.
 'use strict';
@@ -155,7 +155,8 @@ const id = (r) => crypto.createHash('sha1').update(r.tool + '\0' + r.c).digest('
       console.log('  ' + id(r) + ' ' + (r.o + '->' + r.n).padEnd(22) + tag.padEnd(22) + (r.tool === 'PowerShell' ? '[PS] ' : '') + r.c.replace(/\s+/g, ' ').slice(0, 140));
     }
   };
-  const moved = rows.filter((r) => r.o !== r.n && (r.o === 'allow' || /^(?:ask|deny)$/.test(r.n)));
+  // A deny that weakens is listed too: it must be triaged like a new prompt.
+  const moved = rows.filter((r) => r.o !== r.n && (r.o === 'allow' || r.o === 'deny' || /^(?:ask|deny)$/.test(r.n)));
   const gains = rows.filter((r) => r.o === 'fallthrough' && r.n === 'allow');
   show('MOVED', moved);
   for (const r of moved) { const t = triage[id(r)]; if (!t || t === 'regression') bad++; }

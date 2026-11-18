@@ -3371,6 +3371,32 @@ console.log('\n--- 0.11.0 r2 step 9: files side (F H-2, H-4, M-3, M-6, M-8, L-2,
   } finally { fs.rmSync(d, { recursive: true, force: true }); }
 }
 
+console.log('\n--- 0.11.0 r2: probe gaps left after the parser (A-5 tail, PS spellings) ---');
+{
+  const M = join('node ', 'x.js'), E = join('.e', 'nv');
+  testBash('less +! runs a shell command, no approve', "less +'!" + M + "' f", 'fallthrough');
+  testBash('less twin: less -R f allows', 'less -R f', 'allow');
+  testBash('tar old-style I bundle runs a program, no approve', "tar xIf '" + M + "' a.tar", 'fallthrough');
+  testBash('tar twin: tar xzf a.tgz allows', 'tar xzf a.tgz', 'allow');
+  testBash('git fetch -u is --upload-pack, no approve', "git fetch -u '" + M + "'", 'fallthrough');
+  testBash('git fetch twin: git fetch origin allows', 'git fetch origin', 'allow');
+  testBash('grep -f reads a secret, no approve', 'grep -rf ' + E + ' .', 'fallthrough');
+  testBash('grep --include= a secret, no approve', 'grep x -r . --include=' + E, 'fallthrough');
+  testBash('grep twin: a secret name as the pattern allows', 'grep -rn ' + E + ' src', 'allow');
+  testBash('grep twin: --include=*.ts allows', 'grep x -r . --include=*.ts', 'allow');
+  testBash('find -name secret -exec cat denies', "find . -name '" + E + "' -exec cat {} +", 'deny');
+  testBash('xargs over a secret name with a reader denies', 'echo ' + E + ' | xargs cat', 'deny');
+  testBash('find twin: find -name *.ts -exec wc -l allows', "find . -name '*.ts' -exec wc -l {} +", 'allow');
+  testPosh('PS: a block comment is not modelled', 'echo <# x #> hi', 'fallthrough');
+  testPosh('PS: a typographic quote is not modelled', 'echo ' + String.fromCharCode(0x27) + 'a' + String.fromCharCode(0x2019) + ' | ' + M + ' #' + String.fromCharCode(0x27), 'fallthrough');
+  testPosh('PS: an alias word must end the name (cat-evil)', 'cat-evil x', 'fallthrough');
+  testPosh('PS twin: cat x allows', 'cat x', 'allow');
+  testPosh('PS: Out-File to an executable extension does not approve', 'echo x | Out-File x.exe', 'fallthrough');
+  testPosh('PS: Out-File .envrc does not approve', 'echo x | Out-File ' + E + 'rc', 'fallthrough');
+  testPosh('PS: Select-Xml reads a secret, denies', 'Select-Xml -Path ' + E + ' -XPath /', 'deny');
+  testPosh('PS: Get-Item secret | Select-Xml denies', 'Get-Item ' + E + ' | Select-Xml -XPath /', 'deny');
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a

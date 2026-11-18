@@ -1734,6 +1734,29 @@ function inputRedirectSecret(seg) {
   return null;
 }
 
+// `find . -name .env -exec cat {} +` and `echo .env | xargs cat`: the secret name is data that a read
+// verb then opens.
+function namedSecretPipelineRead(seg) {
+  const toks = tokenizeArgs(seg);
+  const verbAt = (k) => READ_VERB_SET.has((toks[k] || '').replace(/^.*[\\/]/, ''));
+  const names = (t) => SECRET_TOKENS_RE.test(t) || scan.globHitsSecret(t) === 'secret';
+  if ((toks[0] || '').replace(/^.*[\\/]/, '') === 'find') {
+    for (let k = 1; k < toks.length; k++) {
+      if (/^-(?:i?name|i?path|i?wholename)$/.test(toks[k]) && names(toks[k + 1] || '') &&
+          toks.some((t, j) => /^-(?:exec|execdir|ok|okdir)$/.test(t) && verbAt(j + 1))) return 'Reading a sensitive file through find -exec blocked';
+    }
+  }
+  const stages = splitPipeStages(seg);
+  for (let k = 0; k + 1 < stages.length; k++) {
+    const a = tokenizeArgs(stages[k]), b = tokenizeArgs(stages[k + 1]);
+    if (!a.slice(1).some(names) || (b[0] || '').replace(/^.*[\\/]/, '') !== 'xargs') continue;
+    const inner = parseXargs(stages[k + 1]);
+    const w = inner ? tokenizeArgs(inner)[0] : '';
+    if (w && READ_VERB_SET.has(w.replace(/^.*[\\/]/, ''))) return 'Reading a sensitive file through xargs blocked';
+  }
+  return null;
+}
+
 function tokenizedSensitiveRead(seg) {
   for (const stage of splitPipeStages(seg)) {
     const s = stage.replace(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*/, '');
@@ -1779,6 +1802,7 @@ function tokenizedSensitiveRead(seg) {
 
 const DENY_PATTERNS = [
   [tokenizedSensitiveRead, null],
+  [namedSecretPipelineRead, null],
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
     'Encoded payload piped to shell blocked'],
@@ -2134,7 +2158,7 @@ const POSH_DENY_PATTERNS = [
   [poshProducerSecretRead, null],
   // Variable-provider read: `${C:\proj\.env}` is the file's content.
   [new RegExp('\\$\\{[A-Za-z]+:[\\\\/][^}]{0,256}' + SECRET_TOKENS + '[^}]{0,256}\\}', 'i'), 'Reading sensitive file via the variable provider blocked'],
-  [new RegExp('\\b(?:Get-Content|gc|type|more|findstr|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)\\b[^;|]*' + SECRET_TOKENS, 'i'),
+  [new RegExp('\\b(?:Get-Content|gc|type|more|findstr|Select-String|sls|Select-Xml|Format-Hex|Import-Csv|Import-Clixml)\\b[^;|]*' + SECRET_TOKENS, 'i'),
     'Reading sensitive file via PowerShell/cmd blocked'],
   // .NET reads: File::ReadAllText/OpenText/OpenRead/Open and StreamReader.
   [new RegExp('(?:\\[(?:System\\.)?IO\\.File\\]::(?:Read\\w*|OpenText|OpenRead|Open)|\\[(?:System\\.)?IO\\.StreamReader\\]|New-Object\\s+(?:System\\.)?IO\\.StreamReader)[^;|]*' + SECRET_TOKENS, 'i'),
@@ -2318,11 +2342,11 @@ const POSH_APPROVE_PATTERNS = [
   /^\s*(?:(?:Get|Select|Where|ForEach|Sort|Measure|Compare|Group|Resolve|Split|Join|Test|ConvertTo|ConvertFrom)-[A-Za-z]+|Format-(?:Table|List|Wide|Custom|Hex)|Out-(?:String|Null|Host|Default)|Write-(?:Output|Host|Verbose|Debug|Warning|Error|Information|Progress))(?![\w-])/i,
   /^\s*[%?]\s/,
   // Out-File / Set-Content into a plain project file name (same shape as the Remove-Item rule).
-  /^\s*(?:Out-File|Set-Content)\s+(?:-(?:FilePath|Path|LiteralPath)\s+)?(['"]?)(?!\.?\w*\.?(?:env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks|bashrc|zshrc|profile|gitconfig|ps1|psm1|bat|cmd)\1(?:\s|$))\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*\1(?:\s+-(?:Encoding\s+[\w-]+|Append|NoNewline|Force|Width\s+\d+))*\s*$/i,
+  /^\s*(?:Out-File|Set-Content)\s+(?:-(?:FilePath|Path|LiteralPath)\s+)?(['"]?)(?!\.?\w*\.?(?:env|envrc|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks|bashrc|zshrc|profile|gitconfig|ps1|psm1|bat|cmd|exe|com|dll|scr|vbs|lnk)\1(?:\s|$))\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*\1(?:\s+-(?:Encoding\s+[\w-]+|Append|NoNewline|Force|Width\s+\d+))*\s*$/i,
   // Canonical read-only aliases.
   // `clear(?!-)` keeps the bare screen-clear alias but stops matching `Clear-Content`/`Clear-Item`/
   // `Clear-RecycleBin` etc. (the `-` was a word boundary), which truncate/erase and must not auto-approve.
-  /^\s*(gci|gc|ls|dir|cat|type|pwd|gl|gi|gm|gps|gsv|select|where|sort|measure|echo|cls|clear(?:-host)?(?!-)|fl|ft|fw|sls)\b/i,
+  /^\s*(gci|gc|ls|dir|cat|type|pwd|gl|gi|gm|gps|gsv|select|where|sort|measure|echo|cls|clear(?:-host)?|fl|ft|fw|sls)(?![\w-])/i,
   // Navigation / harmless builtins.
   /^\s*(cd|Set-Location|Push-Location|Pop-Location)\b/i,
   // Version / environment introspection.
@@ -2511,7 +2535,7 @@ function poshProducerSecretRead(seg) {
     const toks = tokenizeArgs(stages[k]);
     if (!/^(?:Get-Item|gi|Get-ChildItem|gci|ls|dir|Resolve-Path)$/i.test(toks[0] || '')) continue;
     if (!toks.slice(1).some((t) => SECRET_TOKENS_RE.test(t) || scan.globHitsSecret(t) === 'secret')) continue;
-    if (/^\s*(?:Select-String|sls|Get-Content|gc|cat|type|%|ForEach-Object)\b/i.test(stages[k + 1])) return 'Reading a sensitive file through a file object blocked';
+    if (/^\s*(?:Select-String|sls|Select-Xml|Get-Content|gc|cat|type|%|ForEach-Object)\b/i.test(stages[k + 1])) return 'Reading a sensitive file through a file object blocked';
   }
   return null;
 }
@@ -2730,10 +2754,15 @@ function hasExecFlag(toks) {
   const known = (t, k, a) => w === 'tar' && (COMPRESSOR.test((/^--use-compress-program=(.*)$/.exec(t) || [])[1] || '') ||
     (t === '-I' && COMPRESSOR.test(a[k + 1] || '')));
   if (re && toks.slice(1).some((t, k, a) => re.test(t) && !known(t, k, a))) return true;
+  if (w === 'less' && toks.slice(1).some((t) => t.startsWith('+'))) return true;
+  if (w === 'tar' && toks[1] && !toks[1].startsWith('-') && /[IF]/.test(toks[1]) && !COMPRESSOR.test(toks[2] || '')) return true;
+  if (w === 'tmux' && toks.slice(1).some((t) => /;$/.test(t))) return true;
   if (w === 'git') {
     const rest = toks.slice(1).filter((t, i, a) => !(t === '-C' || a[i - 1] === '-C'));
     if (rest[0] === 'rebase' && rest.some((t) => /^-[A-Za-z]*x/.test(t))) return true;
     if (rest[0] === 'bisect' && rest[1] === 'run') return true;
+    // fetch / pull / clone / ls-remote: `-u <cmd>` is --upload-pack.
+    if (/^(?:fetch|pull|clone|ls-remote)$/.test(rest[0]) && rest.some((t) => /^-[A-Za-z]*u/.test(t))) return true;
   }
   return false;
 }
@@ -2999,6 +3028,7 @@ function poshScan(seg) {
   };
   for (let i = 0; i < seg.length; i++) {
     const c = seg[i];
+    if (/[\u2018-\u201E]/.test(c)) return null;   // PowerShell reads typographic quotes as quotes: not modelled
     if (c === '`') { cur += c + (seg[i + 1] || ''); i++; continue; }
     if (q === "'") { if (c === "'") q = null; cur += c; continue; }
     if (q === '"') {
@@ -3012,6 +3042,7 @@ function poshScan(seg) {
     if (c === "'" || c === '"') { q = c; cur += c; continue; }
     if (c === '@' && (seg[i + 1] === "'" || seg[i + 1] === '"')) return null;   // here-string: not modelled
     if (c === '#' && (i === 0 || /[\s;|(){}]/.test(seg[i - 1]))) return null;   // comment: not modelled
+    if (c === '<' && seg[i + 1] === '#') return null;                              // block comment: not modelled
     if (c === '(' || c === '{') {
       const e = group(i); if (e < 0) return null;
       groups.push(seg.slice(i + 1, e)); cur += c + CLOSE[c]; i = e; continue;
@@ -3921,6 +3952,16 @@ function ghApiWrites(toks) {
 const NAME_ONLY = /^(?:echo|printf|ls|test|\[|touch|mkdir|stat|basename|dirname|realpath|find|rm|chmod|chown|git|gh|grep|rg|true|cd|pwd|which|type|npm|pnpm|yarn|bun|cargo|make|go|docker|kubectl)$/;
 const MESSAGE_FLAG = /^(?:-m|--message|--body|--title|-t|-b|--notes|-F)$/;
 function secretArg(words, w0) {
+  const named = (w) => w && w.lit && (SECRET_TOKENS_RE.test(w.text) || scan.globHitsSecret(w.text));
+  // grep names a secret as a pattern freely, but `-f FILE` and `--include=FILE` read FILE.
+  if (/^(?:grep|egrep|fgrep|rg)$/.test(w0)) {
+    for (let k = 1; k < words.length; k++) {
+      const t = words[k].text;
+      if (/^(?:-[A-Za-z]*f|--file)$/.test(t) && named(words[k + 1])) return true;
+      if (/^--(?:file|include|glob)=/.test(t) && named({ lit: words[k].lit, text: t.replace(/^[^=]*=/, '') })) return true;
+      if (/^(?:--include|--glob|-g)$/.test(t) && named(words[k + 1])) return true;
+    }
+  }
   if (NAME_ONLY.test(w0) && !(w0 === 'git' && /^(?:diff|show|log|blame|cat-file|grep|archive)$/.test((words.find((w, k) => k > 0 && !w.text.startsWith('-')) || {}).text || ''))) return false;
   let skip = PROGRAM_ARG_VERBS.has(w0);
   // The last operand of cp / mv / install is the destination: `cp .env.example .env` writes it.
@@ -3932,7 +3973,8 @@ function secretArg(words, w0) {
     if (MESSAGE_FLAG.test(w.text)) { k++; continue; }
     if (w.text.startsWith('-') && !/=/.test(w.text)) continue;
     if (skip) { skip = false; continue; }
-    if (w.lit && (SECRET_TOKENS_RE.test(w.text) || scan.globHitsSecret(w.text))) return true;
+    const t = w.text.startsWith('-') ? w.text.replace(/^-[^=]*=/, '') : w.text;   // --include=.env
+    if (w.lit && (SECRET_TOKENS_RE.test(t) || scan.globHitsSecret(t))) return true;
   }
   return false;
 }
@@ -4002,7 +4044,7 @@ function hasUnresolvedRead(seg, idx) {
 // is the set POSH_DENY_PATTERNS already gates; `Get-ChildItem`/`ls` only list a directory
 // and stay approvable, as they do on the bash side.
 const POSH_READ_VERB =
-  /^\s*(?:Get-Content|gc|cat|type|more|Select-String|sls|findstr|Format-Hex|Import-Csv|Import-Clixml|Get-Item(?:Property)?|Get-Random)\b/i;
+  /^\s*(?:Get-Content|gc|cat|type|more|Select-String|sls|Select-Xml|findstr|Format-Hex|Import-Csv|Import-Clixml|Get-Item(?:Property)?|Get-Random)\b/i;
 
 function hasUnresolvedPoshRead(seg, idx) {
   if (!POSH_READ_VERB.test(seg)) return false;
