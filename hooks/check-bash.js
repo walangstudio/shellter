@@ -2380,6 +2380,7 @@ function isSafeRelativePath(p) {
   if (/(^|[\\\/])(id_rsa|id_ed25519|id_ecdsa|id_dsa|known_hosts|authorized_keys)(\.pub)?$/i.test(p)) return false;
   if (/\.(bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc|config\.fish|env|pem|key|crt|secret|credentials|pgpass|netrc|npmrc|p12|pfx|jks)$/i.test(p)) return false;
   if (/(^|[\\\/])\.ssh([\\\/]|$)|(^|[\\\/])\.gnupg([\\\/]|$)|(^|[\\\/])\.aws([\\\/]|$)|(^|[\\\/])\.gcloud([\\\/]|$)|(^|[\\\/])\.azure([\\\/]|$)|(^|[\\\/])\.docker[\\\/]config|(^|[\\\/])\.gitconfig$|(^|[\\\/])\.git-credentials$|(^|[\\\/])\.git[\\\/]hooks([\\\/]|$)/i.test(p)) return false;
+  if (/(^|[\\\/])\.claude[\\\/]settings[^\\\/]*\.json$|(^|[\\\/])(?:\.git|\.husky|node_modules)[\\\/]|(^|[\\\/])\.envrc$|(^|[\\\/])shellter-trust\.json$/i.test(p)) return false;
   if (/(^|[\\\/])\.github[\\\/]workflows[\\\/]|\.gitlab-ci\.yml$|(^|[\\\/])\.circleci[\\\/]config|(^|[\\\/])Jenkinsfile$|\.drone\.yml$|\.azure-pipelines\.yml$|\.woodpecker\.yml$|buildkite\.yml$/i.test(p)) return false;
   return true;
 }
@@ -3581,6 +3582,44 @@ function expansions(text, vals) {
 
 // ---- approve one simple command from its argv ----
 const sub0 = (words, at) => words.slice(at);
+// W-1: write targets read off the AST. Each output-redirect target and each file operand of a
+// writing command is resolved against the working directory (a literal `cd` is followed; after a
+// computed one, a relative operand counts by its base name). shellter's own store and installed
+// files deny; Claude Code settings and shell rc files ask.
+const WRITE_OPERANDS = /^(?:tee|cp|mv|install|ln|rsync|dd|truncate|sed|rm|chmod)$/;
+const RC_BASE = /^\.(?:bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc)$|^config\.fish$/i;
+function protectedWrite(p, baseOnly) {
+  const c = p.replace(/\\/g, '/').toLowerCase();
+  const b = c.replace(/^.*\//, '');
+  let store = '';
+  try { store = trust.trustStorePath().replace(/\\/g, '/').toLowerCase(); } catch (_) { /* no home */ }
+  if ((store && c === store) || /\/\.claude\/shellter-trust\.json$/.test(c) || (baseOnly && b === 'shellter-trust.json')) return 'deny';
+  if (/\/\.claude\/(?:hooks|plugins)\/(?:.*\/)?(?:check-bash|check-sensitive-files|scan-content|shellter-(?:trust|scan))\.js$/.test(c) ||
+      /\/\.claude\/hooks\/package\.json$/.test(c) || /\/\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^/]+\/)*shellter\//.test(c)) return 'deny';
+  if (/(?:^|\/)\.claude\/settings(?:\.local)?\.json$/.test(c) || RC_BASE.test(b)) return 'ask';
+  return null;
+}
+function writeTargets(st, vals) {
+  const out = [];
+  for (const r of st.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>)$/.test(r.op)) out.push(r.target);
+  const w0 = st.words.length && st.words[0].lit ? base(st.words[0].text) : '';
+  if (WRITE_OPERANDS.test(w0) && (w0 !== 'sed' || st.words.some((w) => /^-[A-Za-z]*i|^--in-place/.test(w.text)))) {
+    // cp / mv / install / ln / rsync write only their destination: the last operand or -t DIR.
+    const destOnly = /^(?:cp|mv|install|ln|rsync)$/.test(w0);
+    const ops = [];
+    for (let k = 1; k < st.words.length; k++) {
+      const w = st.words[k];
+      if (w0 === 'dd') { const m = /^of=(.*)$/.exec(w.text); if (m) out.push({ text: m[1], lit: w.lit }); continue; }
+      if (destOnly && (w.text === '-t' || w.text === '--target-directory') && st.words[k + 1]) { out.push(st.words[++k]); continue; }
+      if (destOnly && /^--target-directory=/.test(w.text)) { out.push({ text: w.text.slice(19), lit: w.lit }); continue; }
+      if (!w.text.startsWith('-')) ops.push(w);
+    }
+    if (destOnly) { if (ops.length > 1) out.push(ops[ops.length - 1]); } else out.push(...ops);
+  }
+  const res = [];
+  for (const w of out) for (const t of (w.lit ? [w.text] : subst(w.text, vals) || [])) res.push(t);
+  return res;
+}
 function heredocTargetsUnsafe(node) {
   if (!node.redirs.some((r) => r.heredoc)) return false;
   const bad = (w) => !w.lit || !isSafeRelativePath(w.text) || scan.isAgentInstructionFile(w.text);
@@ -4299,6 +4338,39 @@ if (MAIN) process.stdin.on('end', () => {
   };
   structuralPass('hard');
 
+  // W-1 on the AST: deny in the hard phase, ask in the ask phase.
+  const writePass = (mode) => {
+    if (!ast) return;
+    let dir = cwd, known = true;
+    const home = safeHomedir();
+    walk(ast, hostSeed(), (p, v) => {
+      for (const st of p.stages) {
+        if (st.type !== 'simple' || !st.words.length) continue;
+        if (st.words[0].text === 'cd' && p.stages.length === 1) {
+          const a = st.words[1];
+          const t = a ? (a.lit ? [a.text] : subst(a.text, v)) : [home];
+          if (t && t.length === 1) dir = path.resolve(dir, t[0].replace(/^~(?=\/|$)/, home)); else known = false;
+          continue;
+        }
+        for (const t of writeTargets(st, v)) {
+          const abs = path.resolve(dir, t.replace(/^~(?=[\\/]|$)/, home));
+          let hit = protectedWrite(abs, !known && !/^[~\\/]|^[A-Za-z]:/.test(t));
+          const last = t.replace(/^.*[\\/]/, '');
+          if (!hit && /[*?[]/.test(last)) {   // a glob operand: test it against the protected names
+            const rx = scan.globComponentRe(last);
+            for (const n of ['shellter-trust.json', 'settings.json', 'settings.local.json', 'package.json', '.bashrc', '.zshrc', '.profile']) {
+              if (rx && rx.test(n)) hit = hit || protectedWrite(path.join(path.dirname(abs), n));
+            }
+          }
+          if (hit === 'deny' && mode === 'hard') deny('Writing shellter\'s own trust store or installed files blocked', t);
+          if (hit === 'ask' && mode === 'ask') ask('Writing Claude Code settings or a shell rc file -- approve only if intended', t);
+        }
+      }
+      return true;
+    }, false);
+  };
+  writePass('hard');
+
   // Injection scan for shell-redirected writes (bash-only), per pipe stage so a
   // later-stage `echo … > f` (or a trailing `| cat`) is still seen. deny()+exit on a hit.
   if (!isPosh) {
@@ -4321,6 +4393,16 @@ if (MAIN) process.stdin.on('end', () => {
       audit('fallthrough', 'script-scan-threw: ' + (err && err.message), seg);
     }
   }
+  if (ast) {
+    walk(ast, hostSeed(), (p) => {
+      for (const st of p.stages) {
+        if (st.type !== 'simple' || !st.words.length) continue;
+        const text = st.words.map(canonWord).join(' ');
+        try { checkSegmentScript(text, rawCmd, cwd, false, approvedScriptSegs); } catch (err) { if (!(err instanceof Error)) throw err; noteGap('script-scan'); }
+      }
+      return true;
+    }, false);
+  }
 
   // Tier-2 ask pass: dev-workflow guards (sudo / git push / DROP TABLE / ...)
   // surface for in-session approval. Runs after hard deny + script scan so those
@@ -4330,6 +4412,7 @@ if (MAIN) process.stdin.on('end', () => {
   }
   viewPass('ask');
   structuralPass('ask');
+  writePass('ask');
   // A heredoc body is a whole program: the python -c RCE/socket rules apply, but as an ask
   // (`import socket`, `model.eval()` are routine there and a wrong deny is unappealable), and the
   // dual-use stdlib asks (subprocess, os.remove) are skipped -- a script touching files is normal.
