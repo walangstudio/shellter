@@ -54,7 +54,7 @@ function mapTool(tool, args) {
     case "apply_patch":
       return patchWrites(a.patchText ?? a.patch ?? a.input ?? "");
     case "grep":
-      return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
+      return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "", glob: a.include ?? a.glob ?? "" } };
     case "glob":
       return { hook: FILE_HOOK, name: "Glob", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
     default:

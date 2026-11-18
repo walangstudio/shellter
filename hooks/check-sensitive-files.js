@@ -204,6 +204,8 @@ const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|googl
 // trust or switching shellter off. The dev repo's `hooks/` (no `.claude` segment) is not matched,
 // and a fixture that merely shares the store's file name is not the store (see isTrustStore).
 const SHELLTER_SELF = /(^|\/)\.claude\/shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|shellter-(?:trust|scan))\.js$/i;
+// The plugin's installed copy: a write anywhere in it can switch shellter off.
+const SHELLTER_PLUGIN_CACHE = /(^|\/)\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^\/]+\/)*shellter\//i;
 // Allow rules and hooks live here. The user edits it too, so ask, never deny.
 const CLAUDE_SETTINGS = /(^|\/)\.claude\/settings(?:\.local)?\.json$/i;
 // The user's own shell history and Claude config: plausibly holds a pasted token, but
@@ -298,6 +300,7 @@ function pathMatchesAnySensitive(p) {
 let data = '';
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 let pendingAsk = null;   // a dual-use content signal, emitted only after every deny check
+let writtenText = '';    // the new text of a write tool, for target rules that depend on it
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', chunk => { data += chunk; });
 process.stdin.on('end', () => {
@@ -324,6 +327,7 @@ process.stdin.on('end', () => {
       const edits = input?.tool_input?.edits;
       content = Array.isArray(edits) ? edits.map(e => str(e && e.new_string)).join('\n') : '';
     }
+    writtenText = content;
     const filePath = tool === 'NotebookEdit'
       ? (input?.tool_input?.notebook_path || input?.tool_input?.file_path || '')
       : (input?.tool_input?.file_path || '');
@@ -456,7 +460,8 @@ process.stdin.on('end', () => {
     if (reason) {
       deny('Access to sensitive file/path blocked: ' + reason, p);
     }
-    if (WRITE_TOOLS.has(tool) && (SHELLTER_SELF.test(p) || isTrustStore(p))) {
+    if (WRITE_TOOLS.has(tool) && (SHELLTER_SELF.test(p) || isTrustStore(p) || SHELLTER_PLUGIN_CACHE.test(p) ||
+        (/(^|\/)\.claude\/hooks\/package\.json$/i.test(p) && /"type"\s*:\s*"module"/.test(writtenText)))) {
       deny('Writing shellter\'s own trust store or hooks blocked', p);
     }
     if (WRITE_TOOLS.has(tool) && CLAUDE_SETTINGS.test(p)) {

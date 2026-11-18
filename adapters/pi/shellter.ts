@@ -55,7 +55,7 @@ function mapTool(toolName: string, input: any) {
       // an edit-like tool that delivers new text directly instead of in an edits array.
       return { hook: FILE_HOOK, name: "Edit", input: { file_path: a.path ?? "", new_string: Array.isArray(a.edits) ? a.edits.map((e: any) => e?.newText ?? "").join("\n") : (a.newText ?? a.new_string ?? a.content ?? "") } };
     case "grep":
-      return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
+      return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "", glob: a.glob ?? a.include ?? "" } };
     case "find":
       return { hook: FILE_HOOK, name: "Glob", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
     default:

@@ -239,7 +239,7 @@ function checkHooksManifest(rel, text, add) {
 
 // A bare tool name grants EVERY invocation of it -- `"Bash"` is broader than `"Bash(*)"`
 // is explicit about. Matching only the parenthesised form missed the actual blanket grant.
-const WILDCARD_ALLOW = /^(?:\*|[A-Za-z]+(?:\(\s*(?:\*\*?|:\*)\s*\))?)$/;
+const WILDCARD_ALLOW = /^(?:\*|[A-Za-z]+(?:\(\s*(?:\*\*?|:\*|\*\s*:\s*\*|\*\s+\*)\s*\))?)$/;
 
 function checkSettings(rel, text, add) {
   let obj;
@@ -266,10 +266,10 @@ function checkSettings(rel, text, add) {
   }
 }
 
-function checkMcpConfig(rel, text, add) {
-  let obj;
-  try { obj = JSON.parse(text); } catch { return; }
-  const servers = obj && (obj.mcpServers || obj.servers);
+function checkMcpConfig(rel, text, add, parsed) {
+  let obj = parsed;
+  if (!obj) { try { obj = JSON.parse(text); } catch { return; } }
+  const servers = obj && (obj.mcpServers || obj.servers || obj.lspServers);
   if (!servers || typeof servers !== 'object') return;
   for (const [name, s] of Object.entries(servers)) {
     if (!s || typeof s !== 'object') continue;
@@ -279,6 +279,13 @@ function checkMcpConfig(rel, text, add) {
     if (/\b(?:npx|bunx|pnpm\s+dlx|uvx|pipx\s+run)\b/.test(argv) && !/@\d|==\d/.test(argv)) {
       add({ rule: 'SC1', severity: 'medium', file: rel,
             detail: 'MCP server "' + name + '" runs an unpinned package: ' + argv.slice(0, 120) });
+    }
+    // A loader option in the server's environment runs code before the server does.
+    const env = s.env && typeof s.env === 'object' ? s.env : {};
+    for (const [k, v] of Object.entries(env)) {
+      if (typeof v === 'string' && ((k === 'NODE_OPTIONS' && /--(?:require|import|loader|experimental-loader)\b|(?:^|\s)-r\b/.test(v)) || /^(?:LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|PYTHONSTARTUP)$/.test(k))) {
+        add({ rule: 'SC3', severity: 'high', file: rel, detail: 'MCP server "' + name + '" loads code through ' + k });
+      }
     }
     const sh = scan.scanShell(argv, { decode: true }).filter((f) => f.severity === 'high');
     if (sh.length) add({ rule: 'SC3', severity: 'high', file: rel, detail: 'MCP server "' + name + '" command: ' + sh[0].signal });
@@ -438,6 +445,18 @@ function scanBundle(root) {
         const tr = readText(target);
         if (tr.text !== undefined) checkHooksManifest(trel, tr.text, add);
         else noteGap('hooks file unreadable: ' + trel);
+      }
+      // Inline or referenced MCP / LSP servers run commands like .mcp.json does.
+      for (const key of ['mcpServers', 'lspServers']) {
+        const v = obj && obj[key];
+        if (v && typeof v === 'object') checkMcpConfig(rel, '', add, { mcpServers: v });
+        else if (typeof v === 'string') {
+          const target = path.resolve(path.dirname(file), v);
+          const trel = path.relative(root, target).replace(/\\/g, '/');
+          if (trel.startsWith('..') || path.isAbsolute(trel)) { noteGap(key + ' path outside the bundle: ' + v); continue; }
+          const tr = readText(target);
+          if (tr.text !== undefined) checkMcpConfig(trel, tr.text, add); else noteGap(key + ' file unreadable: ' + trel);
+        }
       }
     }
     if (base === 'settings.json' || base === 'settings.local.json') checkSettings(rel, text, add);

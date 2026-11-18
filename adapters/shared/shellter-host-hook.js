@@ -41,8 +41,15 @@ function patchWrites(text) {
   const out = [];
   let cur = null;
   for (const line of String(text).split('\n')) {
-    const h = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$/.exec(line);
-    if (h) { cur = { hook: FILE_HOOK, name: 'Write', input: { file_path: h[1], content: '' } }; out.push(cur); continue; }
+    // `*** Add|Update|Delete File:` (indented or not), the rename target `*** Move to:`, and a
+    // unified diff's `+++ b/path` all name a file the patch writes.
+    const h = /^\s*\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+?)\s*$/.exec(line) || /^\+\+\+ (?:b\/)?(.+?)\s*$/.exec(line);
+    if (h) {
+      const moved = /Move to:/.test(line) && cur;
+      cur = { hook: FILE_HOOK, name: 'Write', input: { file_path: h[1], content: moved ? cur.input.content : '' } };
+      out.push(cur);
+      continue;
+    }
     if (cur && line.startsWith('+')) cur.input.content += line.slice(1) + '\n';
   }
   return out;
@@ -56,20 +63,25 @@ function mapTool(ev) {
   const lname = toolName.toLowerCase();
   // A string payload is the patch or command text itself.
   const args = typeof rawArgs === 'string' ? { patch: rawArgs, command: rawArgs } : rawArgs;
+  // codex runs apply_patch through its shell tool as an argv: ["apply_patch", "<patch>"].
+  if (Array.isArray(args.command) && /^apply_?patch$/i.test(String(args.command[0])) && typeof args.command[1] === 'string') {
+    const w = patchWrites(args.command[1]);
+    if (w.length) return w;
+  }
 
   // Write-shaped names first: `search_replace` is a write, and a patch tool may carry its blob
   // in `command`.
   const isWrite = /(write_to_file|write_file|file_write|str_replace|search_replace|replace_file_content|multi_replace|create_file|update_file|apply_patch|save_file|edit_file|multiedit|^patch$|^write$|^edit$|^replace$)/.test(lname);
   if (isWrite) {
     const blob = first(args.patch, args.patchText, args.input, args.changes, args.command);
-    if (typeof blob === 'string' && /^\*\*\* (?:Begin Patch|(?:Add|Update|Delete) File:)/m.test(blob)) {
+    if (typeof blob === 'string' && /^\s*\*\*\* (?:Begin Patch|(?:Add|Update|Delete) File:)|^\+\+\+ /m.test(blob)) {
       const w = patchWrites(blob);
       if (w.length) return w;
     }
     const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.AbsolutePath, args.filePath, args.TargetFile, '') || '');
     // Pull the attacker-influenced new text from whatever shape the host uses.
     // agy/Cascade write tools use PascalCase CodeContent / CodeEdit / ReplacementChunks.
-    let content = first(args.content, args.new_content, args.new_string, args.newText, args.newString, args.text, args.CodeContent, args.CodeEdit);
+    let content = first(args.content, args.new_content, args.new_string, args.newText, args.newString, args.new_str, args.file_text, args.code_edit, args.code, args.text, args.CodeContent, args.CodeEdit);
     const joinNew = (list) => list.map((e) => first(e && (e.newText || e.new_string || e.newString || e.content || e.ReplacementContent), '')).join('\n');
     if (content === undefined && Array.isArray(args.edits)) content = joinNew(args.edits);
     if (content === undefined && Array.isArray(args.replacements)) content = joinNew(args.replacements);
@@ -89,8 +101,9 @@ function mapTool(ev) {
 
   // Native file-READ tools (agy/Cascade view_file uses PascalCase AbsolutePath).
   // Without this, an agent reads .env via its own read tool, bypassing the shell rules.
-  const isRead = /(^|[_-])(view_file|read_file|cat_file|open_file|view|read|view_code_item|view_line_range|view_content_chunk)([_-]|$)/.test(lname);
+  const isRead = /(^|[_-])(view_file|read_file|readfile|read_many_files|cat_file|open_file|view|read|view_code_item|view_line_range|view_content_chunk)([_-]|$)/.test(lname);
   if (isRead) {
+    if (Array.isArray(args.paths)) return args.paths.filter((p) => typeof p === 'string' && p).map((file_path) => ({ hook: FILE_HOOK, name: 'Read', input: { file_path } }));
     const file_path = String(first(args.path, args.file_path, args.AbsolutePath, args.absolute_path, args.filePath, args.target_file, args.TargetFile, '') || '');
     if (!file_path) return [];
     return [{ hook: FILE_HOOK, name: 'Read', input: { file_path } }];
@@ -101,7 +114,10 @@ function mapTool(ev) {
     const pattern = String(first(args.pattern, args.query, args.Query, args.q, '') || '');
     const p = String(first(args.path, args.SearchDirectory, args.search_path, args.SearchPath, args.directory, '') || '');
     if (!pattern && !p) return [];
-    return [{ hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p } }];
+    // The file filter selects what gets read: pass every include glob through.
+    const globs = [].concat(first(args.glob, args.include, args.Includes, args.includes, []) || []).filter((g) => typeof g === 'string' && g);
+    return globs.length ? globs.map((glob) => ({ hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p, glob } }))
+      : [{ hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p } }];
   }
 
   const isFind = /(^|[_-])(find|find_by_name|glob)([_-]|$)/.test(lname);
@@ -128,6 +144,8 @@ function runHook(hook, name, input, cwd) {
     // does not throw. Only a thrown failure lands here, so warn loudly (still fall
     // open per shellter's never-brick-the-host policy) so the gap is diagnosable.
     process.stderr.write('[shellter] detector did NOT run (' + ((e && (e.code || e.message)) || 'unknown') + ') -- command NOT screened: ' + hook + '\n');
+    // agy honours ask: a detector that timed out asks there instead of failing open.
+    if (host === 'agy' && e && e.code === 'ETIMEDOUT') return JSON.stringify({ hookSpecificOutput: { permissionDecision: 'ask', permissionDecisionReason: 'shellter could not finish checking this call in time' } });
     return '';
   }
 }

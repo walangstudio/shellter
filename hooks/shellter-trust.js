@@ -22,11 +22,23 @@ const TRUST_SCAN_BYTES = 256 * 1024;
 
 // SHELLTER_TRUST_FILE counts only as an absolute path outside the working directory: a
 // relative one (or one inside the repo) would let a cloned repo ship its own trust store.
+// SHELLTER_TRUST_FILE counts only as an absolute path outside the working directory and outside
+// any git checkout: a relative one, or one a repo ships (from any subdirectory), would let a cloned
+// repo bring its own trust store.
+function insideGitCheckout(p) {
+  for (let d = path.dirname(p), i = 0; i < 64; i++) {
+    if (fs.existsSync(path.join(d, '.git'))) return true;
+    const up = path.dirname(d);
+    if (up === d) return false;
+    d = up;
+  }
+  return true;
+}
 function trustStorePath() {
   const env = process.env.SHELLTER_TRUST_FILE;
   if (env && path.isAbsolute(env)) {
     const rel = path.relative(process.cwd(), env);
-    if (rel.startsWith('..') || path.isAbsolute(rel)) return env;
+    if ((rel.startsWith('..') || path.isAbsolute(rel)) && !insideGitCheckout(env)) return env;
   }
   return path.join(os.homedir(), '.claude', 'shellter-trust.json');
 }
@@ -131,8 +143,8 @@ function claudeAllowRules(cwd, toolName) {
   for (let i = 0; i < 40; i++) {
     // Only settings.local.json (user-authored, where "don't ask again" lands) is honored for
     // script-flag suppression -- NOT the committed project settings.json, which a cloned
-    // malicious repo controls. A settings.local.json the repo COMMITS is ignored too
-    // (checked lazily, see localRulesTracked).
+    // malicious repo controls. A settings.local.json the repo commits is ignored too
+    // (checked lazily, see localRulesHonoured).
     collectAllow(path.join(dir, '.claude', 'settings.local.json'), toolName, rules, dir);
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -147,20 +159,27 @@ function claudeAllowRules(cwd, toolName) {
   return rules;
 }
 
-// git-tracked = shipped by the repo, not written by this user. Runs only when a rule from that
-// file actually matches a flagged script, so the hot path never spawns git. No git / not a
-// repo -> not tracked (honoured).
-const _tracked = new Map();
-function localRulesTracked(dir) {
-  if (!_tracked.has(dir)) {
-    let tracked = false;
+// A project's settings.local.json is honoured only when git positively says the repo does not
+// ship it: exit 0 and no entry, for the file in any letter case (the file system is case-
+// insensitive on Windows and macOS) and for `.claude` itself (a tracked symlink or submodule).
+// No git, not a repo, a timeout, or GIT_* steering the call elsewhere -> not honoured. Runs only
+// when a rule from that file matches a flagged script, so the hot path never spawns git.
+const _honoured = new Map();
+function localRulesHonoured(dir) {
+  if (!_honoured.has(dir)) {
+    let ok = false;
     try {
-      const r = require('child_process').spawnSync('git', ['-C', dir, 'ls-files', '--error-unmatch', '.claude/settings.local.json'], { stdio: 'ignore', timeout: 2000 });
-      tracked = r.status === 0;
+      const env = {};
+      for (const [k, v] of Object.entries(process.env)) if (!/^GIT_/i.test(k)) env[k] = v;
+      const ls = (spec) => require('child_process').spawnSync('git', ['-C', dir, 'ls-files', '-z', '--', spec], { env, encoding: 'utf8', timeout: 2000 });
+      const file = ls(':(icase).claude/settings.local.json');
+      const top = ls(':(icase).claude');
+      ok = file.status === 0 && file.stdout === '' && top.status === 0 &&
+        !top.stdout.split('\0').some((e) => e.toLowerCase() === '.claude');
     } catch { /* no git */ }
-    _tracked.set(dir, tracked);
+    _honoured.set(dir, ok);
   }
-  return _tracked.get(dir);
+  return _honoured.get(dir);
 }
 
 // `cmd` is one command segment. `exactOnly` is for the whole compound command line: a `:*`
@@ -180,7 +199,7 @@ function commandAllowed(cmd, cwd, toolName, exactOnly) {
     } else {
       hit = c === inner;
     }
-    if (hit && !(dir && localRulesTracked(dir))) return true;
+    if (hit && (!dir || localRulesHonoured(dir))) return true;
   }
   return false;
 }
