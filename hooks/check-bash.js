@@ -2482,6 +2482,7 @@ function isSafeHeredocInvocation(rawCmd) {
     if (scan.isAgentInstructionFile(writeTarget)) {
       const medInj = inj.find(f => f.severity === 'medium' && f.category === 'injection');
       if (medInj) deny('Prompt injection in heredoc-written agent-instruction file: ' + medInj.signal, body);
+      if (inj.some(f => f.signal === 'instruction-override-quoted')) ask('Quoted instruction-override phrase in a heredoc-written agent-instruction file', body);
     }
   }
 
@@ -4342,6 +4343,7 @@ function scanShellRedirectInjection(seg) {
   if (scan.isAgentInstructionFile(target)) {
     const med = inj.find(f => f.severity === 'medium' && f.category === 'injection');
     if (med) deny('Prompt injection redirected into an agent-instruction file: ' + med.signal, seg);
+    if (inj.some(f => f.signal === 'instruction-override-quoted')) ask('Quoted instruction-override phrase redirected into an agent-instruction file', seg);
   }
 }
 

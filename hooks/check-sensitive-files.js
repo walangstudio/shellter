@@ -405,6 +405,8 @@ process.stdin.on('end', () => {
           if (med) {
             deny('Prompt injection in agent-instruction file: ' + med.signal + (med.line ? ' (line ' + med.line + ')' : ''), filePath);
           }
+          const q = inj.find(f => f.signal === 'instruction-override-quoted');
+          if (q) pendingAsk = pendingAsk || { reason: 'Quoted instruction-override phrase in an agent-instruction file' + (q.line ? ' (line ' + q.line + ')' : ''), snippet: filePath };
         }
       }
     }

@@ -73,8 +73,10 @@ every pipe stage and every `( )`, `$( )` and `{ }` body must approve, `2>&1` is 
   path, or `execute curl`.
 - A literal ESC colour sequence asks in source files and denies only in instruction files.
 - On instruction files, `<system>` tags, `User:`/`Assistant:` examples, persona phrasing, "you are
-  now a ...", an override phrase quoted in inline code, a fenced block, a blockquote or after an
-  opening quote, and an HTML comment holding a link or "token" are advisory.
+  now a ...", and an HTML comment holding a link or "token" are advisory. An override phrase quoted
+  in inline code, a fenced block, a blockquote or after an opening quote asks there instead of
+  denying (silent in bypass and auto mode); in any other file it is advisory. A bare phrase still
+  denies, and an override with an exfil target denies everywhere.
 - Grep denies a token-shape regex (a token prefix followed by regex syntax: `AKIA[`, `AKIA.{16}`,
   `gh[pousr]_[`, `xoxb-[`, `BEGIN ... PRIVATE KEY`) or a
   `password\s*=` search only over a broad path: a filesystem or drive root, a home root, an ancestor
@@ -146,7 +148,7 @@ through; tool shapes are best-effort.
   loops and conditionals whose body approves, `[ ]`, subshells, commit and PR heredocs, variables over
   known paths). In that replay no benign command went to deny, and no PowerShell row moved untriaged. The reviewers' probes are pinned as tests.
 
-1919 tests in test-hooks.js (one POSIX-only), 43 shim checks, 33 bun adapter checks (opencode 18, pi 15).
+1923 tests in test-hooks.js (one POSIX-only), 43 shim checks, 33 bun adapter checks (opencode 18, pi 15).
 
 ## [0.10.0] - 2026-09-30
 

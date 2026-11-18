@@ -157,7 +157,7 @@ are part of the suite (`test-probes.js`).
 | M-4 heredoc fast path writes `.git/`, `.husky/`, `.claude/settings*.json` | allow | fallthrough / ask |
 | F M-2 Glob `**/*credential*`, `**/*id*` | deny | fallthrough; literal secret stems still deny |
 | F M-4 path lists exhausting the decode budget | ask | fallthrough |
-| F M-9 quoted override phrase in `SKILL.md` | deny | advisory |
+| F M-9 quoted override phrase in `SKILL.md` | deny | ask on instruction files (a quote is one character, so it cannot exempt there); advisory elsewhere |
 
 Measured on the maintainer's command log (5,389 unique commands) against 0d49eac: 56 benign
 auto-approvals (1.7%) now prompt, all in named classes (env prefix, loop or if body, wrapper, python

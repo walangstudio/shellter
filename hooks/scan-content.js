@@ -541,11 +541,15 @@ function scanInjectionText(findings, text, decodedLayer) {
   const allOv = new RegExp(OVERRIDE_RE.source, 'gi');
   for (let ov, k = 0; k < 50 && (ov = allOv.exec(folded)); k++) {
     const window = folded.slice(Math.max(0, ov.index - 200), ov.index + 200);
-    const sev = EXFIL_TARGET_RE.test(window) ? SEVERITY.HIGH
-      : /^you\s+are\s+now/i.test(ov[0]) || isMention(folded, ov.index) ? SEVERITY.LOW : SEVERITY.MEDIUM;
-    if (!best || RANK[sev] > RANK[best.sev]) best = { index: ov.index, sev };
+    const boiler = /^you\s+are\s+now/i.test(ov[0]);
+    const quoted = !boiler && isMention(folded, ov.index);
+    const sev = EXFIL_TARGET_RE.test(window) ? SEVERITY.HIGH : boiler || quoted ? SEVERITY.LOW : SEVERITY.MEDIUM;
+    if (!best || RANK[sev] > RANK[best.sev] || (sev === best.sev && quoted && !best.quoted)) best = { index: ov.index, sev, quoted };
   }
-  if (best) pushFinding(findings, folded, best.index, 'injection', best.sev === SEVERITY.HIGH ? 'override-with-exfil-target' : 'instruction-override', best.sev);
+  // A quoted phrase is reported as its own signal: an agent-instruction file asks on it (a quote
+  // is one character, so it cannot exempt there), everywhere else it is advisory.
+  if (best) pushFinding(findings, folded, best.index, 'injection', best.sev === SEVERITY.HIGH ? 'override-with-exfil-target'
+    : best.sev === SEVERITY.LOW && best.quoted ? 'instruction-override-quoted' : 'instruction-override', best.sev);
 
   // Jailbreak / role-hijack phrases -> Class B (MEDIUM): denied only on an agent-instruction file.
   const rh = ROLE_HIJACK_RE.exec(clean);
