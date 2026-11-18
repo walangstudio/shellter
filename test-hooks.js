@@ -3274,6 +3274,24 @@ console.log('\n--- 0.11.0 r2 step 7: write targets on the AST, script scan from 
   } finally { fs.rmSync(sd, { recursive: true, force: true }); }
 }
 
+console.log('\n--- 0.11.0 r2 step 8: fail-closed PowerShell scan (N8, B H-2, H-3, H-4, H-9) ---');
+{
+  const M = join('node ', 'x.js'), E = join('.e', 'nv');
+  testPosh('N8: a here-string is not modelled', "echo @'\n'\n'@ | " + M + ' #\'', 'fallthrough');
+  testPosh('H-2: a lone CR ends a line', 'Get-ChildItem\r' + M, 'fallthrough');
+  testPosh('H-2: a comment is not modelled', 'Get-ChildItem # list', 'fallthrough');
+  testPosh('H-2 twin: a pipeline allows', 'Get-ChildItem | Select-Object -First 3', 'allow');
+  for (const c of ['echo\\..\\x.cmd', 'type.bat', 'Get-ChildItem.exe', 'ls\\x.exe']) testPosh('H-3: ' + c + ' runs a file, no approve', c, 'fallthrough');
+  testPosh('H-3 twin: echo hi allows', 'echo hi', 'allow');
+  for (const c of ['Get-ChildItem | % Delete', 'Get-Process | ForEach-Object Kill', 'Get-Process x | ForEach-Object -MemberName Kill']) testPosh('H-4: ' + c + ' does not approve', c, 'fallthrough');
+  testPosh('H-4 twin: % { $_.Name } allows', 'Get-ChildItem | % { $_.Name }', 'allow');
+  testPosh('H-4 twin: % Line (a property) allows', "Select-String -Path notes.md -Pattern 'x' | % Line", 'allow');
+  testPosh('H-9: Get-Item .env | Select-String denies', 'Get-Item ' + E + ' | Select-String .', 'deny');
+  testPosh('H-9: Get-Item .env | Get-Content denies', 'Get-Item ' + E + ' | Get-Content', 'deny');
+  testPosh('H-9: a content reader over a group does not approve', 'gc (gci .e*)', 'fallthrough');
+  testPosh('H-9 twin: Get-ChildItem | Select-String allows', 'Get-ChildItem -Recurse -Filter *.ts | Select-String foo', 'allow');
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a

@@ -2131,6 +2131,7 @@ const POSH_DENY_PATTERNS = [
   // Reading sensitive files via PowerShell/cmd (Get-Content/gc/type/Select-String/.NET).
   // Mirrors the bash `cat .env` rule so a PowerShell-shaped read can't slip past it.
   [poshGlobSecretRead, null],
+  [poshProducerSecretRead, null],
   // Variable-provider read: `${C:\proj\.env}` is the file's content.
   [new RegExp('\\$\\{[A-Za-z]+:[\\\\/][^}]{0,256}' + SECRET_TOKENS + '[^}]{0,256}\\}', 'i'), 'Reading sensitive file via the variable provider blocked'],
   [new RegExp('\\b(?:Get-Content|gc|type|more|findstr|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)\\b[^;|]*' + SECRET_TOKENS, 'i'),
@@ -2503,6 +2504,18 @@ function poshDeObfuscate(s) {
 }
 
 // A PowerShell content read whose path is a glob that expands to a secret (`gc .e?v`).
+// `Get-Item .env | Select-String .` reads the file the producer names.
+function poshProducerSecretRead(seg) {
+  const stages = splitPipeStages(seg);
+  for (let k = 0; k + 1 < stages.length; k++) {
+    const toks = tokenizeArgs(stages[k]);
+    if (!/^(?:Get-Item|gi|Get-ChildItem|gci|ls|dir|Resolve-Path)$/i.test(toks[0] || '')) continue;
+    if (!toks.slice(1).some((t) => SECRET_TOKENS_RE.test(t) || scan.globHitsSecret(t) === 'secret')) continue;
+    if (/^\s*(?:Select-String|sls|Get-Content|gc|cat|type|%|ForEach-Object)\b/i.test(stages[k + 1])) return 'Reading a sensitive file through a file object blocked';
+  }
+  return null;
+}
+
 function poshGlobSecretRead(seg) {
   for (const stage of splitPipeStages(seg)) {
     if (!POSH_READ_VERB.test(stage)) continue;
@@ -2966,6 +2979,7 @@ function checkBashApprove(seg, depth, idx) {
 // every top-level group that PowerShell would evaluate, redirect targets, and whether a
 // call/background `&` appears anywhere but the start of a stage. null = unbalanced.
 function poshScan(seg) {
+  if (/\r(?!\n)/.test(seg)) return null;   // a lone CR ends a line for PowerShell
   const stages = [], groups = [], redirs = [];
   let cur = '', q = null, amp = false;
   const CLOSE = { '(': ')', '{': '}' };
@@ -2996,6 +3010,8 @@ function poshScan(seg) {
       cur += c; continue;
     }
     if (c === "'" || c === '"') { q = c; cur += c; continue; }
+    if (c === '@' && (seg[i + 1] === "'" || seg[i + 1] === '"')) return null;   // here-string: not modelled
+    if (c === '#' && (i === 0 || /[\s;|(){}]/.test(seg[i - 1]))) return null;   // comment: not modelled
     if (c === '(' || c === '{') {
       const e = group(i); if (e < 0) return null;
       groups.push(seg.slice(i + 1, e)); cur += c + CLOSE[c]; i = e; continue;
@@ -3028,6 +3044,7 @@ function isSimplePoshExpr(flat) {
   return !/(?:^|[\s,])[A-Za-z_][\w-]*\s*\(\)/.test(b);       // bare word + call parens
 }
 
+const POSH_SAFE_MEMBER = /^(?:Name|FullName|BaseName|Extension|Line|LineNumber|Path|Length|Count|Id|ProcessName|Value|Key|Matches|Directory|DirectoryName|LastWriteTime|CreationTime|Mode|Status|Source|Version|Definition)$/i;
 function checkPoshApprove(seg, depth, idx) {
   if (depth > 6) return false;
   const sc = poshScan(seg);
@@ -3043,6 +3060,17 @@ function checkPoshApprove(seg, depth, idx) {
     const st = sc.stages[k];
     if (k > 0 && /^\s*(?:Get-Content|gc|cat|type|Format-Hex|Import-Csv|Import-Clixml)\b/i.test(st)) return false;   // reads piped paths we cannot see
     if (/@\{\}/.test(st)) return false;                    // hashtable literal: not modelled
+    // The command name must be a plain name: `echo\..\x.cmd`, `type.bat`, `ls\x.exe` run a file.
+    const name = (st.match(/^\s*(\S+)/) || [])[1] || '';
+    if (!/^(?:[A-Za-z][\w-]*|&|%|\?|\$\w+|\(\))$/.test(name)) return false;
+    // ForEach-Object takes script blocks, or a member name that is a known property: `% Delete` /
+    // `-MemberName Kill` invoke a method.
+    if (/^(?:ForEach-Object|%|foreach)$/i.test(name)) {
+      const rest = st.trim().split(/\s+/).slice(1).filter((t) => !/^-MemberName$/i.test(t));
+      if (rest.some((t) => !(t === '{}' || /^-\w+$/.test(t) || POSH_SAFE_MEMBER.test(t)))) return false;
+    }
+    // A content reader whose argument is a group reads paths we cannot see.
+    if (/^(?:Get-Content|gc|cat|type|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)$/i.test(name) && /(?:^|\s)\$?\(\)/.test(st)) return false;
     const body = st.replace(/\.\s*([A-Za-z_]\w*)\s*\(\)/g, (m0, name) => (POSH_SAFE_METHOD.test(name) ? '' : m0));
     if (/\(\)\s*\.\s*[A-Za-z_]\w*\s*\(\)/.test(body)) return false;   // (cmd).Method(): unknown method
     if (!POSH_APPROVE_PATTERNS.some((p) => p.test(st))) return false;
