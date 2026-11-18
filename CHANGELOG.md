@@ -31,8 +31,10 @@ values substituted), which is what makes `cat<.env`, `cat .e$'\x6e'v`, `for f in
 done` and `ls # '` + newline + a denied command deny with no new rule. Not modelled, so never
 auto-approved: `((..))` and `for ((..))`, functions, `select`, `coproc`, `$[ ]`, `;&`, a heredoc
 delimiter that is not a plain word, a backslash or `<<` inside backticks, a lone CR, NUL, more than 64
-nesting levels or 4,096 words. The raw deny passes still run on everything; deny coverage never
-depends on the parser.
+nesting levels or 4,096 words, an unquoted heredoc body line ending in `\`. The parser reads the
+text before line continuations are joined: a backslash-newline in a comment or a quoted heredoc body
+is literal in bash, and joining it had hidden the next line from the approve pass. The raw deny
+passes still run on everything; deny coverage never depends on the parser.
 
 Argument models refuse unknown flags: environment (`ENV_SAFE` names, program variables only with a
 bare word, loaders such as `LD_*`/`BASH_ENV`/`HOME` never, `PATH` only over system or home
@@ -106,7 +108,7 @@ treats any exception as "not parsed" (5,000 and 50,000 nested `$(` answer), argv
 every deny rule returns in under 600 ms on 30 KB of its own prefix and four fixed paddings (a class
 test; the `sed -i` rules took 68 s), the HTML-comment scan reuses its closer (250 KB of openers: under
 2.5 s through the hook, was 30 s), adapter timeouts are 20 s and agy asks when the detector times out,
-a UTF-8 BOM before the hook JSON is accepted, nested argv arrays are flattened, and the installer
+a script path that is a FIFO or device is not opened (it hung the hook until its timeout), a UTF-8 BOM before the hook JSON is accepted, nested argv arrays are flattened, and the installer
 quotes hook paths and refuses to rewrite a settings file that is not a JSON object.
 
 **Scanner coverage.** Instruction surfaces include `.cursor/rules/`, `.opencode/`, `opencode.json`,
@@ -140,7 +142,7 @@ through; tool shapes are best-effort.
   loops and conditionals whose body approves, `[ ]`, subshells, commit and PR heredocs, variables over
   known paths). In that replay no benign command went to deny, and no PowerShell row moved untriaged. The reviewers' probes are pinned as tests.
 
-1874 tests in test-hooks.js (one POSIX-only), 41 shim checks, 33 bun adapter checks (opencode 18, pi 15).
+1887 tests in test-hooks.js (one POSIX-only), 41 shim checks, 33 bun adapter checks (opencode 18, pi 15).
 
 ## [0.10.0] - 2026-09-30
 
