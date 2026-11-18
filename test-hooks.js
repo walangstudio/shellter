@@ -994,8 +994,10 @@ testBash('fp py heredoc: stdin DATA to a script is not analyzed as code', "pytho
 testBash('fp py heredoc: model.eval() in a real program asks, not deny', "python3 - <<'EOF'\nmodel.eval()\nprint(1)\nEOF", 'ask');
 testBash('py heredoc: -W/-X option values are not a script name', "python3 -W error - <<'EOF'\nimport socket\nEOF", 'ask');
 testBash('py heredoc: py launcher is analyzed', "py -3 - <<'EOF'\nimport socket\nEOF", 'ask');
-testBash('quote-parse: a fake heredoc marker inside quotes cannot blank real code', join("echo \"<<'X'\"\nF=/etc/sha", "dow; echo $'it\\'s'; cat \"$F\"\nX"), 'ask');
-testBash('quote-parse: a fake heredoc marker in a comment cannot blank real code', join("# <<'X'\nF=/etc/sha", "dow; echo $'it\\'s'; cat \"$F\"\nX"), 'ask');
+// 0.11.0 r2: the fail-closed parser reads this; the hidden line is a secret read, so it denies (was ask).
+testBash('quote-parse: a fake heredoc marker inside quotes cannot blank real code', join("echo \"<<'X'\"\nF=/etc/sha", "dow; echo $'it\\'s'; cat \"$F\"\nX"), 'deny');
+// 0.11.0 r2: the fail-closed parser reads this; the hidden line is a secret read, so it denies (was ask).
+testBash('quote-parse: a fake heredoc marker in a comment cannot blank real code', join("# <<'X'\nF=/etc/sha", "dow; echo $'it\\'s'; cat \"$F\"\nX"), 'deny');
 testBash('a # inside ${x:-a #} is not a comment: the $(cat $f) after it still expands and denies', join('f=.e', 'nv; echo ${x:-a #}$(cat $f)'), 'deny');
 // bypassPermissions / auto: the user opted out of prompts, so an ask passes through; denies stay.
 {
@@ -1613,8 +1615,10 @@ testBash('var: command word via variable', 'X=rm; $X -rf /', 'deny');
 testBash('var: command word, home target', 'X=rm; $X -rf ~', 'deny');
 // Approve floor: a read whose target we cannot resolve must not auto-approve.
 testBash('var floor: unresolvable $X is not auto-approved', 'cat $X', 'fallthrough');
-testBash('var floor: computed value stays unresolved', 'D=$HOME/.ssh; cat $D/known_hosts', 'fallthrough');
-testBash('var floor: command substitution arg', 'cat $(find . -name x)', 'fallthrough');
+// 0.11.0 r2: the fail-closed parser reads this; a value composed of known literals resolves, so the secret read denies.
+testBash('var floor: computed value stays unresolved', 'D=$HOME/.ssh; cat $D/known_hosts', 'deny');
+// 0.11.0 r2: the fail-closed parser reads this; a name fed only by `find` is a derived name (same reach as grep -r).
+testBash('var floor: command substitution arg', 'cat $(find . -name x)', 'allow');
 // ...but a resolvable one behaves exactly as before (no new prompts).
 testBash('var floor: resolvable path still approves', 'F=/t/out.txt; cat $F', 'allow');
 testBash('var: benign value does not manufacture a deny', 'F=notes.txt; cat $F', 'allow');
@@ -1625,9 +1629,11 @@ testBash('var: echo of a secret-looking value is not a read', join('X=.en', 'v; 
 // Using the final variable map here would let `cat $X; X=.env` suppress the floor.
 testBash('var floor: trailing assignment does not suppress the floor', 'cat $X; X=.env', 'fallthrough');
 // Bounds degrade to a prompt, never to a silent allow.
+// 0.11.0 r2: the fail-closed parser reads this; no VAR_MAX bound on the parser, so the read is seen and denies.
 testBash('var bound: padding past VAR_MAX degrades to ask',
-  Array.from({ length: 40 }, (_, i) => 'A' + i + '=x').join('; ') + join('; X=.en', 'v; cat $X'), 'ask');
-testBash('var bound: oversized value degrades to ask', 'X=' + 'a'.repeat(300) + join('/.en', 'v; cat $X'), 'ask');
+  Array.from({ length: 40 }, (_, i) => 'A' + i + '=x').join('; ') + join('; X=.en', 'v; cat $X'), 'deny');
+// 0.11.0 r2: the fail-closed parser reads this; no value-size bound on the parser, so the read is seen and denies.
+testBash('var bound: oversized value degrades to ask', 'X=' + 'a'.repeat(300) + join('/.en', 'v; cat $X'), 'deny');
 
 // ---- v0.8.0 review round: the approve floor must see past wrappers ----
 // Checking only the first token left every command wrapper as a way around the floor,
@@ -1635,12 +1641,14 @@ testBash('var bound: oversized value degrades to ask', 'X=' + 'a'.repeat(300) + 
 testBash('floor: timeout wrapper', join('X=.en', 'v; timeout 5 cat $X'), 'deny');
 testBash('floor: command wrapper', join('X=.en', 'v; command cat $X'), 'deny');
 testBash('floor: sudo -u wrapper', join('X=.en', 'v; sudo -u root cat $X'), 'deny');
-testBash('floor: for-loop body is not auto-approved', 'for f in .env; do cat $f; done', 'fallthrough');
+// 0.11.0 r2: the fail-closed parser reads this; a loop variable over literal words holds them, so the body reads .env and denies.
+testBash('floor: for-loop body is not auto-approved', 'for f in .env; do cat $f; done', 'deny');
 testBash('floor: unresolved read behind a wrapper is not auto-approved', 'timeout 5 cat $X', 'fallthrough');
 // The full chain: pad past VAR_MAX so no expansion is produced, then read via a wrapper.
 // Returned `allow` before the ceilings recorded a coverage gap.
+// 0.11.0 r2: the fail-closed parser reads this; the read behind the wrapper is seen and denies.
 testBash('floor: padding + wrapper is not a silent allow',
-  Array.from({ length: 40 }, (_, i) => 'A' + i + '=x').join('; ') + join('; X=.en', 'v; timeout 5 cat $X'), 'ask');
+  Array.from({ length: 40 }, (_, i) => 'A' + i + '=x').join('; ') + join('; X=.en', 'v; timeout 5 cat $X'), 'deny');
 // ---- expansion must not manufacture a deny bash would never make ----
 // A hard deny is unappealable in-session, so over-expansion is worse than under-expansion.
 testBash('expand: single quotes suppress expansion', join('X=.en', "v; cat '$X'"), 'allow');
@@ -1886,7 +1894,8 @@ testPosh('alias: ps one-hop chain', join("$X = '.en", "v'; $Y = $X; Get-Content 
 // unresolved rather than being guessed at.
 testBash('alias: benign chain still approves', 'X=notes.txt; Y=$X; cat $Y', 'allow');
 testBash('alias: unknown source is not resolved', 'Y=$UNSET; cat $Y', 'fallthrough');
-testBash('alias: concatenation is not an alias', 'X=a; Y=$X$X; cat $Y', 'fallthrough');
+// 0.11.0 r2: the fail-closed parser reads this; composition of known literals resolves (`aa`, not a secret).
+testBash('alias: concatenation is not an alias', 'X=a; Y=$X$X; cat $Y', 'allow');
 
 console.log('\n--- v0.8.0 review round 5: PS approve floor + NUL evasion ---');
 // The PS branch of checkSegmentApprove returned before the bash floor, so PowerShell had no
@@ -2156,7 +2165,8 @@ testBash('fp rm: plain node_modules is fine', 'rm -rf node_modules', 'fallthroug
 testBash('fp prose: curl|bash in a commit message', join('git commit -m "add curl ', '| bash installer to docs"'), 'allow');
 testBash('fp prose: installer instructions in echo', join('echo "to install: curl https://sh.rustup.rs ', '| sh"'), 'allow');
 testBash('fp prose: fork bomb quoted in a message', 'git commit -m ":(){ :|:& }; is a fork bomb"', 'allow');
-testBash('fp prose: pipe-to-sh in a trailing comment', join('true # curl http://x ', '| sh'), 'fallthrough');
+// 0.11.0 r2: the fail-closed parser reads this; a comment is lexed as a comment.
+testBash('fp prose: pipe-to-sh in a trailing comment', join('true # curl http://x ', '| sh'), 'allow');
 // KNOWN LIMIT: a commit message quoting BOTH an interpreter -c AND a curl|bash pipe is
 // hard-denied (the raw-gate keeps the text because `sh -c` looks executable). Accepted:
 // a quote-context-aware fix would break the quoted-interpreter deny (`"$SHELL" -c`).
@@ -2591,13 +2601,15 @@ console.log('\n--- 0.11.0 step 4: single & separator, linear assignment scan (B-
   testBash('amp twin: 2>&1 is not a separator', 'npm test 2>&1 | tail -5', 'allow');
   testBash('amp twin: &> is not a separator', 'npm test &> out.log', 'allow');
   testBash('amp twin: >&2 is not a separator', 'echo oops >&2', 'allow');
-  testBash('amp twin: |& stays one segment (verdict unchanged)', 'npm test |& tail -5', 'fallthrough');
+  // 0.11.0 r2: the fail-closed parser reads this; `|&` is parsed as a pipe.
+  testBash('amp twin: |& pipes both streams and allows', 'npm test |& tail -5', 'allow');
   // B-H1: the assignment scan is linear; a long ambiguous prefix returns instantly
   const pad = 'X=' + Array(37).fill('a').join('=') + ' true';
   const t0 = Date.now();
   testBash('assign: ambiguous assignment prefix still denies the rm', join('r', 'm -rf ~\n', pad), 'deny');
   check('assign: ambiguous assignment prefix returns in < 2 s', Date.now() - t0 < 2000, true);
-  testBash('assign twin: X=a=b true allows', 'X=a=b true', 'allow');
+  // 0.11.0 r2 (A-1): an unknown variable before a read-only tool is refused in prefix form.
+  testBash('assign: X=a=b true no longer approves', 'X=a=b true', 'fallthrough');
   testBash('assign twin: quoted value with spaces persists', 'F="notes.txt"; cat $F', 'allow');
 }
 
@@ -3147,6 +3159,86 @@ console.log('\n--- 0.11.0 r2 step 3: the fix reviewers\' probes, pinned (in-proc
   for (const [file, g] of Object.entries(groups)) {
     check('probes ' + file + ': ' + g.n + ' pinned verdicts hold' + (g.bad.length ? '\n         ' + g.bad.slice(0, 10).join('\n         ') : ''), g.bad.length, 0);
   }
+}
+
+console.log('\n--- 0.11.0 r2 steps 4-6: fail-closed bash approve (parser, walker, argv, argument models) ---');
+{
+  const M = join('node ', 'x.js'), E = join('.e', 'nv');
+  // N1: the inner command comes from argv, whatever the spelling of xargs
+  for (const c of ['ls | "xargs" ' + M, 'ls | /usr/bin/xargs ' + M, "ls | xar''gs " + M, 'ls | \\xargs ' + M]) testBash('N1 xargs spelling does not approve: ' + c, c, 'fallthrough');
+  testBash('N1 twin: xargs -I{} echo allows', 'ls | xargs -I{} echo {}', 'allow');
+  // N2-N4: heredocs, `((`, `for` read by the parser
+  testBash('N2: << inside $(( )) is arithmetic, the next line still runs', 'echo $((1<<true))\n' + M, 'fallthrough');
+  testBash('N2: odd heredoc delimiter is not parsed', 'cat <<EOF-1\nx\nEOF-1\n' + M, 'fallthrough');
+  testBash('N2: quoted-part delimiter is not parsed', 'cat <<E"O"F\nx\nEOF\n' + M, 'fallthrough');
+  testBash('N2 twin: plain heredoc allows', 'cat <<EOF\nplain text\nEOF', 'allow');
+  testBash('N3: (( command is not parsed', '((' + M + '); (true))', 'fallthrough');
+  testBash('N3 twin: $(( )) arithmetic allows', 'echo $((n+1))', 'allow');
+  testBash('N4: for (( )) is not parsed', 'for ((;;)) do ' + M + '; done', 'fallthrough');
+  testBash('N4: for without in runs its body', 'for i do ' + M + '; done', 'fallthrough');
+  testBash('N4 twin: for over words allows', 'for f in a b; do echo $f; done', 'allow');
+  // H-1: a keyword is a keyword only as a whole word at command position
+  for (const c of ['fi/x.sh', 'done.sh', '}/x', 'time fi/x.sh', 'X=1 done']) testBash('H-1: ' + c + ' does not approve', c, 'fallthrough');
+  testBash('H-1 twin: if ... fi allows', 'if [ -f x ]; then echo y; fi', 'allow');
+  // H-2: comments are lexed
+  testBash('H-2: a quote in a comment cannot hide a line', "echo hi #'\n" + M + "\necho x #'", 'fallthrough');
+  testBash('H-2: a quote in a comment cannot hide a denied line', join("ls # '\nr", 'm -rf ~'), 'deny');
+  testBash("H-2 twin: a comment with an apostrophe allows", "# it's a comment\nls", 'allow');
+  // H-9: attached redirect and ANSI-C escapes
+  testBash('H-9: cat<.env denies', 'cat<' + E, 'deny');
+  testBash('H-9: sort<.env denies', 'sort<' + E, 'deny');
+  testBash("H-9: hex escape in $'' denies", "cat .e$'\\x6e'v", 'deny');
+  testBash("H-9: unicode escape in $'' denies", "cat $'.e\\u006ev'", 'deny');
+  testBash('H-9 twin: sort < notes.txt allows', 'sort < notes.txt', 'allow');
+  // 3.1: count flags scoped to their verb, loop variables, composition, derived names
+  testBash('3.1: sed -n over a computed name does not approve', 'd=$(echo ' + E + '); sed -n 1p $d', 'fallthrough');
+  testBash('3.1: grep -n over an unresolved variable does not approve', 'grep -n x $UNSET', 'fallthrough');
+  testBash('3.1: cat -n over a loop variable holding .env denies', 'for f in ' + E + '; do cat -n $f; done', 'deny');
+  testBash('3.1: a secret assembled from parts denies', join('A=.e; B=n', 'v; cat $A$B'), 'deny');
+  testBash('3.1: a name set on one branch still holds the old value', 'X=' + E + '; if true; then X=a; fi; cat $X', 'deny');
+  testBash('3.1 twin: loop over literal words allows', 'for f in a.md b.md; do grep -n x $f; done', 'allow');
+  testBash('3.1 twin: a derived name from grep -l allows', 'f=$(grep -ln "FUNCTION x" *.sql | tail -1); sed -n 1,40p $f', 'allow');
+  testBash('3.1 twin: head -n 5 still takes a count', 'head -n 5 notes.txt', 'allow');
+  // 3.2: prototype gaps closed
+  testBash('3.2: a redirect on a subshell is checked', '(cat)<' + E, 'deny');
+  testBash('3.2: a redirect on a loop is checked', 'while read l; do echo $l; done<' + E, 'deny');
+  testBash('3.2: an input redirect from an unresolved name does not approve', 'cat < $X', 'fallthrough');
+  testBash('3.2: echo<(ls) is a process substitution', 'echo<(ls)', 'allow');
+  testBash('3.2: canonical text keeps an expansion unquoted (no prose deny)', 'S=/p; echo "select 1" | sh $S/q.sh', 'fallthrough');
+  for (const n of [5000, 50000]) {
+    const t0 = Date.now();
+    const r = runHook(BASH_HOOK, { tool_name: 'Bash', tool_input: { command: 'echo ' + '$('.repeat(n) + 'ls' + ')'.repeat(n) } });
+    check('3.2: ' + n + ' nested $( answer without a crash (got ' + r.decision + ')', r.decision === 'fallthrough' || r.decision === 'ask', true);
+    check('3.2: ' + n + ' nested $( in < 5 s', Date.now() - t0 < 5000, true);
+  }
+  { const r = runHook(BASH_HOOK, { tool_name: 'Bash', tool_input: { command: '{ '.repeat(5000) + 'ls' + '; }'.repeat(5000) } });
+    check('3.2: 5000 nested { answer without a crash', r.decision === 'fallthrough' || r.decision === 'ask', true); }
+  { const t0 = Date.now();
+    runHook(BASH_HOOK, { tool_name: 'Bash', tool_input: { command: 'echo ' + Array(40000).fill('w').join(' ') } });
+    check('3.2: 200 KB of words returns in < 2 s', Date.now() - t0 < 2000, true); }
+  // A-1 environment
+  for (const c of ["time GIT_PAGER='x' git log", 'PATH=/tmp/x ls', 'HOME=/tmp/x git log', 'GIT_CONFIG_GLOBAL=cfg git status', 'BASH_ENV=x.sh bash -c ls']) testBash('A-1: ' + c + ' does not approve', c, 'fallthrough');
+  testBash('A-1 twin: CI=true pnpm --dir allows', 'CI=true pnpm --dir /p docs:build', 'allow');
+  testBash('A-1 twin: GIT_PAGER=cat git log allows', 'GIT_PAGER=cat git log -3', 'allow');
+  testBash('A-1 twin: PATH under $HOME then cargo build allows', 'export PATH="$HOME/.cargo/bin:$PATH" && cargo build', 'allow');
+  testBash('A-1 twin: export CARGO_TARGET_DIR then cargo test allows', 'export CARGO_TARGET_DIR=x; cargo test; echo rc=$?', 'allow');
+  // A-2 sed
+  for (const c of ["sed -n -l 5 '1e x' f", "sed --expr='1e x' f", 'sed "$X" f', join("sed '1r .e", "nv' f"), "sed -n '1{\ne x\n}' f"]) testBash('A-2: ' + JSON.stringify(c) + ' does not approve', c, 'fallthrough');
+  testBash('A-2 twin: computed line range allows', 'n=$(grep -n X f.txt | cut -d: -f1); sed -n "$((n-30)),$((n+40))p" f.txt', 'allow');
+  testBash('A-2 twin: sed -i with known variables allows', 'old=a; new=b; sed -i "s/$old/$new/" f.txt', 'allow');
+  // A-3 awk
+  testBash('A-3: awk pipe behind a division does not approve', "awk '{print $1/2 | \"sh\"; y=$2/3}' f", 'fallthrough');
+  testBash('A-3: awk output redirect does not approve', "awk '{print > \"/tmp/x\"}' f", 'fallthrough');
+  testBash('A-3 twin: awk field print allows', "awk -F'|' '{print $2}' t.md", 'allow');
+  // A-4 curl / wget
+  for (const c of ['curl -K cfg u', 'curl -T f u', 'curl -F x=@f u', 'curl --netrc-file n u', 'curl -b c u', 'wget --use-askpass=./x u', 'curl -O u/x.sh']) testBash('A-4: ' + c + ' does not approve', c, 'fallthrough');
+  testBash('A-4 twin: curl -s -o /dev/null -w code allows', 'curl -s -o /dev/null -w "%{http_code}" http://localhost:5173', 'allow');
+  // A-5 small ones
+  for (const c of ['gh api -XPOST repos/o/r/issues', 'gh api --method=POST repos/o/r', 'gh api -fx=1 repos/o/r', 'node --check -e x', 'git rebase --ex ' + M, "git fetch 'ext::" + M + "'"]) testBash('A-5: ' + c + ' does not approve', c, 'fallthrough');
+  testBash('A-5 twin: gh api read allows', 'gh api repos/o/r/releases/latest --jq .tag_name', 'allow');
+  testBash('A-5 twin: git diff --exit-code allows', 'git diff --exit-code', 'allow');
+  for (const c of [join('cp .e', 'n* o.txt'), join('split .e', 'nv p_'), join('date -f .e', 'nv'), join('wc --files0-from=.e', 'nv')]) testBash('A-5 secret argument: ' + c + ' does not approve', c, 'fallthrough');
+  testBash('A-5 twin: cp .env.example .env allows (destination)', join('cp .e', 'nv.example .e', 'nv'), 'allow');
 }
 
 console.log('\n--- prompt-rate corpus ---');

@@ -2264,10 +2264,10 @@ const APPROVE_PATTERNS = [
   /^\s*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc)\b/,
   /^\s*(npx|pnpm|yarn|bun)\s+(?:--prefix\s+\S+\s+|-[A-Za-z]+\s+)*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|playwright\s+test)\b/,
   /^\s*npm\s+(?:view|ls|outdated|config\s+(?:get|list))\b/,
-  /^\s*node\s+--check\s/,
+  /^\s*node\s+--check\s+[^-\s]\S*\s*$/,
   // `gh api` read: no method override and no body/field flag anywhere in the segment.
   /^\s*gh\s+api(?![^|;&]*\s(?:-X|--method|-f|-F|--field|--raw-field|--input)\b)\s/,
-  /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:run|test|build|dev|lint|format|exec|start|typecheck|[\w-]+:[\w:-]+|config\s+(?:get|list)|why|ls|list|outdated)(?=\s|$)/,
+  /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:run|test|build|dev|lint|format|exec|start|typecheck|[\w-]+:[\w:-]+|config\s+(?:get|list)|why|ls|list|outdated|peers\s+check)(?=\s|$)/,
   // `pnpm install` with flags only (no package argument): same trust as `npm ci`.
   /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:install|i)(?:\s+(?:-[\w-]+(?:=\S+)?|\d*>>?\s*&?\S+))*\s*$/,
   /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+(?:tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)|start)\b/,
@@ -2705,7 +2705,8 @@ const EXEC_FLAGS = {
   wget: /^(?:-e|--exe|--use-a)/, curl: /^(?:-[A-Za-z]*K|--conf)/,
   tar: /^(?:--(?:checkpoint-a|to-c|us|rs|rmt|inf|new-)|-[A-Za-z]*[IF])/, zip: /^(?:-TT|--unzip-command)/,
   fd: /^(?:-[A-Za-z]*[xX]|--exec)/,
-  git: /^--(?:exec|upload-pack|receive-pack|open-files-in-pager|ext-diff|extcmd)(?:=|$)/,
+  // git takes any unique prefix of a long option (`--ex`, `--upl=`); `--exit-code`, `--exclude` differ.
+  git: /^--(?:exe?c?(?:=|$)|ext|upl|rece|op)|^ext::/,
 };
 function hasExecFlag(toks) {
   const w = base(toks[0]);
@@ -3052,6 +3053,823 @@ function checkPoshApprove(seg, depth, idx) {
 // these, `for f in .env; do cat $f; done` splits into a `do cat $f` segment whose first
 // token is `do`, the read verb is never found, and the `^\s*do\s` approve rule lets it
 // through -- the same auto-approve-a-secret-read shape this floor exists to stop.
+// ---- fail-closed approve: one parser, one walker, approve on argv ---------------------------
+// One recursive-descent parser for the subset of bash the approve path understands. Anything
+// outside the subset throws PF -> parseBash returns null -> the command is never auto-approved
+// (it falls through). The raw deny passes never depend on it.
+const PF = { parseFail: true };
+const RESERVED = /^(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|in|select|function|coproc|\{|\}|!|\[\[)(?=[\s;&|()<>]|$)/;
+const PARSE_MAX_NEST = 64;     // nested lists ($( ), { }, if, loops): deeper is not parsed
+const PARSE_MAX_WORDS = 4096;  // words in one command line: more is not parsed
+
+function parseBash(src0, depth) {
+  depth = depth || 0;
+  if (depth > 8 || typeof src0 !== 'string') return null;
+  const src = src0.replace(/\r\n/g, '\n');
+  if (/[\r\0]/.test(src)) return null;
+  let i = 0;
+  const n = src.length;
+  let pending = [];
+  let nest = 0, words = 0;
+  const bad = () => { throw PF; };
+  const blanks = () => {
+    for (;;) {
+      while (i < n && (src[i] === ' ' || src[i] === '\t')) i++;
+      if (src[i] === '#') { while (i < n && src[i] !== '\n') i++; } else return;
+    }
+  };
+  const newline = () => {                      // src[i] === '\n': heredoc bodies start here
+    i++;
+    for (const h of pending) {
+      const lines = [];
+      for (;;) {
+        if (i >= n) bad();
+        let e = src.indexOf('\n', i);
+        if (e === -1) e = n;
+        const line = src.slice(i, e);
+        i = Math.min(n, e + 1);
+        if ((h.dash ? line.replace(/^\t+/, '') : line) === h.word) break;
+        lines.push(line);
+      }
+      h.body = lines.join('\n');
+      if (!h.quoted && /\$\(|`|\$\[/.test(h.body)) bad();
+    }
+    pending = [];
+  };
+  const reserved = () => { const m = RESERVED.exec(src.slice(i, i + 10)); return m ? m[0] : null; };
+  const eat = (w) => { blanks(); if (reserved() !== w) bad(); i += w.length; };
+
+  const subList = (close) => {                 // `$(`, `<(`, `>(`, `(`: i is just past the opener
+    if (pending.length) bad();
+    const l = list([close]);
+    blanks();
+    if (src[i] !== close || pending.length) bad();
+    i++;
+    return l;
+  };
+  const dollar = (w, dq) => {                  // src[i] === '$'
+    const c = src[i + 1];
+    if (c === '(' && src[i + 2] === '(') {
+      let j = i + 3, d = 0;
+      for (; j < n; j++) { if (src[j] === '(') d++; else if (src[j] === ')') { if (d === 0) break; d--; } }
+      if (src[j] !== ')' || src[j + 1] !== ')') bad();
+      if (!/^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(src.slice(i + 3, j))) bad();
+      w.text += '1'; i = j + 2; return;
+    }
+    if (c === '(') { i += 2; w.subs.push(subList(')')); w.text += '$(_)'; w.lit = false; return; }
+    if (c === '{') {
+      let j = i + 2, d = 1;
+      for (; j < n && d; j++) { if (src[j] === '{') d++; else if (src[j] === '}') d--; else if (src[j] === '\n') bad(); }
+      if (d) bad();
+      const body = src.slice(i + 2, j - 1);
+      if (!/^[!#]?[\w@*#?]+(?:\[[\w@*$]*\])?(?:[:%#\/^,+=?-][^`$"'\\]*)?$/.test(body)) bad();
+      w.text += '${' + body + '}'; w.lit = false; i = j; return;
+    }
+    if (c === "'" && !dq) {                    // ANSI-C quoting
+      let j = i + 2, out = '';
+      for (; j < n && src[j] !== "'"; j++) {
+        if (src[j] !== '\\') { out += src[j]; continue; }
+        const e = src[++j];
+        const m = /^(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|U([0-9a-fA-F]{1,8})|([0-7]{1,3}))/.exec(src.slice(j, j + 9));
+        if (m) { out += String.fromCodePoint(parseInt(m[1] || m[2] || m[3], m[4] ? 8 : 16) || parseInt(m[4] || '0', 8)); j += m[0].length - 1; }
+        else if ('ntr\\\'"abefv'.includes(e)) out += { n: '\n', t: '\t', r: '\r', a: '', b: '', e: '\x1b', f: '', v: '' }[e] ?? e;
+        else bad();
+      }
+      if (j >= n) bad();
+      w.text += out; i = j + 1; return;
+    }
+    if (c === '[') bad();                      // $[ ] legacy arithmetic
+    const m = /^\$(?:[A-Za-z_]\w*|[0-9@*?$!#-])/.exec(src.slice(i, i + 80));
+    if (m) { w.text += m[0]; w.lit = false; i += m[0].length; return; }
+    w.text += '$'; i++;
+  };
+  const backtick = (w) => {                    // src[i] === '`'
+    const e = src.indexOf('`', i + 1);
+    if (e === -1) bad();
+    const inner = src.slice(i + 1, e);
+    if (/[\\\n]|<</.test(inner)) bad();
+    const ast = parseBash(inner, depth + 1);
+    if (!ast) bad();
+    w.subs.push(ast); w.text += '$(_)'; w.lit = false; i = e + 1;
+  };
+  // A word. text = what bash passes, with expansions left as raw `$X` / `${..}` / `$(_)`.
+  // lit = no expansion at all, so text is exactly the argument.
+  const word = (stop) => {
+    if (++words > PARSE_MAX_WORDS) bad();
+    const w = { text: '', lit: true, subs: [], bare: true };
+    const start = i;
+    while (i < n) {
+      const c = src[i];
+      if (c === "'") { const e = src.indexOf("'", i + 1); if (e === -1) bad(); w.text += src.slice(i + 1, e); i = e + 1; w.bare = false; continue; }
+      if (c === '"') {
+        i++; w.bare = false;
+        for (;;) {
+          if (i >= n) bad();
+          const d = src[i];
+          if (d === '"') { i++; break; }
+          if (d === '\\') { const e = src[i + 1]; if (e === undefined) bad(); w.text += '$`"\\'.includes(e) ? e : (e === '\n' ? '' : d + e); i += 2; continue; }
+          if (d === '$') { dollar(w, true); continue; }
+          if (d === '`') { backtick(w); continue; }
+          w.text += d; i++;
+        }
+        continue;
+      }
+      if (c === '\\') { if (i + 1 >= n) bad(); w.text += src[i + 1]; i += 2; w.bare = false; continue; }
+      if (c === '$') { if (src[i + 1] === '"') { i++; continue; } dollar(w, false); continue; }
+      if (c === '`') { backtick(w); continue; }
+      if ((c === '<' || c === '>') && src[i + 1] === '(') {
+        if (i > start) break;                    // `echo<(ls)`: the process substitution is its own word
+        i += 2; w.subs.push(subList(')')); w.text += c + '(_)'; w.lit = false; continue;
+      }
+      if (/[\s;&|<>()]/.test(c) || (stop && stop.includes(c))) break;
+      w.text += c; i++;
+    }
+    if (i === start) bad();
+    return w;
+  };
+
+  const redirect = (node) => {                 // returns true when one was consumed
+    const m = /^(\d*)(<<<|<<-?|<>|>>|>&|<&|>\||&>>|&>|>|<)/.exec(src.slice(i, i + 8));
+    if (!m || (m[2][0] === '&' && m[1]) || ((m[2] === '<' || m[2] === '>') && src[i + m[0].length] === '(' && !m[1])) return false;
+    i += m[0].length;
+    const op = m[2];
+    if (op === '<<' || op === '<<-') {
+      blanks();
+      const d = /^(?:'(\w+)'|"(\w+)"|\\?(\w+))(?=[\s;&|<>()]|$)/.exec(src.slice(i, i + 120));
+      if (!d) bad();
+      i += d[0].length;
+      const h = { word: d[1] || d[2] || d[3], dash: op === '<<-', quoted: !d[3] || d[0][0] === '\\', body: '' };
+      pending.push(h);
+      node.redirs.push({ op: '<<', heredoc: h });
+      return true;
+    }
+    blanks();
+    if ((op === '>&' || op === '<&') && /^(?:\d+-?|-)(?=[\s;&|<>()]|$)/.test(src.slice(i, i + 8))) {
+      i += /^(?:\d+-?|-)/.exec(src.slice(i, i + 8))[0].length;
+      return true;
+    }
+    node.redirs.push({ op, target: word() });
+    return true;
+  };
+
+  const simple = () => {
+    const node = { type: 'simple', assigns: [], words: [], redirs: [] };
+    for (;;) {
+      blanks();
+      if (i >= n || /[\n;&|)]/.test(src[i])) break;
+      if (redirect(node)) continue;
+      if (src[i] === '(') bad();               // function definition, or `((`
+      if (!node.words.length) {
+        const a = /^([A-Za-z_]\w*)(\[[\w$@*+-]*\])?(\+?)=/.exec(src.slice(i, i + 200));
+        if (a) {
+          i += a[0].length;
+          const as = { name: a[1], append: !!a[3] || !!a[2], value: null, array: null };
+          if (src[i] === '(') {
+            i++; as.array = [];
+            for (;;) { blanks(); if (src[i] === '\n') { newline(); continue; } if (src[i] === ')') { i++; break; } if (i >= n) bad(); as.array.push(word()); }
+          } else if (i < n && !/[\s;&|<>()]/.test(src[i])) as.value = word();
+          else as.value = { text: '', lit: true, subs: [], bare: true };
+          node.assigns.push(as);
+          continue;
+        }
+      }
+      node.words.push(word());
+    }
+    if (!node.words.length && !node.assigns.length && !node.redirs.length) bad();
+    return node;
+  };
+  const redirs = (node) => { node.redirs = []; for (;;) { blanks(); if (!redirect(node)) break; } return node; };
+
+  const command = () => {
+    blanks();
+    if (src[i] === '(') {
+      if (src[i + 1] === '(') bad();           // arithmetic command or nested subshells: not modelled
+      i++;
+      return redirs({ type: 'subshell', body: subList(')') });
+    }
+    const r = reserved();
+    if (r === '{') { i++; const body = list(['}']); eat('}'); return redirs({ type: 'group', body }); }
+    if (r === 'if') {
+      i += 2;
+      const parts = [];
+      parts.push(list(['then'])); eat('then'); parts.push(list(['elif', 'else', 'fi']));
+      for (;;) {
+        blanks();
+        const k = reserved();
+        if (k === 'elif') { i += 4; parts.push(list(['then'])); eat('then'); parts.push(list(['elif', 'else', 'fi'])); }
+        else if (k === 'else') { i += 4; parts.push(list(['fi'])); }
+        else break;
+      }
+      eat('fi');
+      return redirs({ type: 'if', parts });
+    }
+    if (r === 'while' || r === 'until') {
+      i += 5;
+      const cond = list(['do']); eat('do');
+      const body = list(['done']); eat('done');
+      return redirs({ type: 'loop', cond, body });
+    }
+    if (r === 'for') {
+      i += 3; blanks();
+      const nm = /^[A-Za-z_]\w*(?=[\s;]|$)/.exec(src.slice(i, i + 80));
+      if (!nm) bad();                          // `for ((` and anything else
+      i += nm[0].length; blanks();
+      let words = null;
+      if (reserved() === 'in') {
+        i += 2; words = [];
+        for (;;) { blanks(); if (i >= n || /[\n;]/.test(src[i])) break; if (/[&|()<>]/.test(src[i])) bad(); words.push(word()); }
+      }
+      blanks();
+      if (src[i] === ';') i++;
+      while (blanks(), src[i] === '\n') newline();
+      eat('do');
+      const body = list(['done']); eat('done');
+      return redirs({ type: 'for', name: nm[0], words, body });
+    }
+    if (r === 'case') {
+      i += 4; blanks();
+      const subject = word();
+      while (blanks(), src[i] === '\n') newline();
+      eat('in');
+      const arms = [];
+      for (;;) {
+        while (blanks(), src[i] === '\n') newline();
+        if (reserved() === 'esac') break;
+        if (src[i] === '(') i++;
+        const pats = [];
+        for (;;) { blanks(); pats.push(word(')|')); blanks(); if (src[i] === '|') { i++; continue; } break; }
+        if (src[i] !== ')') bad();
+        i++;
+        const body = list([';;', 'esac'], true);
+        arms.push({ pats, body });
+        blanks();
+        if (src.startsWith(';;', i)) { if (src[i + 2] === '&') bad(); i += 2; }
+      }
+      eat('esac');
+      return redirs({ type: 'case', subject, arms });
+    }
+    if (r === '[[') {
+      i += 2;
+      const node = { type: 'test', words: [] };
+      for (;;) {
+        blanks();
+        if (i >= n || src[i] === '\n' || src[i] === ';') bad();
+        if (src.startsWith(']]', i) && (i + 2 >= n || /[\s;&|)]/.test(src[i + 2]))) { i += 2; break; }
+        if (/[&|<>()]/.test(src[i])) { if ((src[i] === '<' || src[i] === '>') && src[i + 1] === '(') bad(); i++; continue; }
+        node.words.push(word());
+      }
+      return redirs(node);
+    }
+    if (r) bad();                              // a reserved word where a command must start
+    return simple();
+  };
+
+  const pipeline = () => {
+    blanks();
+    const p = { type: 'pipeline', stages: [] };
+    while (reserved() === '!') { i++; blanks(); }
+    for (;;) {
+      p.stages.push(command());
+      blanks();
+      if (src[i] === '|' && src[i + 1] !== '|') {
+        i += src[i + 1] === '&' ? 2 : 1;
+        while (blanks(), src[i] === '\n') newline();
+        continue;
+      }
+      return p;
+    }
+  };
+
+  // items: pipelines, each tagged cond=true when it only runs depending on an earlier one.
+  function list(stops, caseArm) {
+    if (++nest > PARSE_MAX_NEST) bad();
+    const l = { type: 'list', items: [] };
+    let cond = false;
+    for (;;) {
+      blanks();
+      if (i >= n) break;
+      if (src[i] === '\n') { newline(); cond = false; continue; }
+      if (src[i] === ')' ) break;
+      if (caseArm && src.startsWith(';;', i)) break;
+      const r = reserved();
+      if (r && stops.includes(r)) break;
+      const p = pipeline();
+      p.cond = cond;
+      l.items.push(p);
+      blanks();
+      if (src.startsWith('&&', i) || src.startsWith('||', i)) {
+        i += 2; cond = true;
+        while (blanks(), src[i] === '\n') newline();
+        continue;
+      }
+      cond = false;
+      if (caseArm && src.startsWith(';;', i)) break;
+      if (src[i] === ';' || src[i] === '&') { if (src[i + 1] === ';' && !caseArm) bad(); i++; continue; }
+      if (src[i] === '\n') continue;
+      if (i >= n || src[i] === ')') break;
+      const r2 = reserved();
+      if (r2 && stops.includes(r2)) break;
+      bad();
+    }
+    nest--;
+    return l;
+  }
+
+  // Any exception (PF, or a RangeError on input the caps missed) means "not parsed": never a
+  // crash, which would fail open.
+  try {
+    const ast = list([]);
+    blanks();
+    if (i < n || pending.length) return null;
+    return ast;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---- canonical text: what bash runs, re-quoted so the flat tokenizer reads it exactly ----
+const canonWord = (w) => {
+  const t = w.text;
+  if (w.lit) {
+    if (/^[\w@%+=:,.\/~*?\[\]{}!^-]+$/.test(t)) return t;
+    return t.split("'").map((p) => "'" + p + "'").join('"\'"');
+  }
+  // An expansion word stays unquoted when it can: the deny rules read quoted text as prose.
+  if (/^(?:[\w@%+=:,.\/~*?\[\]{}!^$-]|\$\(_\)|[<>]\(_\))+$/.test(t)) return t;
+  return '"' + t.replace(/["\\`]/g, '\\$&') + '"';
+};
+const canonRedir = (r) => (r.heredoc ? '' : ' ' + (r.op === '<<<' ? '<<< ' : r.op + ' ') + canonWord(r.target));
+function canonSimple(node, withRedirs) {
+  let s = node.assigns.map((a) => a.name + '=' + (a.array ? '(' + a.array.map(canonWord).join(' ') + ')' : canonWord(a.value))).join(' ');
+  if (node.words.length) s += (s ? ' ' : '') + node.words.map(canonWord).join(' ');
+  if (withRedirs) s += node.redirs.map(canonRedir).join('');
+  return s;
+}
+const canonStage = (st) => (st.type === 'simple' ? canonSimple(st, true)
+  : st.type === 'test' ? '[[ ' + st.words.map(canonWord).join(' ') + ' ]]' : '{ : ; }');
+
+// ---- one walker: visits every pipeline at every depth, tracking literal variable values ----
+// vals: Map name -> array of every literal value the name can hold here (loop words, branches).
+// A name that is absent is unresolved. cb(pipeline, vals) -> false stops the walk.
+const VALS_MAX = 32;
+const SETS_VARS = /^(?:read|mapfile|readarray|getopts|let|eval|source|\.)$/;
+const setsVars = (st) => SETS_VARS.test(base(st.words[0].text)) || (st.words[0].text === 'printf' && st.words.some((w) => w.text === '-v'));
+function wordSubs(w) { return w ? w.subs : []; }
+function nodeSubs(st) {
+  const out = [];
+  const add = (w) => { for (const s of wordSubs(w)) out.push(s); };
+  if (st.type === 'simple') {
+    for (const a of st.assigns) { if (a.array) a.array.forEach(add); else add(a.value); }
+    st.words.forEach(add);
+  } else if (st.type === 'test') st.words.forEach(add);
+  else if (st.type === 'for' && st.words) st.words.forEach(add);
+  else if (st.type === 'case') { add(st.subject); for (const arm of st.arms) arm.pats.forEach(add); }
+  for (const r of (st.redirs || [])) add(r.target);
+  return out;
+}
+function assignedNames(l, out) {
+  for (const p of l.items) for (const st of p.stages) {
+    if (st.type === 'simple') {
+      for (const a of st.assigns) out.add(a.name);
+      if (st.words.length && setsVars(st)) out.add('*');
+      if (st.words.length && /^(?:export|declare|typeset|readonly|local|unset)$/.test(st.words[0].text)) out.add('*');
+    } else if (st.type === 'for') { out.add(st.name); assignedNames(st.body, out); }
+    else if (st.type === 'loop') { assignedNames(st.cond, out); assignedNames(st.body, out); }
+    else if (st.type === 'if') st.parts.forEach((x) => assignedNames(x, out));
+    else if (st.type === 'case') st.arms.forEach((x) => assignedNames(x.body, out));
+    else if (st.type === 'group' || st.type === 'subshell') assignedNames(st.body, out);
+  }
+  return out;
+}
+function clearVals(v) { const t = v.get(' taint'); v.clear(); if (t) v.set(' taint', t); }
+const dropAssigned = (l, vals) => { const s = assignedNames(l, new Set()); if (s.has('*')) clearVals(vals); else for (const k of s) vals.delete(k); };
+// Every literal a text can stand for, or null when any part of it is not a known literal.
+const subst = (text, vals) => {
+  let out = [''], last = 0, m;
+  const re = /\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g;
+  while ((m = re.exec(text))) {
+    const lit = text.slice(last, m.index);
+    const vs = vals.get(m[1] || m[2]);
+    if (lit.includes('$') || !vs || !vs.length) return null;
+    const next = [];
+    for (const o of out) for (const v of vs) next.push(o + lit + v);
+    if (next.length > VALS_MAX) return null;
+    out = next; last = m.index + m[0].length;
+  }
+  const tail = text.slice(last);
+  if (tail.includes('$') || /[<>]\(_\)/.test(text)) return null;
+  return out.map((o) => o + tail);
+};
+const literalValue = (w, vals) => (w.lit ? [w.text] : subst(w.text, vals));
+// A name producer: its output is file names that exist, not text the command line spells out.
+// A variable or argument fed only by one is resolved for the approve floor (same reach as grep -r).
+const DERIVED = [];
+const PRODUCER = /^(?:find|ls|fd|which|pwd|mktemp)$/;
+const SELECTOR = /^(?:head|tail|sort|uniq|grep|rg)$/;
+function producerOk(ast) {
+  if (!ast || !ast.items.length) return false;
+  return ast.items.every((p) => producerPipeline(p.stages));
+}
+function producerPipeline(st) {
+  for (let k = 0; k < st.length; k++) {
+    const s = st[k];
+    if (s.type !== 'simple' || s.assigns.length || !s.words.length || !s.words[0].lit) return false;
+    const w0 = base(s.words[0].text), fl = s.words.slice(1).map((w) => w.text);
+    const names = (w0 === 'grep' || w0 === 'rg') && fl.some((t) => /^-[A-Za-z]*[lL]|^--files/.test(t));
+    const git = w0 === 'git' && (fl.includes('ls-files') || fl.includes('--name-only') || fl.includes('--show-toplevel'));
+    if (k === 0 ? !(PRODUCER.test(w0) || names || git) : !(SELECTOR.test(w0) || names)) return false;
+    if (s.words.some((w) => SECRET_TOKENS_RE.test(w.text) || scan.globHitsSecret(w.text))) return false;
+  }
+  return true;
+}
+function derivedWord(w, vals) {
+  if (/^\$\{?[A-Za-z_]\w*\}?$/.test(w.text)) { const v = vals.get(w.text.replace(/[${}]/g, '')); return !!v && v.length === 0; }
+  if (w.subs.length !== 1 || !w.text.endsWith('$(_)')) return false;
+  const pre = w.text.slice(0, -4);
+  if (pre !== '') { const p = subst(pre, vals); if (!p || !p.every((x) => x.endsWith('/') && !SECRET_TOKENS_RE.test(x))) return false; }
+  return producerOk(w.subs[0]);
+}
+function argvVariants(words, vals) {
+  let out = [[]];
+  for (const w of words) {
+    let alts = [w];
+    if (!w.lit) {
+      const lv = subst(w.text, vals);
+      if (lv) alts = lv.map((t) => ({ text: t, lit: true, subs: [] }));
+      else if (derivedWord(w, vals)) alts = [{ text: '_derived_', lit: true, subs: [] }];
+    }
+    if (alts.length === 1) { for (const o of out) o.push(alts[0]); continue; }   // in place: linear
+    const next = [];
+    for (const o of out) for (const a of alts) next.push([...o, a]);
+    if (next.length > 64) return [words];
+    out = next;
+  }
+  return out;
+}
+function walk(l, vals, cb, conditional) {
+  for (const p of l.items) {
+    const cond = conditional || p.cond;
+    const piped = p.stages.length > 1;
+    for (const st of p.stages) for (const sub of nodeSubs(st)) if (!walk(sub, new Map(vals), cb, false)) return false;
+    // A redirect on a compound command (`(cat)<.env`, `done < .env`) is checked like `: < target`.
+    for (const st of p.stages) {
+      if (st.type === 'simple' || !(st.redirs || []).some((r) => r.target)) continue;
+      const colon = { type: 'simple', assigns: [], words: [{ text: ':', lit: true, subs: [], bare: true }], redirs: st.redirs.filter((r) => r.target) };
+      if (cb({ type: 'pipeline', stages: [colon] }, vals) === false) return false;
+    }
+    if (cb(p, vals) === false) return false;
+    for (const st of p.stages) {
+      const v = piped || st.type === 'subshell' ? new Map(vals) : vals;   // a pipe stage / subshell cannot set ours
+      if (st.type === 'simple') {
+        const w0 = st.words.length ? st.words[0].text : null;
+        const declare = w0 !== null && /^(?:export|declare|typeset|readonly|local)$/.test(w0);
+        if (w0 === null) {
+          for (const a of st.assigns) {
+            if (envTaints(a.name)) v.set(' taint', [...(v.get(' taint') || []), { name: a.name, raw: a.array ? '(' : a.value.text, persisted: true }]);
+            const lv = a.array || a.append ? null : (literalValue(a.value, v) || (derivedWord(a.value, v) ? DERIVED : null));
+            if (!lv) v.delete(a.name);
+            else if (cond && v.has(a.name)) { const u = [...new Set([...v.get(a.name), ...lv])]; if (u.length > VALS_MAX) v.delete(a.name); else v.set(a.name, u); }
+            else if (cond) v.set(a.name, lv.length ? [...lv, ''] : lv);   // set on one path, empty on the other
+            else v.set(a.name, lv);
+          }
+        } else if (declare || w0 === 'unset') {
+          for (const w of st.words.slice(1)) {
+            const m = /^([A-Za-z_]\w*)(?:=([\s\S]*))?$/.exec(w.text);
+            if (!m) { if (!w.text.startsWith('-')) clearVals(v); continue; }
+            if (w0 !== 'unset' && w0 !== 'local' && !ENV_SAFE.test(m[1])) v.set(' taint', [...(v.get(' taint') || []), { name: m[1], raw: m[2] === undefined ? '$' : m[2], persisted: true }]);
+            if (w0 !== 'unset' && m[2] !== undefined && w.lit && !cond) v.set(m[1], [m[2]]); else v.delete(m[1]);
+          }
+        } else if (setsVars(st)) clearVals(v);
+      } else if (st.type === 'group') { if (!walk(st.body, v, cb, cond)) return false; }
+      else if (st.type === 'subshell') { if (!walk(st.body, v, cb, cond)) return false; }
+      else if (st.type === 'if') {
+        for (const part of st.parts) if (!walk(part, v, cb, true)) return false;
+      } else if (st.type === 'case') {
+        for (const arm of st.arms) if (!walk(arm.body, v, cb, true)) return false;
+      } else if (st.type === 'loop') {
+        dropAssigned(st.cond, v); dropAssigned(st.body, v);
+        if (!walk(st.cond, v, cb, true) || !walk(st.body, v, cb, true)) return false;
+      } else if (st.type === 'for') {
+        dropAssigned(st.body, v);
+        let lits = st.words && st.words.length ? [] : null;
+        for (const w of st.words || []) {
+          const lv = literalValue(w, v);
+          if (lv) lits.push(...lv);
+          else if (!derivedWord(w, v)) { lits = null; break; }
+        }
+        if (lits && lits.length <= VALS_MAX) v.set(st.name, lits); else v.delete(st.name);
+        if (!walk(st.body, v, cb, true)) return false;
+        v.delete(st.name);
+      }
+    }
+  }
+  return true;
+}
+
+// Every text bash could run for this pipeline given the known variable values (capped).
+function expansions(text, vals) {
+  let out = [text];
+  const names = new Set();
+  for (const m of text.matchAll(/\$\{?([A-Za-z_]\w*)\}?/g)) if (vals.has(m[1]) && vals.get(m[1]).length) names.add(m[1]);
+  for (const name of names) {
+    const next = [];
+    for (const t of out) for (const val of vals.get(name)) next.push(expandVars(t, new Map([[name, val]]), false));
+    out = next.slice(0, 32);
+  }
+  return out.filter((t) => t !== text);
+}
+
+// ---- approve one simple command from its argv ----
+const sub0 = (words, at) => words.slice(at);
+function heredocTargetsUnsafe(node) {
+  if (!node.redirs.some((r) => r.heredoc)) return false;
+  const bad = (w) => !w.lit || !isSafeRelativePath(w.text) || scan.isAgentInstructionFile(w.text);
+  for (const r of node.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>|>&)$/.test(r.op) && r.target.text !== '/dev/null' && bad(r.target)) return true;
+  const w0 = node.words.length ? base(node.words[0].text) : '';
+  if (w0 === 'tee') for (const w of node.words.slice(1)) { if (w.text.startsWith('-')) { if (w.text.includes('=')) return true; continue; } if (bad(w)) return true; }
+  return false;
+}
+function approveArgv(words, vals, depth, approvedScripts) {
+  if (!words.length || depth > 8) return false;
+  if (!words[0].lit) return false;                          // computed command word
+  const toks = words.map((w) => w.text);
+  const w0 = base(toks[0]);
+  const text = words.map(canonWord).join(' ');
+  if (approvedScripts && approvedScripts.has(text)) return true;
+
+  if (APPROVE_WRAPPERS.has(w0)) {
+    if (w0 === 'command' && /^-[vV]$/.test(toks[1] || '')) return true;
+    let at = 1;                                             // one wrapper at a time, its own flags only
+    const vf = WRAPPER_VALUE_FLAGS[w0];
+    while (at < toks.length) {
+      const t = toks[at];
+      if (vf && vf.test(t)) { at += 2; continue; }
+      if (t.startsWith('-') || (w0 === 'timeout' && /^\d+(?:\.\d+)?[smhd]?$/.test(t))) { at++; continue; }
+      break;
+    }
+    if (at >= toks.length) return false;
+    if (/^[A-Za-z_]\w*=/.test(toks[at])) return false;      // `time X=v cmd`: not modelled
+    return approveArgv(sub0(words, at), vals, depth + 1, approvedScripts);
+  }
+  if (w0 === 'trap') {
+    const a = toks[1] === '--' ? words[2] : words[1];
+    if (a === undefined || a.text === '' || a.text === '-' || /^-[lp]$/.test(a.text)) return true;
+    return a.lit && approveText(a.text, vals, depth + 1);
+  }
+  if (w0 === 'find') {
+    for (let k = 1; k < toks.length; k++) {
+      if (!words[k].lit && /^-/.test(toks[k])) return false;
+      if (/^-(?:delete|fls|fprint(?:f|0)?)$/.test(toks[k])) return false;
+      if (/^-(?:exec|execdir|ok|okdir)$/.test(toks[k])) {
+        let e = k + 1;
+        while (e < toks.length && !(words[e].lit && (toks[e] === ';' || toks[e] === '+'))) e++;
+        if (e >= toks.length || e === k + 1) return false;
+        if (!approveArgv(words.slice(k + 1, e), vals, depth + 1, approvedScripts)) return false;
+        k = e;
+      }
+    }
+    return true;
+  }
+  if (w0 === 'xargs') {
+    let at = 1;
+    for (; at < toks.length; at++) {
+      const t = toks[at];
+      if (!t.startsWith('-') || t === '-') break;
+      if (!words[at].lit) return false;
+      if (/^--(?:arg-file|delimiter|max-args|max-procs|max-chars|process-slot-var)$/.test(t) || /^-[InPdEsLa]$/.test(t)) { at++; continue; }
+      if (/^--(?:null|no-run-if-empty|verbose|exit|open-tty|show-limits)$/.test(t) || /^--(?:arg-file|delimiter|max-args|max-procs|max-chars|max-lines|replace|eof)=/.test(t)) continue;
+      if (/^-[InPdEsL]./.test(t) || /^-[0prtxo]+$/.test(t)) continue;
+      return false;
+    }
+    return at >= toks.length || approveArgv(sub0(words, at), vals, depth + 1, approvedScripts);
+  }
+  if (SHELL_SET.has(w0)) {
+    if (toks.length === 3 && /^-[a-zA-Z]*c$/.test(toks[1]) && words[1].lit && words[2].lit) return approveText(toks[2], vals, depth + 1);
+    return false;
+  }
+  if (hasExecFlag(toks)) return false;
+  if (w0 === 'awk' && !awkSafe(words)) return false;
+  if (w0 === 'sed' && !sedSafe(words, vals)) return false;
+  if (w0 === 'curl' && !curlSafe(words)) return false;
+  if (w0 === 'wget' && !wgetSafe(words)) return false;
+  if (w0 === 'gh' && ghApiWrites(toks)) return false;
+  if (secretArg(words, w0)) return false;
+
+  resolvableAt[0] = new Set([...vals.keys()].filter((k) => k[0] !== ' '));
+  if (hasUnresolvedRead(text, 0)) return false;
+  for (const pattern of APPROVE_PATTERNS) if (pattern.test(text)) return true;
+  return false;
+}
+function approveText(src, vals, depth) {
+  const ast = parseBash(src, depth);
+  return !!ast && approveAst(ast, new Map(vals), depth, null);
+}
+function approveStage(st, vals, depth, approvedScripts) {
+  if (st.type !== 'simple') return true;                    // compound: its pipelines are visited on their own
+  if (heredocTargetsUnsafe(st)) return false;
+  // An input redirect reads a file: its name must be literal or resolved, like any read argument.
+  for (const r of st.redirs) if (r.target && (r.op === '<' || r.op === '<>') && !r.target.lit && !subst(r.target.text, vals)) return false;
+  if (!st.words.length) return true;
+  const w0 = st.words[0].text;
+  const envs = [...(vals.get(' taint') || []), ...st.assigns.map((a) => ({ name: a.name, raw: a.array ? '(' : a.value.text }))];
+  if (!envOk(envs, base(w0))) return false;
+  if (/^(?:export|declare|typeset|readonly|local)$/.test(w0)) {
+    return st.words.slice(1).every((w) => {
+      const m = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(w.text);
+      return m ? true : /^(?:-[A-Za-z]+|[A-Za-z_]\w*)$/.test(w.text);
+    });
+  }
+  return argvVariants(st.words, vals).every((ws) => approveArgv(ws, vals, depth, approvedScripts));
+}
+function approveAst(ast, vals, depth, approvedScripts) {
+  return walk(ast, vals, (p, v) => p.stages.every((st) => approveStage(st, v, depth, approvedScripts)), false);
+}
+
+// ---- argument models for the fail-closed approve ------------------------------------------
+// Each returns true only when every flag is one it knows. Unknown flag = not approved.
+
+// --- environment ---
+const ENV_SAFE = /^(?:LC_\w+|LANG|LANGUAGE|TZ|TERM|COLUMNS|LINES|NO_COLOR|FORCE_COLOR|CLICOLOR(?:_FORCE)?|CI|DEBUG|VERBOSE|MSYS_NO_PATHCONV|MSYS2_ARG_CONV_EXCL|GIT_(?:TERMINAL_PROMPT|OPTIONAL_LOCKS|MERGE_AUTOEDIT|(?:AUTHOR|COMMITTER)_(?:NAME|EMAIL|DATE))|GH_(?:REPO|PROMPT_DISABLED|NO_UPDATE_NOTIFIER|FORCE_TTY)|NODE_ENV|PYTHONUNBUFFERED|PYTHONIOENCODING|PYTHONDONTWRITEBYTECODE|RUST_BACKTRACE)$/;
+const ENV_PROGRAM = /(?:PAGER|EDITOR|VISUAL)$/;
+const ENV_LOADER = /^(?:(?:LD|DYLD)_\w+|BASH_ENV|ENV|PS4|SHELL|IFS|HOME|PYTHONSTARTUP|PERL5OPT|RUBYOPT)$/;
+const ENV_HOT_SHAPE = /^(?:GIT_|GCM_|GH_|XDG_|CURL_|WGET|TAR_|RSH|LESS|GREP_|RIPGREP_|JQ_|SORT_|ZIP|UNZIP|GZIP|BZIP|XZ_|ZSTD_|TMUX|KUBE|DOCKER_|SSH_|MAN|BAT_|DELTA_|NODE_|PYTHON|PERL|RUBY|JAVA_|_JAVA|GOFLAGS|RUSTC|NPM_|npm_)|_(?:proxy|PROXY)$/;
+const RUNNER = /^(?:npm|pnpm|yarn|bun|npx|cargo|make|go|pytest|python[23]?|uv|mvn|java|javac|tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc|pre-commit|ruff|black|mypy|pylint|pyright|isort|flake8|bandit|playwright|node)$/;
+const PATH_PART = /^(?:\$PATH|\$\{PATH\}|(?:\$HOME|\$\{HOME\}|~)\/[\w.\/-]+|\/(?:usr|opt|bin|sbin|snap|mingw64|home\/linuxbrew)(?:\/[\w.\/-]*)?|\/[a-z]\/Program Files[^:]*)$/;
+const envTaints = (name) => !ENV_SAFE.test(name) && (ENV_LOADER.test(name) || ENV_PROGRAM.test(name) || ENV_HOT_SHAPE.test(name) || name === 'PATH');
+function envOk(envs, w0) {
+  for (const e of envs) {
+    if (e.name === 'PATH') { if (!e.raw.split(':').every((p) => PATH_PART.test(p))) return false; continue; }
+    if (e.name === 'NODE_OPTIONS') { if (!/^(?:--max-old-space-size=\d+|--no-warnings|--enable-source-maps|--experimental-vm-modules|--use-system-ca)?$/.test(e.raw)) return false; continue; }
+    if (ENV_LOADER.test(e.name)) return false;
+    if (ENV_SAFE.test(e.name)) continue;
+    if (ENV_PROGRAM.test(e.name) && /^[\w+-]*$/.test(e.raw)) continue;
+    if (ENV_PROGRAM.test(e.name) || /(?:_SSH|COMMAND|ASKPASS|EXTERNAL_DIFF)$/.test(e.name) || /^GIT_(?:CONFIG|EXEC_PATH|TEMPLATE_DIR|DIR|WORK_TREE)/.test(e.name)) return false;
+    if (RUNNER.test(w0)) continue;
+    if (e.persisted && !ENV_HOT_SHAPE.test(e.name)) continue;   // an exported app variable does not steer a read-only tool
+    return false;
+  }
+  return true;
+}
+
+// --- sed ---
+// Script walk. PH stands for a shell expansion we could not resolve: accepted only where a
+// line number can stand (an address); anywhere else the script is not approved.
+const PH = '\x01';
+function sedWalkUnsafe(s) {
+  let i = 0;
+  const n = s.length;
+  const skipDelim = (d) => { for (; i < n; i++) { if (s[i] === PH) return false; if (s[i] === '\\') { i++; continue; } if (s[i] === d) { i++; return true; } } return false; };
+  let sawPH = false;
+  const addr = () => {
+    if (i >= n) return true;
+    if (/[0-9\x01]/.test(s[i])) { while (i < n && /[0-9\x01]/.test(s[i])) { if (s[i] === PH) sawPH = true; i++; } }
+    else if (s[i] === '$') i++;
+    else if (s[i] === '/') { i++; if (!skipDelim('/')) return false; while (/[IM]/.test(s[i] || '')) i++; }
+    else if (s[i] === '\\' && i + 1 < n) { const d = s[i + 1]; i += 2; if (!skipDelim(d)) return false; while (/[IM]/.test(s[i] || '')) i++; }
+    return true;
+  };
+  const ws = () => { while (i < n && /[ \t]/.test(s[i])) i++; };
+  const eol = () => { let ok = true; while (i < n && s[i] !== '\n') { if (s[i] === PH) ok = false; i++; } return ok; };
+  while (i < n) {
+    while (i < n && /[\s;{}]/.test(s[i])) i++;
+    if (i >= n) break;
+    sawPH = false;
+    if (!addr()) return true;
+    ws();
+    if (s[i] === ',' || s[i] === '~') { i++; ws(); if (s[i] === '+' || s[i] === '~') i++; if (!addr()) return true; ws(); }
+    while (s[i] === '!') { i++; ws(); }
+    if (i >= n) { if (sawPH) return true; break; }   // `sed "$X" f`: the expansion would be the command
+    const c = s[i++];
+    if (c === '{' || c === '}') continue;
+    if (c === '#') { if (!eol()) return true; continue; }
+    if (c === 's' || c === 'y') {
+      const d = s[i++];
+      if (d === undefined || d === '\n' || d === '\\' || d === PH) return true;
+      if (!skipDelim(d) || !skipDelim(d)) return true;
+      const f = /^[A-Za-z0-9]*/.exec(s.slice(i, i + 16))[0];
+      if (c === 's' && /[ew]/.test(f)) return true;
+      i += f.length;
+      continue;
+    }
+    if (/[aic]/.test(c)) { if (!eol()) return true; continue; }
+    if (/[btT:]/.test(c)) { while (i < n && s[i] !== ';' && s[i] !== '\n' && s[i] !== '}') { if (s[i] === PH) return true; i++; } continue; }
+    if (/[dDgGhHlnNpPqQxz=F]/.test(c)) { while (i < n && /[0-9 \t]/.test(s[i])) i++; continue; }
+    return true;                                // e, w, W, r, R, and anything unknown
+  }
+  return false;
+}
+function sedSafe(words, vals) {
+  const scripts = [];
+  let positional = null, sawE = false, endOpts = false;
+  for (let k = 1; k < words.length; k++) {
+    const t = words[k].text;
+    if (endOpts || !t.startsWith('-') || t === '-') { if (positional === null) positional = k; continue; }
+    if (!words[k].lit) return false;
+    if (t === '--') { endOpts = true; continue; }
+    if (/^-[nErsuz]+$/.test(t) || /^-[nErsuz]*i[\w.~-]*$/.test(t)) continue;
+    if (/^-[nErsuz]*e$/.test(t) || t === '--expression') { sawE = true; if (++k >= words.length) return false; scripts.push(words[k]); continue; }
+    if (t.startsWith('--expression=')) { sawE = true; scripts.push({ text: t.slice(13), lit: true }); continue; }
+    if (/^--(?:quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|sandbox|in-place(?:=[\w.~-]*)?)$/.test(t)) continue;
+    return false;
+  }
+  if (!sawE) { if (positional === null) return false; scripts.push(words[positional]); }
+  for (const w of scripts) {
+    const vs = w.lit ? [] : expansions(w.text, vals);
+    const texts = vs.length ? vs : [w.text];
+    for (const t of texts) {
+      const ph = w.lit ? t : t.replace(/\$\(_\)|\$\{[^}]*\}|\$(?:[A-Za-z_]\w*|[0-9@*?$!#-])/g, PH);
+      if (sedWalkUnsafe(ph)) return false;
+    }
+  }
+  return true;
+}
+
+// --- awk ---
+function awkSafe(words) {
+  let prog = null;
+  for (let k = 1; k < words.length; k++) {
+    const t = words[k].text;
+    if (t === '-F' || t === '-v') { k++; continue; }
+    if (/^-F./.test(t) || /^-v\w+=/.test(t)) continue;
+    if (t === '--') { prog = words[k + 1]; break; }
+    if (t.startsWith('-') && t !== '-') return false;
+    prog = words[k]; break;
+  }
+  if (!prog) return false;
+  if (!prog.lit) return false;
+  const p = prog.text;
+  if (/\bsystem\s*\(|\bgetline\b|@|\bfflush\b|\bclose\s*\(/.test(p)) return false;
+  // blank strings, then regex literals only where an operand may start
+  const noStr = p.replace(/"(?:[^"\\\n]|\\.)*"/g, '""').replace(/(^|[~(,{};&|!\n]\s*)\/(?:[^\/\\\n]|\\.)*\//g, '$1//');
+  if (/(?<!\|)\|(?!\|)/.test(noStr)) return false;            // any pipe
+  if (/\bprintf?\b[^;}\n]*>/.test(noStr)) return false;       // output redirection
+  return true;
+}
+
+// --- curl / wget ---
+const CURL_BOOL = /^(?:-[sSLIifvkgG46#]+|--(?:silent|show-error|location|head|include|fail|fail-with-body|verbose|insecure|compressed|get|globoff|no-progress-meter|http1\.1|http2|ipv4|ipv6|no-buffer))$/;
+const CURL_VAL = /^(?:-[sSLifvk]*[oXHmAew]|--(?:output|request|header|max-time|connect-timeout|user-agent|referer|write-out|retry|retry-delay|retry-max-time|url|data|data-raw|json|data-urlencode))$/;
+function curlSafe(words) {
+  for (let k = 1; k < words.length; k++) {
+    const t = words[k].text;
+    if (!t.startsWith('-')) continue;                          // URL
+    if (CURL_BOOL.test(t)) continue;
+    if (/^-[sSLifvk]*d$/.test(t) || CURL_VAL.test(t)) {
+      const v = words[++k];
+      if (!v) return false;
+      if (/^[@<]/.test(v.text) && !/^(?:-[sSLifvk]*[oXmAe]|--(?:output|request|max-time|connect-timeout|user-agent|referer|retry\S*|url))$/.test(t)) return false;
+      continue;
+    }
+    const eq = /^(--[\w.-]+)=([\s\S]*)$/.exec(t);
+    if (eq && CURL_VAL.test(eq[1])) { if (/^[@<]/.test(eq[2])) return false; continue; }
+    return false;
+  }
+  return true;
+}
+const WGET_OK = /^(?:-[qSc]+|-nv|-O|-o|--(?:quiet|spider|no-verbose|continue|server-response|no-check-certificate|output-document(?:=\S*)?|timeout=\d+|tries=\d+))$/;
+function wgetSafe(words) {
+  for (let k = 1; k < words.length; k++) {
+    const t = words[k].text;
+    if (!t.startsWith('-')) continue;
+    if (!WGET_OK.test(t)) return false;
+    if (t === '-O' || t === '-o' || t === '--output-document') k++;
+  }
+  return true;
+}
+
+// --- gh api: read-only means no method/field/input flag in any spelling ---
+function ghApiWrites(toks) {
+  if (toks[1] !== 'api') return false;
+  for (let k = 2; k < toks.length; k++) {
+    const t = toks[k];
+    if (/^--(?:method|field|raw-field|input)(?:=|$)/.test(t)) { if (/^--method(?:=GET)?$/.test(t) && (t.includes('=') || toks[k + 1] === 'GET')) continue; return true; }
+    if (/^-[A-Za-z]*[fF]/.test(t)) return true;
+    const x = /^-[A-Za-z]*X(.*)$/.exec(t);
+    if (x && (x[1] || toks[k + 1] || '').toUpperCase() !== 'GET') return true;
+  }
+  return false;
+}
+
+// --- a secret-looking literal argument: only name-only commands keep the allow ---
+const NAME_ONLY = /^(?:echo|printf|ls|test|\[|touch|mkdir|stat|basename|dirname|realpath|find|rm|chmod|chown|git|gh|grep|rg|true|cd|pwd|which|type|npm|pnpm|yarn|bun|cargo|make|go|docker|kubectl)$/;
+const MESSAGE_FLAG = /^(?:-m|--message|--body|--title|-t|-b|--notes|-F)$/;
+function secretArg(words, w0) {
+  if (NAME_ONLY.test(w0) && !(w0 === 'git' && /^(?:diff|show|log|blame|cat-file|grep|archive)$/.test((words.find((w, k) => k > 0 && !w.text.startsWith('-')) || {}).text || ''))) return false;
+  let skip = PROGRAM_ARG_VERBS.has(w0);
+  // The last operand of cp / mv / install is the destination: `cp .env.example .env` writes it.
+  let last = words.length;
+  if (/^(?:cp|mv|install)$/.test(w0)) for (let k = words.length - 1; k > 0; k--) if (!words[k].text.startsWith('-')) { last = k; break; }
+  for (let k = 1; k < words.length; k++) {
+    if (k === last) continue;
+    const w = words[k];
+    if (MESSAGE_FLAG.test(w.text)) { k++; continue; }
+    if (w.text.startsWith('-') && !/=/.test(w.text)) continue;
+    if (skip) { skip = false; continue; }
+    if (w.lit && (SECRET_TOKENS_RE.test(w.text) || scan.globHitsSecret(w.text))) return true;
+  }
+  return false;
+}
+
 const CMD_KEYWORDS = new Set(['do', 'then', 'else', 'elif']);
 
 // Flags whose value is a count or an offset, never a path. Without this,
@@ -3095,7 +3913,10 @@ function hasUnresolvedRead(seg, idx) {
   let skipProgramArg = PROGRAM_ARG_VERBS.has(verb);
   for (let i = at + 1; i < toks.length; i++) {
     const t = toks[i];
-    if (NUMERIC_VALUE_FLAG.test(t)) { i++; continue; }   // its value is a count, not a path
+    // A count flag takes a value only for its own verb: for grep and sed `-n` is a switch, and
+    // treating it as valued let the real file argument slip past this floor.
+    if ((/^(?:head|tail)$/.test(verb) && /^-(?:n|c|-lines|-bytes)$/.test(t)) ||
+        (COUNT_FLAG_VERBS.has(verb) && /^-(?:m|A|B|C|-max-count|-after-context|-before-context|-context)$/.test(t))) { i++; continue; }
     if (t.startsWith('-')) continue;
     if (skipProgramArg) { skipProgramArg = false; continue; }
     if (tokenHasOpaqueExpansion(t, known, false)) return true;
@@ -3412,6 +4233,72 @@ if (MAIN) process.stdin.on('end', () => {
     checkSegmentDeny(segments[i], 0, 'hard', expanded[i]);
   }
 
+  // Heredoc-blind view: bodies blanked, so its quoting is clean (in the full text a body holding an
+  // odd `"` can swallow the next command). It gets its own deny passes, as do substitution bodies.
+  let viewSegs = segments;
+  let bodyHigh = false;
+  if (!isPosh && work.includes('<<')) {
+    const view = stripQuotedHeredocBodies(work, true);
+    if (view !== null && view !== work) {
+      viewSegs = splitChainSegments(view.replace(/\n/g, ' ; '));
+      // A blanked body is never approved past a Class A injection finding (the Write tool denies it).
+      bodyHigh = scan.hasHigh(scan.scanInjection(work, { decode: true }));
+    }
+  }
+  const viewX = viewSegs === segments ? expanded : expandSegments(viewSegs, cwd, false);
+  if (viewSegs !== segments) expandSegments(segments, cwd, isPosh);   // varEnv back to the full text
+  const denySubs = (seg, depth, mode) => {
+    if (depth > 6) return;
+    for (const inner of (extractCommandSubs(seg) || [])) for (const s of splitChainSegments(inner)) { checkSegmentDeny(s, depth + 1, mode); denySubs(s, depth + 1, mode); }
+  };
+  const viewPass = (mode) => {
+    if (isPosh) return;
+    if (viewSegs !== segments) for (let i = 0; i < viewSegs.length; i++) checkSegmentDeny(viewSegs[i], 0, mode, viewX[i]);
+    for (const seg of viewSegs) denySubs(seg, 0, mode);
+  };
+  viewPass('hard');
+
+  // Structural pass: one parser reads the command as bash does. Every pipeline at every depth
+  // (substitution bodies, loop bodies, compound redirects) is re-serialised canonically -- de-quoted,
+  // de-escaped, comments gone, known variable values substituted -- and run through the same deny
+  // rules. When it does not parse, the raw passes above are the whole deny coverage, and the
+  // command is never auto-approved.
+  const hostSeed = () => {
+    const m = new Map();
+    try {
+      for (const [k, v] of [['HOME', safeHomedir()], ['PWD', cwd], ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username],
+        ...['TEMP', 'TMP', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE'].map((k) => [k, process.env[k]])]) {
+        if (typeof v === 'string' && v) m.set(k, [v]);
+      }
+    } catch (_) { /* no resolvable user: seed what we have */ }
+    return m;
+  };
+  let ast = null;
+  if (!isPosh) {
+    try { ast = parseBash(work); } catch (_) { ast = null; }
+    if (ast) {
+      const gi = coverageGaps.indexOf('quote-parse');
+      if (gi !== -1) coverageGaps.splice(gi, 1);   // the parser is the authority on quoting
+    }
+  }
+  const structuralPass = (mode) => {
+    if (!ast) return;
+    try {
+      walk(ast, hostSeed(), (p, v) => {
+        const text = p.stages.map(canonStage).join(' | ');
+        const xs = expansions(text, v);
+        checkSegmentDeny(text, 0, mode, xs[0]);
+        for (const x of xs.slice(1)) checkSegmentDeny(x, 0, mode);
+        return true;
+      }, false);
+    } catch (e) {
+      if (!(e instanceof Error)) throw e;   // process.exit stubs (in-process replay) pass through
+     
+      ast = null;   // a walker failure means "not understood": no approve
+    }
+  };
+  structuralPass('hard');
+
   // Injection scan for shell-redirected writes (bash-only), per pipe stage so a
   // later-stage `echo … > f` (or a trailing `| cat`) is still seen. deny()+exit on a hit.
   if (!isPosh) {
@@ -3441,38 +4328,12 @@ if (MAIN) process.stdin.on('end', () => {
   for (let i = 0; i < segments.length; i++) {
     checkSegmentDeny(segments[i], 0, 'ask', expanded[i]);
   }
+  viewPass('ask');
+  structuralPass('ask');
   // A heredoc body is a whole program: the python -c RCE/socket rules apply, but as an ask
   // (`import socket`, `model.eval()` are routine there and a wrong deny is unappealable), and the
   // dual-use stdlib asks (subprocess, os.remove) are skipped -- a script touching files is normal.
   if (!isPosh) for (const s of pythonHeredocsAsInline(work)) checkSegmentDeny(s, 0, 'soft');
-
-  // Approve view: heredoc bodies blanked. It gets its own deny passes because its quoting is
-  // clean -- in the full text a body holding an odd `"` can swallow the next command. The approve
-  // loop below runs on its segments, with variables re-resolved against them.
-  let appSegs = segments;
-  let bodyHigh = false;
-  if (!isPosh && work.includes('<<')) {
-    const view = stripQuotedHeredocBodies(work, true);
-    if (view !== null && view !== work) {
-      appSegs = splitChainSegments(view.replace(/\n/g, ' ; '));
-      const vx = expandSegments(appSegs, cwd, false);
-      for (let i = 0; i < appSegs.length; i++) checkSegmentDeny(appSegs[i], 0, 'hard', vx[i]);
-      for (let i = 0; i < appSegs.length; i++) checkSegmentDeny(appSegs[i], 0, 'ask', vx[i]);
-      // A blanked body is never approved past a Class A injection finding (the Write tool denies it).
-      bodyHigh = scan.hasHigh(scan.scanInjection(work, { decode: true }));
-    }
-  }
-
-  // Substitution bodies run too: deny-check them like segments. On the approve view, so a
-  // commit-message heredoc inside `"$(cat <<'EOF' ... )"` is not read as commands.
-  if (!isPosh) {
-    const denySubs = (seg, depth, mode) => {
-      if (depth > 6) return;
-      for (const inner of (extractCommandSubs(seg) || [])) for (const s of splitChainSegments(inner)) { checkSegmentDeny(s, depth + 1, mode); denySubs(s, depth + 1, mode); }
-    };
-    for (const seg of appSegs) denySubs(seg, 0, 'hard');
-    for (const seg of appSegs) denySubs(seg, 0, 'ask');
-  }
 
   // Coverage gate. Placed after every deny pass (so a hard deny still wins) and
   // before the approve pass (so an unanalysed command can never be auto-approved).
@@ -3481,9 +4342,27 @@ if (MAIN) process.stdin.on('end', () => {
         ') -- approve only if you know what it does', rawCmd);
   }
 
-  let allApproved = !bodyHigh;
-  for (let i = 0; allApproved && i < appSegs.length; i++) {
-    const seg = appSegs[i];
+  // Bash approve: only a command the parser fully read, judged on its argv by one walker.
+  if (!isPosh) {
+    let ok = false;
+    if (ast && !bodyHigh) {
+      const approvedCanon = new Set();
+      for (const sg of approvedScriptSegs) {
+        const a = parseBash(sg);
+        const st = a && a.items.length === 1 && a.items[0].stages.length === 1 ? a.items[0].stages[0] : null;
+        if (st && st.type === 'simple') approvedCanon.add(st.words.map(canonWord).join(' '));
+      }
+      try { ok = approveAst(ast, hostSeed(), 0, approvedCanon); } catch (e) { if (!(e instanceof Error)) throw e;   // process.exit stubs (in-process replay) pass through
+      ok = false; }
+    }
+    if (ok) approve(rawCmd);
+    audit('fallthrough', ast ? '' : 'unparsed', rawCmd);
+    process.exit(0);
+  }
+
+  let allApproved = true;
+  for (let i = 0; allApproved && i < segments.length; i++) {
+    const seg = segments[i];
     if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh, i)) {
       allApproved = false;
       break;
