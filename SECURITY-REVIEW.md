@@ -99,14 +99,14 @@ log against the previous release) gate every change on not adding prompts.
 | B-M3 `bun x <pkg>`, `go run host/mod@v`, `~/.kube/config`, gh `hosts.yml`, `/proc/self/environ` | allow | fallthrough / deny |
 | F-C1 `:*` rule matched against the whole compound command | allow | segment only |
 | F-C2 Windows backslash paths | fallthrough | deny |
-| F-H1 repo-committed `settings.local.json` | allow | ignored when git-tracked |
-| F-H2 agent writes its own trust / hooks / relative `SHELLTER_TRUST_FILE` | fallthrough / allow | deny / ignored |
-| F-H3 Grep `glob`, token-shape regexes | fallthrough | deny (broad path for shapes) |
+| F-H1 repo-committed `settings.local.json` | allow | ignored when git reports it tracked, in any letter case; not honoured when git cannot answer |
+| F-H2 agent writes its own trust / hooks / relative `SHELLTER_TRUST_FILE` | fallthrough / allow | deny for the trust store, installed shellter hook files, the plugin cache subtree and a `package.json` beside the hooks that switches them to ESM; `SHELLTER_TRUST_FILE` inside any git checkout ignored. Settings edits are ask-only, silent in bypass and auto mode |
+| F-H3 Grep `glob`, token-shape regexes | fallthrough | deny for explicit secret-name globs; token shapes only over a broad path. Adapters pass include globs through |
 | F-H4 adapter write tools unscanned | allow | scanned (best-effort shapes) |
-| F-H5 adapters time out on 300 KB comment padding | fail open | linear scan, 20 s timeout |
+| F-H5 adapters time out on 300 KB comment padding | fail open | linear comment scan (250 KB of openers under 2.5 s), 20 s timeout; agy asks on a timeout |
 | F-H6 installer with a space in the home path | fail open | quoted |
 | F-M1 junction / `::$DATA` / other hosts' instruction files | fallthrough | deny |
-| F-M2 invisible format characters, Markdown emphasis | fallthrough | deny on instruction files |
+| F-M2 invisible format characters, Markdown emphasis | fallthrough | deny on instruction files: default-ignorable code points, combining marks and the braille blank are stripped by class; HTML tags and link wrappers seen through |
 | F-M3 false hard-denies on ordinary content | deny | fallthrough / ask |
 | F-M4 `shellter scan` blind spots | no findings | reported |
 | F-M5 decode budget exhausted by 8 decoys | fallthrough | 64 tokens; exhaustion asks on instruction files |
@@ -116,33 +116,95 @@ log against the previous release) gate every change on not adding prompts.
 | F-L3 stale bun adapter tests | red | green |
 | F-L4 dead `permissions` line | present | removed |
 
-The heredoc approve view blanks quoted bodies before the approve pass, so a commit or PR body with
-an apostrophe no longer prompts. Deny passes still read the full text.
+The recursion described above was the round-1 design. Round 2 (below) replaced it with one parser.
+
+## Fourth review - fail-closed approve (v0.11.0, 2026-11-18)
+
+Two reviews of the round-1 fixes found that the approve path still held six independent models of
+bash (chain split, pipe split, substitution extractor, heredoc view, tokenizer, keyword regexes);
+every new bypass was a place where two of them disagreed. The approve side is now one strict parser
+(`parseBash`) and one walker. A command the parser does not fully read is never auto-approved; the
+raw deny passes still run on everything, so deny coverage does not depend on the parser. Parse and
+walk failures of any kind, more than 64 nesting levels and more than 4,096 words all mean "unparsed".
+Every finding below is pinned in `test-hooks.js` with a benign twin, and the reviewers' probe files
+are part of the suite (`test-probes.js`).
+
+| Finding | v0.11.0 round 1 | v0.11.0 |
+| --- | --- | --- |
+| N1 xargs with a quoted or pathed command word | allow | fallthrough |
+| N2 heredoc view blanks real command lines | allow | fallthrough |
+| N3 `((` assumed arithmetic | allow | fallthrough |
+| N4 `for` / `select` approve unread | allow | fallthrough |
+| N5 `node --check` with a preload | allow | fallthrough |
+| N6 `gh api` attached short flags | allow | fallthrough |
+| N7 heredoc `tee` target lost | allow | ask |
+| N8 PowerShell here-string quote parity | allow | fallthrough |
+| H-1 `fi` / `done` prefix approves | allow | fallthrough |
+| H-2 a quote inside a `#` comment | ask | deny |
+| H-3 PowerShell name prefix match | allow | fallthrough |
+| H-4 PowerShell member-name invocation | allow | fallthrough |
+| H-5 sed walker (value-taking flag) | allow | fallthrough |
+| H-6 awk walker | allow | fallthrough |
+| H-7 env prefix behind `time` | allow | fallthrough |
+| H-8 exec-flag gaps (git `ext::`, `fetch -u`, tar `I`, `less +`) | allow | fallthrough |
+| H-9 secret read via a loop variable, attached redirect, `$'\x..'` | fallthrough / allow | deny |
+| H-10 curl header from a secret file | fallthrough | fallthrough (accepted, see below) |
+| H-11 cubic `sed -i` rule (27 KB) | hang | bounded, class timing test |
+| H-12 `-n` as a value flag for every verb | allow | scoped to `head`/`tail`/`grep`/`rg` |
+| M-1 download rule weakened by `&` in a URL | fallthrough | deny restored |
+| M-2 trust-store basename match on fixtures | deny | fallthrough (resolved path compared) |
+| M-3 flagged script behind a pipe, `$( )`, `if` | fallthrough | ask |
+| M-4 heredoc fast path writes `.git/`, `.husky/`, `.claude/settings*.json` | allow | fallthrough / ask |
+| F M-2 Glob `**/*credential*`, `**/*id*` | deny | fallthrough; literal secret stems still deny |
+| F M-4 path lists exhausting the decode budget | ask | fallthrough |
+| F M-9 quoted override phrase in `SKILL.md` | deny | advisory |
+
+Measured on the maintainer's command log (5,389 unique commands) against 0d49eac: 56 benign
+auto-approvals (1.7%) now prompt, all in named classes (env prefix, loop or if body, wrapper, python
+heredoc, invalid sed, `${x%%pat}`, unresolved substitution); 346 rows that prompted now approve; no
+benign command went to deny. Against round 1: 10 allow -> fallthrough, all attack probes or accepted
+classes.
 
 ### Accepted limits (v0.11.0)
+
+- **An unparsed command is never auto-approved, and in bypass mode it runs.** `((..))`, `for ((..))`,
+  functions, `select`, `coproc`, PowerShell here-strings and comments are not modelled.
+- **Derived-name and recursive reads.** A name produced by `find`, `ls`, `grep -l`, `git ls-files`
+  counts as resolved for the approve floor, and `grep -r` / `--include` over a tree is allowed: the
+  same reach as recursive content search, which is the tool's purpose.
+- **Glob forms that are not a literal secret stem** (`*env`, `?env`, `**/*nv`, `*ssh/*`) in Grep and
+  Glob fall through: any rule that catches them re-creates the false denies.
+- **One-character regex evasions** of the token-shape Grep rule (`AK[I]A`): it is a tripwire for mass
+  harvesting, not a boundary.
+- **Write-then-run chains** (a heredoc `package.json` then `npm test`): project-trust model.
+- **`cp /dev/stdin <dest> <<EOF`, `sort -o`** to destinations other than rc files and shellter's own
+  files: general write-target classification is deferred.
+- **`time X=v cmd`, and an app variable in prefix form before a read-only tool** fall through.
+- **PowerShell has no full parser.** `poshScan` rejects what it does not model.
 
 - **Code runners** (`tsx x.ts`, `ts-node`, `bun run`, `uv run`, `java -jar`, `pnpm exec`) still
   auto-approve: they run project code, the same trust as `npm run`. Only the remote-fetch forms
   (`bun x <pkg>`, `go run host/mod@version`) were closed.
 - **Destructive or persistent writes** that no rule names (`chmod -R 000 ~`, `mv ~/Documents /tmp`,
-  `git switch -f`, `echo x > ~/.config/autostart/...`, `cp evil ~/.bashrc`) still auto-approve. A
-  write-target classifier needs its own release and false-positive budget.
-- **`PATH=` / `PYTHONPATH=` / `LD_LIBRARY_PATH=` prefixes** stay approvable: they need a planted
-  file first, and `export PATH="$HOME/.cargo/bin:$PATH" && cargo build` is everywhere.
+  `git switch -f`, `echo x > ~/.config/autostart/...`) still auto-approve. Only shell rc files and
+  Claude Code settings (ask) and shellter's own files (deny) are classified as write targets.
+- **`PATH=` over system or home directories and app variables before a project-code runner** stay
+  approvable: `export PATH="$HOME/.cargo/bin:$PATH" && cargo build` is everywhere. Loaders
+  (`LD_*`, `DYLD_*`, `BASH_ENV`, `HOME`, ...) never approve.
 - **A secret env var in a header or URL** (`curl -H "Authorization: Bearer $GITHUB_TOKEN" ...`) is
   indistinguishable from every authenticated API call.
 - **`cp $X out.txt` with an unresolved `$X`** stays approvable: copying is not disclosure.
-- **sed / awk scripts whose shell variable carries code at runtime** are not modelled.
-- **Loop variables over a literal word list** (`for f in a b; do grep x $f; done`) stay
-  "unresolved" and prompt, as before. Resolving them is the largest remaining prompt-rate win.
+- **sed / awk scripts whose shell variable carries code at runtime** do not approve: an unresolved
+  expansion in a sed script may only stand for a line number, and an awk program must be literal.
 - **Heredoc bodies of `cat`/`tee`** are still deny-scanned as pseudo-commands (a known false-prompt
   source); relaxing a deny pass does not belong in a security-fix release.
 - **WebFetch / WebSearch** are not gated: exfiltration needs a secret already read, which the gated
   tools cover.
 - **MCP tools (`mcp__*`) are a known bypass.** A filesystem or shell MCP server reads and runs what
   it is asked; shellter does not know its tool shapes, and a generic sniff would false-deny.
-- **Adapters fail open on a timeout.** The cause (a superlinear comment scan) is fixed; failing
-  closed would turn a slow machine into a false block.
+- **Adapters other than agy fail open on a timeout.** The cause (a superlinear comment scan) is
+  fixed and the scan is linear; agy asks, and failing closed elsewhere would turn a slow machine into
+  a false block.
 - **`ls` / `list` on `~/.ssh`** through the opencode and pi adapters: filenames only.
 - **Host tool shapes** for codex / agy / opencode patch and multi-edit tools are best-effort; only
   the adapter side is verified.

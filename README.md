@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.11.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-1616%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-1874%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -114,18 +114,26 @@ JSON on stdin, JSON on stdout.
 the prompt). Exit `0` = structured decision or fallthrough; exit `2` = hard block (stderr
 shown).
 
-## Recursive wrapper checking
+## How a command is read
 
-| Wrapper | Behaviour |
+Bash auto-approve is fail-closed. One parser (`parseBash`) reads the command the way bash does:
+quoting, `$'..'` escapes, `$VAR` and `${..}`, `$( )`, backticks, `<( )`, `$(( ))`, redirections,
+heredocs, comments, pipelines, `&&`, `||`, `;`, `&`, `if`, `while`, `until`, `for NAME in`, `case`,
+`{ }`, `( )`, `[[ ]]`. A command it does not fully read (`((..))`, functions, `select`, more than 64
+nesting levels or 4,096 words) is never auto-approved. One walker visits every pipeline at every depth
+with the values variables can hold, and feeds three passes: structural deny, structural ask, approve.
+
+| Shape | Behaviour |
 | --- | --- |
-| `bash -c '…'` / `sh -c` | inner command parsed, deny/approve recurses per segment |
-| `bash -c "$(curl …)"` | denied — opaque payload |
-| `find … -exec CMD … \;` | `CMD` parsed and checked |
-| `xargs … CMD` | `CMD` parsed and checked |
+| `bash -c '…'` / `sh -c` | inner command parsed from argv, checked like a top-level command |
+| `bash -c "$(curl …)"` | denied - opaque payload |
+| `find … -exec CMD … ;`, `xargs … CMD`, `trap` | `CMD` taken from the word list and checked |
 | process substitution | inner command checked; `bash <(curl …)` and `source <(curl/wget/base64 …)` denied; `source <(kubectl completion …)` and other local generators allowed |
-| `X=1 cmd`, `timeout`/`time`/`command`/`builtin`, `if`/`for`/`while`/`case`, `( )`, `{ }`, `trap`, `&` | approve side: approves only if the command it runs approves (`X=1 npm test` yes, `X=1 node x.js` no) |
+| `X=1 cmd`, `timeout`/`time`/`command`/`builtin`, `if`/`for`/`while`/`case`, `( )`, `{ }` | approves only if the command it runs approves (`X=1 npm test` yes, `X=1 node x.js` no) |
 | `$( )`, backticks, `<( )`, `>( )` | every body is deny-checked and must itself approve |
-| PowerShell `( )`, `$( )`, `{ }`, pipe stages | every group body and every stage must approve |
+| `for f in a b`, `A=x; B=$A/y` | a loop variable holds its literal words and known values compose, so `for f in .env; do cat $f; done` denies like `cat .env` |
+| known tools (`sed`, `awk`, `curl`, `gh api`, env prefixes, ...) | known flags only; an unknown flag means no approve |
+| PowerShell `( )`, `$( )`, `{ }`, pipe stages | every group body and every stage must approve; here-strings and comments are not modelled |
 
 ## Script trust
 
@@ -145,10 +153,11 @@ node ~/.claude/hooks/shellter-trust.js remove <hash|path>
 ```
 
 Trust survives move/rename; editing the script invalidates it. Store at
-`~/.claude/shellter-trust.json` (override with `SHELLTER_TRUST_FILE`, an absolute path outside the
-project). A `:*` allow rule is matched against the script segment only, and a
-`.claude/settings.local.json` that is tracked by git is ignored: a cloned repo cannot whitelist
-its own script. shellter denies writes to its trust store and installed hooks. If a build doesn't
+`~/.claude/shellter-trust.json` (override with `SHELLTER_TRUST_FILE`, an absolute path outside any
+git repository). A `:*` allow rule is matched against the script segment only, and a project's
+`.claude/settings.local.json` is honoured only when git positively reports it untracked: a cloned
+repo cannot whitelist its own script. shellter denies writes to its trust store, its installed files
+and a module-type `package.json` beside them. If a build doesn't
 surface `ask` reasons, set `SCRIPT_RISK_DECISION` in `check-bash.js` to `'deny'`.
 
 ## Injection-on-write
@@ -311,9 +320,8 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.11.0 - security-fix release: auto-approve is
-structural (an env prefix, wrapper, keyword, substitution or heredoc approves only if what it runs
-approves), secret reads see through globs and escapes, Windows backslash paths are canonicalised,
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.11.0 - security-fix release: bash auto-approve is
+fail-closed (one parser reads the command; what it cannot read is never auto-approved), secret reads see through globs and escapes, Windows backslash paths are canonicalised,
 and the trust store ignores repo-committed allow rules. Previously 0.10.0 - never asks in bypass or auto mode
 (denies still block), stops false "could not fully analyze" prompts on heredocs, nested `$( … )`
 quoting (found in real sessions), analyzes Python fed through a heredoc, narrows the

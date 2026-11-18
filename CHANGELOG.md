@@ -7,97 +7,140 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
-## [0.11.0] - 2026-11-17
+## [0.11.0] - 2026-11-18
 
-A security-fix release from a third review: the auto-approve pass now asks what a command actually
-runs, secret reads see through globs and escapes, and the trust store can no longer be steered by a
-cloned repo. The rule that kept the prompt rate flat: an over-broad allow becomes a recursion, not a
-deletion, so `X=1 npm test`, `timeout 30 npm test` and `if [ -f x ]; then npm test; fi` keep their
-silent allow. **In bypassPermissions and auto mode this release adds no prompts**: the only new
-verdicts there are denies on shapes whose plain form already denies.
+A security-fix release from two review rounds. Bash auto-approve is now fail-closed: one parser reads
+the command the way bash does, and a command it does not fully understand is never auto-approved.
+Secret reads see through globs, escapes and variables, the trust store can no longer be steered by a
+cloned repo, and a set of false denies from the first round is gone. **In bypassPermissions and auto
+mode this release adds no prompts**; the new denies there are the shapes whose plain form already
+denies, plus four deliberate ones: writing shellter's trust store, its installed files or plugin
+cache, a module-type `package.json` beside the hooks, and a `data:text/html` link in Markdown.
+
+**Auto-approve is fail-closed.** `parseBash` is one recursive-descent parser for the subset of bash the
+approve path needs: words with all quoting forms (`$'..'` escapes decoded), `$VAR`, `${..}`, `$( )`,
+backticks, `<( )`, `$(( ))`, redirections, heredocs (bodies read by the parser itself), comments,
+pipelines, `&&`, `||`, `;`, `&`, `if`, `while`, `until`, `for NAME in`, `case`, `{ }`, `( )`, `[[ ]]`
+and `!`. One walker visits every pipeline at every depth (substitution bodies, loop bodies, redirects
+on compound commands) with the values variables can hold, and three passes use it: structural hard
+deny, structural ask, approve. Approve works on argv, never on raw text: the command word must be a
+literal, and wrappers, `trap`, `find -exec`, `xargs` and `sh -c` take their inner command from the
+word list, so a quoted, escaped or path-qualified spelling changes nothing. The deny passes also see a
+canonical re-serialisation of every pipeline (de-quoted, de-escaped, comments gone, known variable
+values substituted), which is what makes `cat<.env`, `cat .e$'\x6e'v`, `for f in .env; do cat $f;
+done` and `ls # '` + newline + a denied command deny with no new rule. Not modelled, so never
+auto-approved: `((..))` and `for ((..))`, functions, `select`, `coproc`, `$[ ]`, `;&`, a heredoc
+delimiter that is not a plain word, a backslash or `<<` inside backticks, a lone CR, NUL, more than 64
+nesting levels or 4,096 words. The raw deny passes still run on everything; deny coverage never
+depends on the parser.
+
+Argument models refuse unknown flags: environment (`ENV_SAFE` names, program variables only with a
+bare word, loaders such as `LD_*`/`BASH_ENV`/`HOME` never, `PATH` only over system or home
+directories, any other variable only in front of a project-code runner), `sed` (a script walk where an
+unresolved expansion may only stand for a line number), `awk` (`-F`/`-v` only, no `system`, `getline`,
+`|`, `print >`), `curl`/`wget` (a flag allowlist; `@file` uploads refused), `gh api` (no method or
+field flag in any spelling), `node --check <file>`, git long options by unique prefix and `ext::`
+URLs, `git fetch -u`, `tar` compressors and old-style `I` bundles, `less +`, `tmux`/`screen`
+inspection only, `bun x` and `go run host/mod@v`. A literal secret name as an argument refuses the
+allow except for name-only commands (`ls`, `test`, `touch`, `git add`, a grep pattern, ...) and a
+`cp`/`mv` destination (`cp .env.example .env` still allows); `grep -f .env` and `--include=.env`
+read the file and refuse it. Count flags take a
+value only for their own verb (`-n` for `head`/`tail`, `-A/-B/-C/-m` for `grep`/`rg`): the old floor
+read `grep -n x $UNSET` as reading nothing. A loop variable over literal words holds those words, a
+value composed of known literals resolves, and a name fed only by a name producer (`find`, `ls`,
+`grep -l`, `git ls-files`, ...) counts as resolved for the approve floor (the same reach as `grep -r`).
+Write targets are read off the syntax tree: writing shellter's trust store or installed files denies
+and writing Claude Code settings or a shell rc file asks, through `tee --`, `dd of=`, `ln`, globs and
+after `cd`. A flagged script is found behind a pipe, in a substitution or in an `if`.
+
+PowerShell keeps its single scanner, now fail-closed: here-strings, line and block comments,
+typographic quotes and a lone CR are not modelled, a stage's command must be a plain name
+(`echo\..\x.cmd`, `type.bat` and `cat-evil` are not the alias), `Out-File` to an executable or
+`.envrc` does not approve,
+`ForEach-Object` takes script blocks or a known property name only (`% Delete` is a method call),
+every pipe stage and every `( )`, `$( )` and `{ }` body must approve, `2>&1` is a stream merge, and
+`Get-Item .env | Select-String .` and `Select-Xml -Path .env` deny.
 
 **Fewer false blocks.**
 - Keycap, (c), (R), TM and info-sign emoji with a variation selector no longer deny as smuggling.
-- A ZWJ emoji sequence or a leading BOM in `.tsx`/`.json`/`.yml` no longer denies; a zero-width char
-  anywhere else still does.
+- A ZWJ emoji sequence or a leading BOM in `.tsx`/`.json`/`.yml` no longer denies.
 - `re.exec(atob(x))` asks instead of denying; a bare `eval(atob(x))` still denies, and python
   `exec(base64.b64decode(x))` now does too.
-- A `javascript:` link denies only where it renders (Markdown/HTML, instruction files); a sanitizer
-  test in `.js` is fine. `[x](data:text/html,...)` in Markdown now denies (the old rule never matched).
-- `<IMPORTANT>` blocks deny only on concealment or a transfer verb aimed at a secret.
+- A `javascript:` link denies only where it renders (Markdown/HTML, instruction files).
+- `<IMPORTANT>` blocks deny only on concealment, a transfer verb within 120 characters of a secret
+  path, or `execute curl`.
 - A literal ESC colour sequence asks in source files and denies only in instruction files.
-- On instruction files, `<system>`/`<instructions>` tags, `User:`/`Assistant:` examples, persona
-  phrasing ("act as if you are"), and an HTML comment holding a link or the word "token" are advisory.
-  "you are now in the project root" and "if the user gives new instructions" no longer match.
+- On instruction files, `<system>` tags, `User:`/`Assistant:` examples, persona phrasing, "you are
+  now a ...", an override phrase quoted in inline code, a fenced block, a blockquote or after an
+  opening quote, and an HTML comment holding a link or "token" are advisory.
+- Grep denies a token-shape regex (`AKIA[`, `ghp_[`, `BEGIN ... PRIVATE KEY`, case-sensitive) or a
+  `password\s*=` search only over a broad path: a filesystem or drive root, a home root, an ancestor
+  of your home, a dot-directory directly under a home, or system config. A project below your home is
+  not broad (`privateKey`, `beginSection`, `token: string` searches were denying).
+- A glob denies only through a literal secret stem after brace expansion (`**/.env*`, `**/id_rsa*`,
+  `*.pem`, `*.{pem,key}`, `[.]env`, `.{ssh,aws}/**`); `**/*credential*`, `**/*id*`, `**/*.p*` fall
+  through. Not caught: `*env`, `?env`, `**/*nv`, `*ssh/*`, `**/id_rs*`.
+- The decode budget counts tokens that decode to text, so a CLAUDE.md or memory file listing paths or
+  commit SHAs no longer asks "too many encoded tokens".
+- PowerShell `git status 2>&1`, `(Get-Date).AddDays(-1)` and `tar --use-compress-program=zstd` allow.
 
-**Auto-approve is now structural.** A segment approves only if what it runs approves: an env prefix,
-`command`/`timeout`/`time`/`builtin`, shell keywords (`if`/`for`/`while`/`case`/subshell/brace
-group), `trap`, every `$( )`, backtick, `<( )` and `>( )` body, `find -exec`, and `xargs` are all
-recursed into. A single `&` now separates commands. The heredoc fast path accepts only an exact
-`cat`/`cat > file` preface and sends trailing commands through the full pipeline; heredoc bodies are
-blanked for the approve pass (so `git commit -m "$(cat <<'EOF' ... it's ... EOF)"` now allows instead
-of asking). Approve-listed commands that execute their arguments lose the approve on those options:
-`awk system()/getline/print |`, `sed e`/`s///e`/`w`, `tar --checkpoint-action/--to-command`,
-`git rebase -x`/`bisect run`/`--upload-pack`, `fd -x`, `rg --pre`, `sort --compress-program`,
-`tmux new-session`, `screen -dm`, `bun x <any package>`, `go run host/mod@version`. Env names whose
-value is run as a command (`*_PAGER`, `*EDITOR`, `GIT_SSH_COMMAND`, `LD_*`, ...) keep the approve only
-with a bare-word value. PowerShell approve is structural too: every pipe stage, every `( )`, `$( )` and
-`{ }` body must approve, a mid-stage `&` does not approve, redirect targets must be project files, and
-the verb-prefix rule is narrowed (`Format-Volume` no longer approves).
-
-**Secret reads.** Globs that expand to a secret (`cat .en*`, `~/.s?h/id_r*a`), backslash and `$'x'`
-escapes (`.e\nv`), more read verbs at command position (`sort`, `uniq`, `diff`, `comm`, `expand`,
-`fmt`, `shuf`, `join`, `tsort`), an input redirect anywhere in the segment (`sort < .env`,
-`done < .env`), `ln -s` of a secret, `git diff --no-index`, `curl file://`, `curl --json @`, bundled
-`-sT`, `wget --body-file` and the PowerShell spellings (`` .e`nv ``, `.e"n"v`, `('.e'+'nv')`,
-`${C:\p\.env}`) all deny like the plain form. File tools: backslash paths, NTFS stream and
-trailing-dot spellings, junctions into `.claude/`, `.envrc`, `.env_prod`, `_netrc`,
-`/proc/*/environ`, `~/.kube/config`, gh `hosts.yml` deny; shell history and `~/.claude.json` ask.
-Grep's `glob` is checked, and a token-shape regex or `password\s*=` over a home/system/drive-root
-path denies.
+**Secret reads.** Globs, backslash and `$'x'` escapes, more read verbs at command position, an input
+redirect anywhere, `find -name .env -exec cat`, `echo .env | xargs cat`, `ln -s`,
+`git diff --no-index`, `curl file://`, `curl --json @`, bundled `-sT`,
+`wget --body-file` and the PowerShell spellings deny like the plain form. File tools: backslash
+paths, NTFS stream and trailing-dot spellings, junctions into `.claude/`, `.envrc`, `.env_prod`,
+`_netrc`, `/proc/*/environ`, `~/.kube/config`, gh `hosts.yml` deny; shell history and
+`~/.claude.json` ask.
 
 **Trust store.** A `:*` allow rule is matched against the script's own segment, never the whole
-compound command (`git status; bash ./evil.sh` under `Bash(git status:*)` used to allow). A
-`.claude/settings.local.json` that the repo commits is ignored. `SHELLTER_TRUST_FILE` must be an
-absolute path outside the working directory. Writing the trust store or an installed shellter hook
-denies; writing `.claude/settings*.json` asks.
+compound command. A project's `.claude/settings.local.json` is honoured only when git positively
+reports it untracked, in any letter case, with `.claude` itself not tracked and every `GIT_*`
+variable stripped; without git, or when git cannot answer, it is not honoured (the trust store still
+works). `SHELLTER_TRUST_FILE` must be an absolute path outside the working directory and outside any
+git checkout. shellter denies writes to its trust store, its installed hook files, its plugin cache
+and a module-type `package.json` beside the hooks, and ships `hooks/package.json` as CommonJS; writing
+`.claude/settings*.json` asks (silent in bypass and auto mode).
 
-**Hang and crash hardening.** The assignment scan is linear (a 36-step ambiguous prefix hung the hook
-for 30 s+), two polynomial rules are bounded, the HTML-comment scan is an indexOf walk (300 KB of
-padding pushed adapter calls past their timeout), adapter timeouts are 20 s, a UTF-8 BOM before the
-hook JSON is accepted, nested argv arrays are flattened, and the installer quotes hook paths (a home
-with a space failed open) and refuses to rewrite a settings file that is not a JSON object.
+**Hang and crash hardening.** The assignment scan is linear, the parser caps nesting and words and
+treats any exception as "not parsed" (5,000 and 50,000 nested `$(` answer), argv expansion is linear,
+every deny rule returns in under 600 ms on 30 KB of its own prefix and four fixed paddings (a class
+test; the `sed -i` rules took 68 s), the HTML-comment scan reuses its closer (250 KB of openers: under
+2.5 s through the hook, was 30 s), adapter timeouts are 20 s and agy asks when the detector times out,
+a UTF-8 BOM before the hook JSON is accepted, nested argv arrays are flattened, and the installer
+quotes hook paths and refuses to rewrite a settings file that is not a JSON object.
 
-**Scanner coverage.** Instruction surfaces now include `.cursor/rules/`, `.opencode/`, `opencode.json`,
-`.codex/`, `.gemini/`, `.github/instructions/`, `.pi/`, `.agents/`, `.windsurf/rules/` and any
-`SKILL.md`. Soft hyphen, LRM/RLM, invisible operators and similar format characters are stripped
-before matching, and Markdown emphasis inside a keyword is seen through. The decode budget is 64
-tokens (256 KB cap); running out on an instruction file asks. `shellter scan` sees through a
-`FF FE` prefix, scans `.mcp.json` command lines, `statusLine.command` and a `hooks` path in
-`plugin.json`, reads quoted and flow-list `allowed-tools`, and flags `Bash(**)`, `Bash(:*)`,
-`defaultMode: auto` and remote `type: http` hooks. The codex/agy shim and the opencode adapter
-gate `apply_patch`/`patch` blobs per file, agy `ReplacementChunks`, `search_replace`, `edit_file`
-and `multiedit` (tool shapes are best-effort).
+**Scanner coverage.** Instruction surfaces include `.cursor/rules/`, `.opencode/`, `opencode.json`,
+`.codex/`, `.gemini/`, `.github/instructions/`, `.pi/`, `.agents/`, `.windsurf/rules/`, `.clinerules/`,
+`.roo/rules/`, `.kiro/steering/` and any `SKILL.md`. Default-ignorable code points, combining marks and
+the braille blank are stripped before matching, and Markdown emphasis, HTML tags and link wrappers
+inside a keyword are seen through. `shellter scan` sees through a `FF FE` prefix, scans `.mcp.json`
+and `plugin.json` MCP and LSP server command lines and loader variables, `statusLine.command` and a
+`hooks` path, reads quoted and flow-list `allowed-tools`, and flags `Bash(**)`, `Bash(:*)`,
+`Bash(*:*)`, `defaultMode: auto` and remote `type: http` hooks. The codex/agy shim and the opencode
+adapter gate patch blobs per file (`Move to:`, indented headers, unified diffs, the argv form), more
+edit shapes (`new_str`, `file_text`, `code_edit`, `ReplacementChunks`) and pass Grep include globs
+through; tool shapes are best-effort.
 
 **Behaviour changes you may notice** (default, acceptEdits and plan mode only):
 - These used to auto-approve and now prompt, because the bare command prompts: an env prefix over a
-  non-approved command (`PYTHONPATH=. python -m mod`), a loop/if body or wrapper running one
-  (`timeout 90 ./run.sh`), a substitution running one or reading an unresolved variable, and an
-  exec-carrying env with a command-line value (`export GIT_CONFIG_PARAMETERS="..."`).
-- Python heredocs (`python3 - <<'EOF'`) prompt: the old body validator was a keyword blacklist.
-- A PowerShell pipeline whose later stage runs a non-approved command (`echo $q | docker exec -i db psql`)
-  prompts: every stage must approve now.
-- PowerShell `@{}` calculated properties, static calls outside `[math]`/`[string]`/`[datetime]`/...,
-  and `Out-File`/`Set-Content` to a path prompt.
-- `sort $f`/`diff $a $b` over an unresolved variable prompts, as `cat $f` already did, and
-  `diff .env.example .env` denies, as `cat .env` does.
-- Measured on one maintainer's real command log (5,379 unique commands, 3,385 benign auto-approvals):
-  57 benign commands (1.7%) now prompt, all in the classes above; 234 that used to prompt now
-  auto-approve (pnpm `--dir`/`--filter` and script-name forms, `npx --prefix`, `gh api` reads, loops
-  and conditionals whose body approves, `[ ]`, subshells, commit and PR heredocs). No benign command
-  went to deny.
+  non-approved command (`PYTHONPATH=. python -m mod`), a loop or if body or wrapper running one, a
+  substitution running one or reading an unresolved variable, an exec-carrying env with a command-line
+  value, a `${x%%pat}` operator over a loop variable, and an unknown variable before a read-only tool
+  (`X=a=b true`).
+- Python heredocs prompt; PowerShell here-strings, comments, `@{}` calculated properties, static calls
+  outside `[math]`/`[string]`/`[datetime]`/..., `Out-File` to a path and a pipeline whose later stage
+  runs a non-approved command prompt.
+- Constructs the parser does not model prompt (`((i++))`, functions).
+- These now deny because the read is seen: `for f in .env; do cat $f; done`, `D=$HOME/.ssh; cat
+  $D/known_hosts`, a read hidden behind an apostrophe in a comment.
+- A project's `settings.local.json` outside a git repo no longer silences a flagged script.
+- Measured on one maintainer's real command log (5,389 unique commands, 3,384 benign auto-approvals
+  at 0.10.0): 56 benign commands (1.7%) now prompt, all in the classes above; 346 that used to prompt
+  now auto-approve (pnpm `--dir`/`--filter` and script-name forms, `npx --prefix`, `gh api` reads,
+  loops and conditionals whose body approves, `[ ]`, subshells, commit and PR heredocs, variables over
+  known paths). In that replay no benign command went to deny, and no PowerShell row moved untriaged. The reviewers' probes are pinned as tests.
 
-1616 tests in test-hooks.js, 31 shim checks, 33 bun adapter checks (opencode 18, pi 15).
+1874 tests in test-hooks.js (one POSIX-only), 41 shim checks, 33 bun adapter checks (opencode 18, pi 15).
 
 ## [0.10.0] - 2026-09-30
 
