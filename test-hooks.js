@@ -3578,6 +3578,34 @@ console.log('\n--- 0.11.0 r3 step 7: one approve path for heredocs (B F2, F8) --
   for (const c of ['test -d x', 'pre-commit run', 'python3 -m pytest']) testBash('F8 twin: ' + c + ' allows', c, 'allow');
 }
 
+console.log('\n--- 0.11.0 r3 step 8: one table of what sets a name, one definition of integer (G4) ---');
+{
+  const M = 'node x.js';
+  const AR = "'a[$(" + M + ")]'";
+  // B F4: an expansion where sed reads a line number must be an integer
+  for (const c of ['sed -n "$(echo ' + "'1e " + M + "'" + ')p" f', 'x=$(echo 1e); sed -n "${x}p" f', join(': ${x:=1e ', M, ' #}; sed -n "${x}p" f')])
+    testBash('F4: ' + c.replace(M, 'M') + ' does not approve', c, 'fallthrough');
+  testBash('F4 twin: n from grep -n | cut; sed -n "${n},$((n+5))p" f allows', 'n=$(grep -n x f | cut -d: -f1); sed -n "${n},$((n+5))p" f', 'allow');
+  // B F5: every arithmetic evaluation site, and every name position
+  for (const c of ['x=' + AR + "; cat <<EOF\n${a[x]}\nEOF", 'x=' + AR + "; trap 'echo $((x))' EXIT", 'export x=' + AR + "; bash -c 'echo $((x))'",
+    'printf -vx %s ' + AR + '; echo $((x))', '[[ ' + AR + ' -eq 0 ]]', '[[ -v ' + AR + ' ]]', '[ -v ' + AR + ' ]', 'test -v ' + AR,
+    'printf -v ' + AR + ' %s x', 'read ' + AR, 'declare -i x=' + AR, 'typeset -i x=' + AR, "declare -n r=" + AR + '; echo $r',
+    '[[ $(echo ' + AR + ') -eq 0 ]]', 'echo $(( $(echo ' + AR + ') + 1 ))'])
+    testBash('F5: ' + c.replace(M, 'M').replace(/\n/g, ' ') + ' does not approve', c, 'fallthrough');
+  for (const c of ['count=$(ls | wc -l); [[ $count -gt 0 ]] && echo some', 'read -p "Continue [y/n]? " a', "printf '%s\\n' \"${arr[@]}\"",
+    'START=$(date +%s); echo "took $(( $(date +%s) - START ))s"', 'for i in $(seq 1 3); do echo $((i*2)); done', 'export N=3; echo $((N+1))'])
+    testBash('F5 twin: ' + c + ' allows', c, 'allow');
+  testBash('F5 deferred: x=$(cat count.txt); echo $((x+1)) still falls through', 'x=$(cat count.txt); echo $((x+1))', 'fallthrough');
+  // B F6: every name the table sets goes through the PATH / loader rule
+  for (const c of ['for PATH in ./d; do ls; done', 'read PATH <<< ./d; ls', 'printf -v PATH %s ./d; ls', 'hash -p ./x.sh ls; ls', join(': ${PATH:=./d}; ls')])
+    testBash('F6: ' + c + ' does not approve', c, 'fallthrough');
+  for (const c of ['hash -r', 'for f in a b; do ls $f; done', 'export PATH="$HOME/.cargo/bin:$PATH" && cargo build', 'while IFS= read -r line; do echo "$line"; done < f.txt'])
+    testBash('F6 twin: ' + c + ' allows', c, 'allow');
+  testBash('F6: a standalone IFS= still does not approve', 'IFS=/; ls', 'fallthrough');
+  // B R2: printf -v drops the stale value
+  testBash('R2: printf -vx %s .env; cat $x does not approve', join('x=a; printf -vx %s .e', 'nv; cat $x'), 'fallthrough');
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a

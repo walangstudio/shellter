@@ -2336,7 +2336,8 @@ const APPROVE_PATTERNS = [
   /^\s*(?:\[\[?\s|:(?:\s|$)|(?:break|continue|return|exit|shift|wait|sleep)\b)/,
   // `source` / `.` removed here: routed through the script-content scanner so a
   // sourced local script is inspected, not blanket-approved.
-  /^\s*(set|type|hash|read|unset)\s/,
+  /^\s*(set|type|read|unset)\s/,
+  /^hash(?:\s+-r|\s+-t\s+[\w.-]+)?$/,
   /^\s*type\s+-[apt]/,
 
   // Multiplexers / archives / perms
@@ -3192,6 +3193,7 @@ function parseBash(src0, depth) {
   let pending = [];
   let nest = 0, words = 0;
   const arith = [];                            // every expression bash evaluates arithmetically
+  const intSubs = [];                          // substitutions whose output bash evaluates as arithmetic
   const bad = () => { throw PF; };
   const blanks = () => {
     for (;;) {
@@ -3217,6 +3219,13 @@ function parseBash(src0, depth) {
       h.body = lines.join('\n');
       // Unquoted, bash joins a line ending in `\` with the next before looking for the terminator.
       if (!h.quoted && /\$\(|`|\$\[|\\$/m.test(h.body)) bad();
+      // An unquoted body expands like a double-quoted word: its subscripts, offsets and `$(( ))`
+      // are arithmetic contexts too.
+      if (!h.quoted) {
+        for (const m of h.body.matchAll(/\$\{[!#]?\w+\[([^\]]*)\]/g)) if (!/^[@*]$/.test(m[1])) arith.push(m[1]);
+        for (const m of h.body.matchAll(/\$\{\w+:(?![-=?+])([^}]*)\}/g)) arith.push(m[1]);
+        for (const m of h.body.matchAll(/\$\(\(([\s\S]*?)\)\)/g)) arith.push(m[1]);
+      }
     }
     pending = [];
   };
@@ -3237,8 +3246,18 @@ function parseBash(src0, depth) {
       let j = i + 3, d = 0;
       for (; j < n; j++) { if (src[j] === '(') d++; else if (src[j] === ')') { if (d === 0) break; d--; } }
       if (src[j] !== ')' || src[j + 1] !== ')') bad();
-      const expr = src.slice(i + 3, j);
-      if (!/^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(expr) || /\$\(/.test(expr)) bad();   // a $( ) inside would run unread
+      // A `$( )` inside is parsed and stands as 0; its output is evaluated, so it must print an integer.
+      let expr = '';
+      for (let k = i + 3; k < j; ) {
+        if (src[k] !== '$' || src[k + 1] !== '(') { expr += src[k++]; continue; }
+        let e = k + 2, d = 0;
+        for (; e < j; e++) { if (src[e] === '(') d++; else if (src[e] === ')') { if (d === 0) break; d--; } }
+        const sub = parseBash(src.slice(k + 2, e), depth + 1);
+        if (!sub) bad();
+        arith.push(...sub.arith); intSubs.push(sub, ...sub.intSubs); w.subs.push(sub);
+        expr += '0'; k = e + 1;
+      }
+      if (!/^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(expr)) bad();
       arith.push(expr);
       w.text += '1'; w.arith = true; i = j + 2; return;
     }
@@ -3315,7 +3334,7 @@ function parseBash(src0, depth) {
     if (/[\\\n]|<</.test(inner)) bad();
     const ast = parseBash(inner, depth + 1);
     if (!ast) bad();
-    arith.push(...ast.arith);
+    arith.push(...ast.arith); intSubs.push(...ast.intSubs);
     w.subs.push(ast); w.text += '$(_)'; w.lit = false; i = e + 1;
   };
   // A word. text = what bash passes, with expansions left as raw `$X` / `${..}` / `$(_)`.
@@ -3506,8 +3525,11 @@ function parseBash(src0, depth) {
         if (/[&|<>()]/.test(src[i])) { if ((src[i] === '<' || src[i] === '>') && src[i + 1] === '(') bad(); i++; continue; }
         node.words.push(word());
       }
-      // `[[ x -eq 0 ]]`: the operands are evaluated arithmetically.
-      if (node.words.some((w) => /^-(?:eq|ne|lt|le|gt|ge)$/.test(w.text))) arith.push(node.words.map((w) => w.text).join(' '));
+      // `[[ x -eq 0 ]]`: the two operands are evaluated arithmetically (a substitution's output too).
+      node.words.forEach((w, k) => {
+        if (!/^-(?:eq|ne|lt|le|gt|ge)$/.test(w.text)) return;
+        for (const o of [node.words[k - 1], node.words[k + 1]]) if (o) { arith.push(o.text); intSubs.push(...o.subs); }
+      });
       return redirs(node);
     }
     if (r) bad();                              // a reserved word where a command must start
@@ -3572,7 +3594,7 @@ function parseBash(src0, depth) {
     const ast = list([]);
     blanks();
     if (i < n || pending.length) return null;
-    ast.arith = arith; ast.src = src;
+    ast.arith = arith; ast.intSubs = intSubs; ast.src = src;
     return ast;
   } catch (e) {
     return null;
@@ -3604,11 +3626,70 @@ const canonStage = (st) => (st.type === 'simple' ? canonSimple(st, true)
 // vals: Map name -> array of every literal value the name can hold here (loop words, branches).
 // A name that is absent is unresolved. cb(pipeline, vals) -> false stops the walk.
 const VALS_MAX = 32;
-const SETS_VARS = /^(?:read|mapfile|readarray|getopts|let|eval|source|\.)$/;
-const setsVars = (st) => SETS_VARS.test(base(st.words[0].text)) || (st.words[0].text === 'printf' && st.words.some((w) => w.text === '-v'));
 function wordSubs(w) { return w ? w.subs : []; }
 // Names a ${x:=w} / ${x=w} in a stage's words, assignment values or redirect targets assigns.
 const wordSets = (st) => [...st.words, ...st.assigns.flatMap((a) => a.array || [a.value]), ...st.redirs.map((r) => r.target)].flatMap((w) => (w && w.sets) || []);
+// What a stage sets: { names: [{ name, value, kind }], all, bad }. value is a word, or null when the
+// stage sets the name to something unread. all = it may set any name (let, eval, source). bad = a
+// name position holds something other than a name (bash evaluates a subscript there), or a declare
+// flag makes a name an integer or a reference. One table for walk, assignedNames, the env model
+// and the arithmetic check.
+const DECLARES = /^(?:export|declare|typeset|readonly|local)$/;
+const NAME_RE = /^[A-Za-z_]\w*$/;
+function nameAfterV(ws, out) {
+  for (let k = 0; k < ws.length - 1; k++) if (ws[k].text === '-v' && !(ws[k + 1].lit && NAME_RE.test(ws[k + 1].text))) out.bad = true;
+}
+function stageSets(st) {
+  const out = { names: [], all: false, bad: false };
+  const add = (name, value, kind) => out.names.push({ name, value, kind });
+  if (st.type === 'for') { add(st.name, null, 'for'); return out; }
+  if (st.type === 'test') { nameAfterV(st.words, out); return out; }
+  if (st.type !== 'simple') return out;
+  for (const a of st.assigns) add(a.name, a.array ? null : a.value, 'assign');
+  for (const n of wordSets(st)) add(n, null, 'word');
+  if (!st.words.length) return out;
+  const w0 = base(st.words[0].text), ws = st.words.slice(1);
+  const name = (w) => { if (w && w.lit && NAME_RE.test(w.text)) add(w.text, null, 'cmd'); else out.bad = true; };
+  // Bundled flags as bash reads them; a flag in `takes` consumes the rest of its word or the next one.
+  const operands = (takes, plain, onArg) => {
+    let k = 0;
+    for (; k < ws.length && /^-./.test(ws[k].text); k++) {
+      const t = ws[k].text;
+      if (t === '--') { k++; break; }
+      if (!ws[k].lit) { out.bad = true; break; }
+      for (let j = 1; j < t.length; j++) {
+        if (takes.includes(t[j])) { const arg = j + 1 < t.length ? { text: t.slice(j + 1), lit: true } : ws[++k]; if (onArg) onArg(t[j], arg); break; }
+        if (!plain.includes(t[j])) out.bad = true;
+      }
+    }
+    return ws.slice(k);
+  };
+  if (w0 === 'read') {
+    let arr = false;
+    const ops = operands('adinNptu', 'rse', (c, arg) => { if (c === 'a') { arr = true; name(arg); } });
+    ops.forEach(name);
+    if (!ops.length && !arr) add('REPLY', null, 'cmd');
+  } else if (w0 === 'printf') {
+    if (ws.length && /^-v/.test(ws[0].text)) name(ws[0].text === '-v' ? ws[1] : { text: ws[0].text.slice(2), lit: ws[0].lit });
+  } else if (w0 === 'mapfile' || w0 === 'readarray') {
+    const ops = operands('dnOsuCc', 't');
+    if (ops.length) name(ops[0]); else add('MAPFILE', null, 'cmd');
+  } else if (w0 === 'getopts') {
+    name(ws[1]); add('OPTARG', null, 'cmd'); add('OPTIND', null, 'cmd');
+  } else if (w0 === 'unset') {
+    operands('', 'fvn').forEach(name);
+  } else if (DECLARES.test(w0)) {
+    for (const w of ws) {
+      if (/^[-+][A-Za-z]+$/.test(w.text)) { if (/[in]/.test(w.text)) out.bad = true; continue; }
+      const m = /^([^=]*)=([\s\S]*)$/.exec(w.text);
+      if (!m) { name(w); continue; }
+      if (!NAME_RE.test(m[1])) { out.bad = true; continue; }
+      add(m[1], { text: m[2], lit: w.lit, subs: w.subs, arith: w.arith }, 'assign');
+    }
+  } else if (/^(?:let|eval|source|\.)$/.test(w0)) out.all = true;
+  else if (w0 === 'test' || w0 === '[') nameAfterV(ws, out);
+  return out;
+}
 function nodeSubs(st) {
   const out = [];
   const add = (w) => { for (const s of wordSubs(w)) out.push(s); };
@@ -3625,9 +3706,9 @@ function assignedNames(l, out) {
   for (const p of l.items) for (const st of p.stages) {
     if (st.type === 'simple') {
       for (const a of st.assigns) out.add(a.name);
-      for (const n of wordSets(st)) out.add(n);
-      if (st.words.length && setsVars(st)) out.add('*');
-      if (st.words.length && /^(?:export|declare|typeset|readonly|local|unset)$/.test(st.words[0].text)) out.add('*');
+      const ss = stageSets(st);
+      for (const x of ss.names) out.add(x.name);
+      if (ss.all) out.add('*');
     } else if (st.type === 'for') { out.add(st.name); assignedNames(st.body, out); }
     else if (st.type === 'loop') { assignedNames(st.cond, out); assignedNames(st.body, out); }
     else if (st.type === 'if') st.parts.forEach((x) => assignedNames(x, out));
@@ -3741,7 +3822,12 @@ function walk(l, vals, cb, conditional) {
     for (const st of p.stages) {
       const v = piped || st.type === 'subshell' ? new Map(vals) : vals;   // a pipe stage / subshell cannot set ours
       if (st.type === 'simple') {
-        for (const n of wordSets(st)) v.delete(n);
+        const ss = stageSets(st);
+        for (const x of ss.names) {
+          if (x.kind === 'assign') continue;
+          v.delete(x.name);
+          if (envTaints(x.name)) v.set(' taint', [...(v.get(' taint') || []), { name: x.name, raw: '$', persisted: true }]);
+        }
         const w0 = st.words.length ? st.words[0].text : null;
         const declare = w0 !== null && /^(?:export|declare|typeset|readonly|local)$/.test(w0);
         if (w0 === null) {
@@ -3760,7 +3846,7 @@ function walk(l, vals, cb, conditional) {
             if (w0 !== 'unset' && w0 !== 'local' && !ENV_SAFE.test(m[1])) v.set(' taint', [...(v.get(' taint') || []), { name: m[1], raw: m[2] === undefined ? '$' : m[2], persisted: true }]);
             if (w0 !== 'unset' && m[2] !== undefined && w.lit && !cond) v.set(m[1], [m[2]]); else v.delete(m[1]);
           }
-        } else if (setsVars(st)) clearVals(v);
+        } else if (ss.all) clearVals(v);
       } else if (st.type === 'group' || st.type === 'subshell') { if (!(cond ? walkMaybe(st.body, v, cb) : walk(st.body, v, cb, false))) return false; }
       else if (st.type === 'if') {
         for (const part of st.parts) if (!walkMaybe(part, v, cb)) return false;
@@ -3780,6 +3866,7 @@ function walk(l, vals, cb, conditional) {
           else if (!derivedWord(w, v)) { lits = null; break; }
         }
         if (lits && lits.length <= VALS_MAX) v.set(st.name, lits); else v.delete(st.name);
+        if (envTaints(st.name)) v.set(' taint', [...(v.get(' taint') || []), { name: st.name, raw: (st.words || []).map((w) => w.text).join(' ') || '$', persisted: true }]);
         if (!walkMaybe(st.body, v, cb)) return false;
         v.delete(st.name);
       }
@@ -3940,7 +4027,8 @@ function approveStage(st, vals, depth, approvedScripts) {
   for (const r of st.redirs) if (r.target && (r.op === '<' || r.op === '<>') && !r.target.lit && !subst(r.target.text, vals)) return false;
   if (!st.words.length) return true;
   const w0 = st.words[0].text;
-  const envs = [...(vals.get(' taint') || []), ...st.assigns.map((a) => ({ name: a.name, raw: a.array ? '(' : a.value.text }))];
+  // `IFS=.. read` scopes IFS to that read; anywhere else IFS changes how later words split.
+  const envs = [...(vals.get(' taint') || []), ...st.assigns.filter((a) => !(a.name === 'IFS' && base(w0) === 'read')).map((a) => ({ name: a.name, raw: a.array ? '(' : a.value.text }))];
   if (!envOk(envs, base(w0))) return false;
   if (/^(?:export|declare|typeset|readonly|local)$/.test(w0)) {
     return st.words.slice(1).every((w) => {
@@ -3962,14 +4050,14 @@ function countsOnly(l, vals) {
   const flagsOk = (re) => a.slice(1).every((w) => !w.text.startsWith('-') || (w.lit && re.test(w.text)));
   const ops = a.slice(1).filter((w) => !w.text.startsWith('-'));
   const oneFile = (w) => {
-    if (!w || /[*?[]/.test(w.text)) return false;
+    if (!w || w.glob) return false;
     if (w.lit) return true;
     if (w.subs.length || !/^[\w$\/.:{}~-]+$/.test(w.text)) return false;
-    const vs = subst(w.text, vals);   // known values must not split into several files
-    return vs ? vs.every((v) => !/[\s*?[]/.test(v)) : /^\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})$/.test(w.text);
+    const vs = subst(w.text, vals);   // known values must not split into several files (quoted ones do not)
+    return vs ? !w.uexp || vs.every((v) => !/[\s*?[]/.test(v)) : /^\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})$/.test(w.text);
   };
   const grep = (need) => a[0].text === 'grep' && flagsOk(/^-[nciEFwvx]+$/) && a.some((w) => new RegExp('^-[a-zA-Z]*' + need).test(w.text)) &&
-    ops.length === 2 && ops[0].lit && oneFile(ops[1]);
+    ops.length === 2 && (ops[0].lit || !ops[0].uexp) && oneFile(ops[1]);
   if (st.length === 1) {
     if (a[0].text === 'awk') return a.length === 3 && a[1].lit && /^(?:\/[^\/]*\/)?\s*\{\s*print NR\s*;?\s*(?:exit\s*;?)?\s*\}$/.test(a[1].text) && oneFile(a[2]);
     return grep('c') || (a[0].text === 'wc' && a.length === 2 && a[1].text === '-l' && !st[0].redirs.some((r) => r.op !== '<'));
@@ -3977,29 +4065,64 @@ function countsOnly(l, vals) {
   return st.length === 2 && grep('n') && st[1].words.every((w) => w.lit) &&
     /^(?:cut -d: -f1|cut -f1 -d:|cut -d : -f 1)$/.test(st[1].words.map((w) => w.text).join(' '));
 }
-// bash evaluates a variable's value as an expression in an arithmetic context, and `a[$(cmd)]`
-// there runs cmd. Approve only when every name such a context reads is either never set by this
-// command (it comes from the user's environment) or only ever set to a literal integer.
-function arithSafe(ast) {
-  if (!ast.arith || !ast.arith.length) return true;
-  const unsafe = new Set();
-  let cur = new Map();
-  const num = (w) => w && ((w.lit && /^-?\d+$/.test(w.text)) || (w.text === '$(_)' && w.subs.length === 1 && countsOnly(w.subs[0], cur)));
+// A substitution that can only print an integer: countsOnly, or a pipeline ending in `wc -l|-c|-w|-m`
+// on stdin, `date +%s`-style formats, `seq`, `nproc`, `stat` sizes and times, `pgrep`; head / tail
+// stages after the first are allowed.
+function intProducer(l, vals) {
+  if (countsOnly(l, vals)) return true;
+  if (l.items.length !== 1) return false;
+  const st = l.items[0].stages.filter((s, k) => !(k > 0 && s.type === 'simple' && /^(?:head|tail)$/.test((s.words[0] || {}).text) &&
+    s.words.slice(1).every((w) => w.lit && /^-n?\d+$|^-n$|^\d+$/.test(w.text))));
+  const last = st[st.length - 1];
+  if (!last || last.type !== 'simple' || last.assigns.length || !last.words.length || !last.words.every((w) => w.lit)) return false;
+  const w = last.words.map((x) => x.text);
+  if (w[0] === 'wc') return w.length > 1 && w.slice(1).every((t) => /^-[lcwm]+$/.test(t)) && last.redirs.every((r) => r.op === '<');
+  if (st.length !== 1) return false;
+  if (w[0] === 'date') return w.length === 2 && /^\+(?:%[sNjHMSYmdu]|\d)+$/.test(w[1]);
+  if (w[0] === 'seq') return w.length >= 2 && w.length <= 4 && w.slice(1).every((t) => /^-?\d+$/.test(t));
+  if (w[0] === 'nproc') return w.length === 1;
+  if (w[0] === 'stat') return w.length === 4 && ((w[1] === '-c' && /^%[sYX]$/.test(w[2])) || (w[1] === '-f' && w[2] === '%z')) && !w[3].startsWith('-');
+  if (w[0] === 'pgrep') {
+    const ops = [];
+    for (let k = 1; k < w.length; k++) { if (/^-[fxno]+$/.test(w[k])) continue; if (w[k] === '-u') { k++; continue; } ops.push(w[k]); }
+    return ops.length === 1 && !ops[0].startsWith('-');
+  }
+  return false;
+}
+const intWord = (w, v) => !!w && ((w.lit && /^-?\d+$/.test(w.text)) || (w.text === '$(_)' && w.subs.length === 1 && intProducer(w.subs[0], v)));
+// Names this command sets, and those set only to integers. Nested commands (`bash -c`, `trap`) see
+// the outer command's names too.
+let outerTypes = { set: new Set(), notInt: new Set(), all: false };
+function nameTypes(ast) {
+  const t = { set: new Set(outerTypes.set), notInt: new Set(outerTypes.notInt), all: outerTypes.all, bad: false };
   walk(ast, new Map(), (p, v) => {
-    cur = v;
     for (const st of p.stages) {
-      if (st.type === 'simple') {
-        for (const a of st.assigns) if (a.array || !num(a.value)) unsafe.add(a.name);
-        if (st.words.length && (setsVars(st) || /^(?:export|declare|typeset|readonly|local|let|getopts)$/.test(st.words[0].text))) unsafe.add('*');
-      } else if (st.type === 'for' && !(st.words && st.words.every(num))) unsafe.add(st.name);
+      const ss = stageSets(st);
+      if (ss.all) t.all = true;
+      if (ss.bad) t.bad = true;
+      for (const x of ss.names) {
+        t.set.add(x.name);
+        if (!(x.kind === 'for' ? st.words && st.words.every((w) => intWord(w, v)) : intWord(x.value, v))) t.notInt.add(x.name);
+      }
     }
     return true;
   }, false);
-  return ast.arith.every((e) => !(e.match(/[A-Za-z_]\w*/g) || []).some((n) => unsafe.has(n) || unsafe.has('*')));
+  return t;
+}
+// An integer, or a name from the user's environment: what an arithmetic context may read.
+const intName = (t, n) => !t.all && !t.notInt.has(n);
+function arithOk(ast, t) {
+  if (t.bad) return false;
+  if (!(ast.arith || []).every((e) => /^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(e) && (e.match(/[A-Za-z_]\w*/g) || []).every((n) => intName(t, n)))) return false;
+  return (ast.intSubs || []).every((sub) => intProducer(sub, new Map()));
 }
 function approveAst(ast, vals, depth, approvedScripts) {
-  if (!arithSafe(ast)) return false;
-  return walk(ast, vals, (p, v) => p.stages.every((st) => approveStage(st, v, depth, approvedScripts)), false);
+  const t = nameTypes(ast);
+  if (!arithOk(ast, t)) return false;
+  const saved = outerTypes;
+  outerTypes = t;
+  try { return walk(ast, vals, (p, v) => p.stages.every((st) => approveStage(st, v, depth, approvedScripts)), false); }
+  finally { outerTypes = saved; }
 }
 
 // ---- argument models for the fail-closed approve ------------------------------------------
@@ -4103,6 +4226,13 @@ function sedSafe(words, vals) {
   for (const w of scripts) {
     const vs = w.lit ? [] : expansions(w.text, vals);
     const texts = vs.length ? vs : [w.text];
+    // Only an integer may stand where sed reads a line number: GNU sed runs `1e CMD`.
+    let sub = 0;
+    for (const m of (w.lit ? '' : w.text).matchAll(/\$\(_\)|\$\{[^}]*\}|\$(?:[A-Za-z_]\w*|[0-9@*?$!#-])/g)) {
+      if (m[0] === '$(_)') { if (!intProducer(w.subs[sub++], vals)) return false; continue; }
+      const n = /^\$\{?([A-Za-z_]\w*)\}?$/.exec(m[0]);
+      if (!n || !intName(outerTypes, n[1])) return false;
+    }
     for (const t of texts) {
       const ph = w.lit ? t : t.replace(/\$\(_\)|\$\{[^}]*\}|\$(?:[A-Za-z_]\w*|[0-9@*?$!#-])/g, PH);
       if (sedWalkUnsafe(ph)) return false;
