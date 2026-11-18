@@ -10,9 +10,11 @@
 
 'use strict';
 
+if (!module.parent && require('./watchdog.js').parent(__filename, 'check-bash')) return;
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const watchdog = require('./watchdog.js');
 const scan = require('./scan-content.js');
 const trust = require('./shellter-trust.js');
 
@@ -1017,8 +1019,7 @@ function deny(reason, snippet) {
       permissionDecisionReason: reason + BYPASS_NOTICE,
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 function approve(snippet) {
@@ -1030,8 +1031,7 @@ function approve(snippet) {
       permissionDecisionReason: 'Auto-approved by hook',
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 // Decision for a script whose CONTENTS scan as high-risk and that isn't trusted.
@@ -1049,8 +1049,7 @@ function flagRisk(reason, snippet) {
       permissionDecisionReason: reason + BYPASS_NOTICE,
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 // For Tier-2 "dev-workflow" rules (git push/reset, sudo, ssh, DROP TABLE): risky
@@ -1078,8 +1077,7 @@ function ask(reason, snippet) {
       permissionDecisionReason: reason + ASK_NOTICE,
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 // Shared sensitive-token alternation so every read/copy/interpreter rule sees the
@@ -3735,7 +3733,7 @@ function protectedWrite(p, baseOnly) {
   let store = '';
   try { store = trust.trustStorePath().replace(/\\/g, '/').toLowerCase(); } catch (_) { /* no home */ }
   if ((store && c === store) || /\/\.claude\/shellter-trust\.json$/.test(c) || (baseOnly && b === 'shellter-trust.json')) return 'deny';
-  if (/\/\.claude\/(?:hooks|plugins)\/(?:.*\/)?(?:check-bash|check-sensitive-files|scan-content|shellter-(?:trust|scan))\.js$/.test(c) ||
+  if (/\/\.claude\/(?:hooks|plugins)\/(?:.*\/)?(?:check-bash|check-sensitive-files|scan-content|watchdog|shellter-(?:trust|scan))\.js$/.test(c) ||
       /\/\.claude\/hooks\/package\.json$/.test(c) || /\/\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^/]+\/)*shellter\//.test(c)) return 'deny';
   if (/(?:^|\/)\.claude\/settings(?:\.local)?\.json$/.test(c) || RC_BASE.test(b)) return 'ask';
   return null;
@@ -4411,10 +4409,7 @@ function scanShellRedirectInjection(seg) {
 // rule tables (for the regex cost test).
 const MAIN = !module.parent;
 if (!MAIN) module.exports = { DENY_PATTERNS, POSH_DENY_PATTERNS, CMD_DENY_PATTERNS };
-let data = '';
-if (MAIN) process.stdin.setEncoding('utf8');
-if (MAIN) process.stdin.on('data', chunk => { data += chunk; });
-if (MAIN) process.stdin.on('end', () => {
+if (MAIN) watchdog.input((data) => {
   let input;
   try {
     input = JSON.parse(data.replace(/^\uFEFF/, ''));

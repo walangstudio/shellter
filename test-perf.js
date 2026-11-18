@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const Module = require('module');
+process.env.SHELLTER_INLINE = '1';   // analysis time on this thread, not the watchdog worker
 
 const HOOKS_DIR = path.join(__dirname, 'hooks');
 const BASH_HOOK = path.join(HOOKS_DIR, 'check-bash.js');
@@ -95,5 +96,13 @@ for (const [name, tpl] of Object.entries(TEMPLATES)) {
 }
 slow.sort((x, y) => y.ms - x.ms);
 console.log('slowest: ' + slow.slice(0, 5).map((s) => s.name + ' x ' + JSON.stringify(s.pad) + ' ' + Math.round(s.ms) + ' ms').join('; '));
+// The ten slowest again as real processes, worker on: none may end on the watchdog's verdict.
+const env = { ...process.env, CLAUDE_HOOK_LOG: '' };
+delete env.SHELLTER_INLINE;
+for (const s of slow.slice(0, 10)) {
+  const [hook, payload] = TEMPLATES[s.name](s.pad.repeat(Math.ceil(250000 / s.pad.length)).slice(0, 250000));
+  const out = require('child_process').execFileSync('node', [hook], { input: JSON.stringify({ permission_mode: 'default', cwd: __dirname, ...payload }), encoding: 'utf8', env, maxBuffer: 1 << 26 });
+  if (/could not finish analysing/.test(out)) { failed++; console.log('[FAIL] ' + s.name + ' x ' + JSON.stringify(s.pad) + ': the watchdog answered'); }
+}
 console.log('=== perf gate: ' + n + ' cases, ' + failed + ' failed ===');
 process.exit(failed ? 1 : 0);

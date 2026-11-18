@@ -35,8 +35,9 @@ const triageFile = args.triage || path.join(ROOT, '.corpus-triage.json');
 const outFile = args.out || path.join(os.tmpdir(), 'shellter-replay.json');
 
 const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shellter-base-'));
-for (const f of ['check-bash.js', 'scan-content.js', 'shellter-trust.js']) {
-  fs.writeFileSync(path.join(baseDir, f), execFileSync('git', ['-C', ROOT, 'show', args.base + ':hooks/' + f]));
+for (const f of ['check-bash.js', 'scan-content.js', 'shellter-trust.js', 'watchdog.js']) {
+  try { fs.writeFileSync(path.join(baseDir, f), execFileSync('git', ['-C', ROOT, 'show', args.base + ':hooks/' + f], { stdio: ['ignore', 'pipe', 'ignore'] })); }
+  catch (e) { if (f !== 'watchdog.js') throw e; }   // before 0.11.0 there is no watchdog
 }
 const HOOK = { base: path.join(baseDir, 'check-bash.js'), work: path.join(ROOT, 'hooks', 'check-bash.js') };
 delete process.env.CLAUDE_HOOK_LOG;   // or the replay writes into the log it reads
@@ -77,6 +78,7 @@ function runInProcess(which, cmd, tool) {
   // The first exit ends the run, as it would in a real process: a try/catch in the hook can
   // swallow the stub's throw, so anything written after it is ignored.
   let exited = false;
+  process.env.SHELLTER_INLINE = '1';   // analysis on this thread: no watchdog worker
   process.exit = () => { exited = true; throw EXIT; };
   process.stdout.write = (c) => { if (!exited) out += c; return true; };
   let res = null;

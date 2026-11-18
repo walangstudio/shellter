@@ -6,8 +6,10 @@
 
 'use strict';
 
+if (!module.parent && require('./watchdog.js').parent(__filename, 'check-sensitive-files')) return;
 const fs = require('fs');
 const path = require('path');
+const watchdog = require('./watchdog.js');
 const scan = require('./scan-content.js');
 
 function audit(decision, reason, snippet) {
@@ -42,8 +44,7 @@ function deny(reason, snippet) {
       permissionDecisionReason: reason + BYPASS_NOTICE,
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 // A dual-use content signal (legitimate in docs/CI, suspicious in a config an agent fabricates)
@@ -62,8 +63,7 @@ function ask(reason, snippet) {
       permissionDecisionReason: reason + ' -- approve only if you intended it',
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 // Resolve symlinks for the deepest existing ancestor and re-append the
@@ -203,7 +203,7 @@ const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|googl
 // shellter's own trust store and installed hooks: a write there is the agent granting itself
 // trust or switching shellter off. The dev repo's `hooks/` (no `.claude` segment) is not matched,
 // and a fixture that merely shares the store's file name is not the store (see isTrustStore).
-const SHELLTER_SELF = /(^|\/)\.claude\/shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|shellter-(?:trust|scan))\.js$/i;
+const SHELLTER_SELF = /(^|\/)\.claude\/shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|watchdog|shellter-(?:trust|scan))\.js$/i;
 // The plugin's installed copy: a write anywhere in it can switch shellter off.
 const SHELLTER_PLUGIN_CACHE = /(^|\/)\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^\/]+\/)*shellter\//i;
 // Allow rules and hooks live here. The user edits it too, so ask, never deny.
@@ -304,13 +304,10 @@ function pathMatchesAnySensitive(p) {
   return null;
 }
 
-let data = '';
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 let pendingAsk = null;   // a dual-use content signal, emitted only after every deny check
 let writtenText = '';    // the new text of a write tool, for target rules that depend on it
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', chunk => { data += chunk; });
-process.stdin.on('end', () => {
+watchdog.input((data) => {
   let input;
   try {
     input = JSON.parse(data.replace(/^\uFEFF/, ''));
