@@ -241,7 +241,8 @@ const GREP_KEYWORD_EXTRACTION = /(password|secret|api.?key|token|credential|priv
 // A token SHAPE written as a regex (`AKIA[0-9A-Z]{16}`, `ghp_[A-Za-z0-9]{36}`, `BEGIN.*PRIVATE KEY`):
 // case-sensitive and followed by regex syntax, so `privateKey` or `beginSection` is not one. This
 // repo's own source is full of those strings, so only a broad search path denies.
-const GREP_TOKEN_SHAPE = /AKIA\[|gh[pousr]_\[|xox\[|eyJ\[|BEGIN[\s\S]{0,24}PRIVATE KEY/;
+// A token prefix followed by regex syntax (a class, `.`, `\w`, a group): `privateKey` or `token: string` is not one.
+const GREP_TOKEN_SHAPE = /(?:AKIA|gh(?:[pousr]|\[[pousr]+\])_|xox[a-z]?-?|eyJ)(?:\[|\.|\\[wWdDsS]|\()|BEGIN[\s\S]{0,24}PRIVATE KEY/i;
 
 // A broad search path is a place to harvest from, not a project: a filesystem or drive root, a
 // home root (any user's) or an ancestor of it, a dot-directory directly under a home root, or
@@ -266,12 +267,16 @@ function isBroadSearchPath(p) {
 // the last component with its glob runs removed still holds a secret name, or a directory component
 // is literally `.ssh`/`.aws`/`.gnupg`. Guessing from wildcards false-denied `**/*credential*`.
 const SECRET_STEM = /\.env(?!\.(?:example|sample|template|dist|defaults?)\b)|id_rsa|id_ed25519|id_ecdsa|\.netrc|\.npmrc|\.pgpass|\.git-credentials|\.pem$|\.key$/i;
+const SECRET_NAMES = ['.env', 'id_rsa', 'id_ed25519', 'id_ecdsa', '.netrc', '.npmrc', '.pgpass', '.git-credentials'];
 function globNamesSecret(g) {
   if (typeof g !== 'string' || !/[*?[{]/.test(g)) return false;
   return [g, ...scan.expandBraces(g)].some((f) => {
     const parts = f.replace(/\\/g, '/').replace(/\[([^\]\\])\]/g, '$1').split('/');
     if (parts.slice(0, -1).some((c) => /^\.(?:ssh|aws|gnupg)$/i.test(c))) return true;
-    return SECRET_STEM.test(parts[parts.length - 1].replace(/\[[^\]]*\]|[*?]+/g, ''));
+    const last = parts[parts.length - 1];
+    // Without `*`, a `?` or a class stands for one character: `.e?v`, `id_rs?` name the secret itself.
+    if (!last.includes('*')) { const rx = scan.globComponentRe(last); if (rx && SECRET_NAMES.some((s) => rx.test(s))) return true; }
+    return SECRET_STEM.test(last.replace(/\[[^\]]*\]|[*?]+/g, ''));
   });
 }
 

@@ -88,6 +88,9 @@ check('str_replace_editor file_text -> deny', 'codex', { tool_name: 'str_replace
 check('edit_file code_edit -> deny', 'agy', { toolCall: { name: 'edit_file', args: { target_file: 'AGENTS.md', code_edit: INJECTION } } }, 'deny');
 check('grep_search Includes .env glob -> deny', 'agy', { toolCall: { name: 'grep_search', args: { Query: 'x', SearchDirectory: '.', Includes: [join('*.e', 'nv')] } } }, 'deny');
 check('read_many_files paths[] -> deny', 'codex', { tool_name: 'read_many_files', tool_input: { paths: ['README.md', join('proj/.e', 'nv')] } }, 'deny');
+// code review r2: a `+++` content line is not a header; a header's timestamp is not part of the path.
+check('added +++ line does not re-attribute later lines -> deny', 'codex', { tool_name: 'apply_patch', tool_input: { input: '*** Begin Patch\n*** Update File: CLAUDE.md\n+++ notes.txt\n+' + OV + '\n*** End Patch' } }, 'deny');
+check('+++ header with a tab timestamp -> deny', 'codex', { tool_name: 'apply_patch', tool_input: { input: '--- a/CLAUDE.md\t2024-01-01 00:00:00\n+++ b/CLAUDE.md\t2024-01-01 00:00:00\n@@ -1 +1 @@\n+' + OV } }, 'deny');
 check('grep_search Includes *.ts -> allow', 'agy', { toolCall: { name: 'grep_search', args: { Query: 'x', SearchDirectory: '.', Includes: ['*.ts'] } } }, 'allow');
 
 console.log(`\n${pass}/${total} shared host-hook checks passed`);

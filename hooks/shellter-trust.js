@@ -20,8 +20,6 @@ const crypto = require('crypto');
 
 const TRUST_SCAN_BYTES = 256 * 1024;
 
-// SHELLTER_TRUST_FILE counts only as an absolute path outside the working directory: a
-// relative one (or one inside the repo) would let a cloned repo ship its own trust store.
 // SHELLTER_TRUST_FILE counts only as an absolute path outside the working directory and outside
 // any git checkout: a relative one, or one a repo ships (from any subdirectory), would let a cloned
 // repo bring its own trust store.
@@ -159,16 +157,17 @@ function claudeAllowRules(cwd, toolName) {
   return rules;
 }
 
-// A project's settings.local.json is honoured only when git positively says the repo does not
-// ship it: exit 0 and no entry, for the file in any letter case (the file system is case-
-// insensitive on Windows and macOS) and for `.claude` itself (a tracked symlink or submodule).
-// No git, not a repo, a timeout, or GIT_* steering the call elsewhere -> not honoured. Runs only
-// when a rule from that file matches a flagged script, so the hot path never spawns git.
+// A settings.local.json outside any git checkout is the user's own (`~/.claude`, a scratch dir):
+// honoured. Inside a checkout it is honoured only when git positively says the repo does not ship
+// it: exit 0 and no entry, for the file in any letter case (the file system is case-insensitive on
+// Windows and macOS) and for `.claude` itself (a tracked symlink or submodule). A git error, a
+// timeout, or GIT_* steering the call elsewhere -> not honoured. Runs only when a rule from that
+// file matches a flagged script, so the hot path never spawns git.
 const _honoured = new Map();
 function localRulesHonoured(dir) {
   if (!_honoured.has(dir)) {
-    let ok = false;
-    try {
+    let ok = !insideGitCheckout(path.join(dir, '.claude', 'settings.local.json'));
+    if (!ok) try {
       const env = {};
       for (const [k, v] of Object.entries(process.env)) if (!/^GIT_/i.test(k)) env[k] = v;
       const ls = (spec) => require('child_process').spawnSync('git', ['-C', dir, 'ls-files', '-z', '--', spec], { env, encoding: 'utf8', timeout: 2000 });

@@ -40,10 +40,14 @@ const asCommand = (c) => (Array.isArray(c) ? c.join(' ') : typeof c === 'string'
 function patchWrites(text) {
   const out = [];
   let cur = null;
+  let prev = '';
   for (const line of String(text).split('\n')) {
     // `*** Add|Update|Delete File:` (indented or not), the rename target `*** Move to:`, and a
-    // unified diff's `+++ b/path` all name a file the patch writes.
-    const h = /^\s*\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+?)\s*$/.exec(line) || /^\+\+\+ (?:b\/)?(.+?)\s*$/.exec(line);
+    // unified diff's `+++ b/path` all name a file the patch writes. A `+++` line is a header only
+    // right after a `--- ` line (else it is added content), and a tab starts its timestamp.
+    const h = /^\s*\*\*\* (?:(?:Add|Update|Delete) File|Move to):\s*(.+?)\s*$/.exec(line) ||
+      (prev.startsWith('--- ') && /^\+\+\+ (?:b\/)?([^\t]+?)\s*(?:\t.*)?$/.exec(line));
+    prev = line;
     if (h) {
       const moved = /Move to:/.test(line) && cur;
       cur = { hook: FILE_HOOK, name: 'Write', input: { file_path: h[1], content: moved ? cur.input.content : '' } };

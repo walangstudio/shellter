@@ -3133,6 +3133,7 @@ function parseBash(src0, depth) {
   const n = src.length;
   let pending = [];
   let nest = 0, words = 0;
+  const arith = [];                            // every expression bash evaluates arithmetically
   const bad = () => { throw PF; };
   const blanks = () => {
     for (;;) {
@@ -3176,7 +3177,9 @@ function parseBash(src0, depth) {
       let j = i + 3, d = 0;
       for (; j < n; j++) { if (src[j] === '(') d++; else if (src[j] === ')') { if (d === 0) break; d--; } }
       if (src[j] !== ')' || src[j + 1] !== ')') bad();
-      if (!/^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(src.slice(i + 3, j))) bad();
+      const expr = src.slice(i + 3, j);
+      if (!/^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(expr) || /\$\(/.test(expr)) bad();   // a $( ) inside would run unread
+      arith.push(expr);
       w.text += '1'; i = j + 2; return;
     }
     if (c === '(') { i += 2; w.subs.push(subList(')')); w.text += '$(_)'; w.lit = false; return; }
@@ -3185,7 +3188,13 @@ function parseBash(src0, depth) {
       for (; j < n && d; j++) { if (src[j] === '{') d++; else if (src[j] === '}') d--; else if (src[j] === '\n') bad(); }
       if (d) bad();
       const body = src.slice(i + 2, j - 1);
-      if (!/^[!#]?[\w@*#?]+(?:\[[\w@*$]*\])?(?:[:%#\/^,+=?-][^`$"'\\]*)?$/.test(body)) bad();
+      const pm = /^([!#]?)([\w@*#?]+)(?:\[([\w@*$]*)\])?([:%#\/^,+=?-][^`$"'\\]*)?$/.exec(body);
+      if (!pm || /^\w+@|@[A-Za-z]/.test(pm[2])) bad();      // ${x@P} and friends: transformations are not modelled
+      // Arithmetic contexts bash evaluates (a variable holding `a[$(cmd)]` runs cmd there): a subscript,
+      // a `${s:off:len}` offset, and the name behind `${!x}` indirection.
+      if (pm[3] && !/^[@*]$/.test(pm[3])) arith.push(pm[3]);
+      if (pm[4] && pm[4][0] === ':' && !/^:[-=?+]/.test(pm[4])) arith.push(pm[4].slice(1));
+      if (pm[1] === '!') arith.push(pm[2]);
       w.text += '${' + body + '}'; w.lit = false; i = j; return;
     }
     if (c === "'" && !dq) {                    // ANSI-C quoting
@@ -3213,6 +3222,7 @@ function parseBash(src0, depth) {
     if (/[\\\n]|<</.test(inner)) bad();
     const ast = parseBash(inner, depth + 1);
     if (!ast) bad();
+    arith.push(...ast.arith);
     w.subs.push(ast); w.text += '$(_)'; w.lit = false; i = e + 1;
   };
   // A word. text = what bash passes, with expansions left as raw `$X` / `${..}` / `$(_)`.
@@ -3290,6 +3300,7 @@ function parseBash(src0, depth) {
         const a = /^([A-Za-z_]\w*)(\[[\w$@*+-]*\])?(\+?)=/.exec(src.slice(i, i + 200));
         if (a) {
           i += a[0].length;
+          if (a[2] && !/^\[[@*]?\]$/.test(a[2])) arith.push(a[2].slice(1, -1));
           const as = { name: a[1], append: !!a[3] || !!a[2], value: null, array: null };
           if (src[i] === '(') {
             i++; as.array = [];
@@ -3385,6 +3396,8 @@ function parseBash(src0, depth) {
         if (/[&|<>()]/.test(src[i])) { if ((src[i] === '<' || src[i] === '>') && src[i + 1] === '(') bad(); i++; continue; }
         node.words.push(word());
       }
+      // `[[ x -eq 0 ]]`: the operands are evaluated arithmetically.
+      if (node.words.some((w) => /^-(?:eq|ne|lt|le|gt|ge)$/.test(w.text))) arith.push(node.words.map((w) => w.text).join(' '));
       return redirs(node);
     }
     if (r) bad();                              // a reserved word where a command must start
@@ -3448,6 +3461,7 @@ function parseBash(src0, depth) {
     const ast = list([]);
     blanks();
     if (i < n || pending.length) return null;
+    ast.arith = arith;
     return ast;
   } catch (e) {
     return null;
@@ -3741,6 +3755,9 @@ function approveArgv(words, vals, depth, approvedScripts) {
       const t = toks[at];
       if (!t.startsWith('-') || t === '-') break;
       if (!words[at].lit) return false;
+      // `-a FILE` / `--arg-file=FILE` reads FILE into the argv: a secret there is a read.
+      const af = t === '-a' || t === '--arg-file' ? words[at + 1] : /^--arg-file=/.test(t) ? { lit: true, text: t.slice(11) } : null;
+      if (af && (!af.lit || SECRET_TOKENS_RE.test(af.text) || scan.globHitsSecret(af.text))) return false;
       if (/^--(?:arg-file|delimiter|max-args|max-procs|max-chars|process-slot-var)$/.test(t) || /^-[InPdEsLa]$/.test(t)) { at++; continue; }
       if (/^--(?:null|no-run-if-empty|verbose|exit|open-tty|show-limits)$/.test(t) || /^--(?:arg-file|delimiter|max-args|max-procs|max-chars|max-lines|replace|eof)=/.test(t)) continue;
       if (/^-[InPdEsL]./.test(t) || /^-[0prtxo]+$/.test(t)) continue;
@@ -3786,7 +3803,55 @@ function approveStage(st, vals, depth, approvedScripts) {
   }
   return argvVariants(st.words, vals).every((ws) => approveArgv(ws, vals, depth, approvedScripts));
 }
+// A substitution that can only print integers: `grep -n X FILE | cut -d: -f1`, `grep -c X FILE`,
+// `awk '/re/{print NR; exit}' FILE`, `wc -l` on stdin, with head / tail stages anywhere after the
+// first. FILE is one literal or a variable path like `$W/f.md` (a planted name with spaces is project trust).
+function countsOnly(l, vals) {
+  if (l.items.length !== 1) return false;
+  const st = l.items[0].stages.filter((s, k) => !(k > 0 && s.type === 'simple' && /^(?:head|tail)$/.test((s.words[0] || {}).text) &&
+    s.words.slice(1).every((w) => w.lit && /^-n?\d+$|^-n$|^\d+$/.test(w.text))));
+  if (!st.every((s) => s.type === 'simple' && !s.assigns.length && s.words.length && s.words[0].lit)) return false;
+  const a = st[0].words;
+  const flagsOk = (re) => a.slice(1).every((w) => !w.text.startsWith('-') || (w.lit && re.test(w.text)));
+  const ops = a.slice(1).filter((w) => !w.text.startsWith('-'));
+  const oneFile = (w) => {
+    if (!w || /[*?[]/.test(w.text)) return false;
+    if (w.lit) return true;
+    if (w.subs.length || !/^[\w$\/.:{}~-]+$/.test(w.text)) return false;
+    const vs = subst(w.text, vals);   // known values must not split into several files
+    return vs ? vs.every((v) => !/[\s*?[]/.test(v)) : /^\$(?:[A-Za-z_]\w*|\{[A-Za-z_]\w*\})$/.test(w.text);
+  };
+  const grep = (need) => a[0].text === 'grep' && flagsOk(/^-[nciEFwvx]+$/) && a.some((w) => new RegExp('^-[a-zA-Z]*' + need).test(w.text)) &&
+    ops.length === 2 && ops[0].lit && oneFile(ops[1]);
+  if (st.length === 1) {
+    if (a[0].text === 'awk') return a.length === 3 && a[1].lit && /^(?:\/[^\/]*\/)?\s*\{\s*print NR\s*;?\s*(?:exit\s*;?)?\s*\}$/.test(a[1].text) && oneFile(a[2]);
+    return grep('c') || (a[0].text === 'wc' && a.length === 2 && a[1].text === '-l' && !st[0].redirs.some((r) => r.op !== '<'));
+  }
+  return st.length === 2 && grep('n') && st[1].words.every((w) => w.lit) &&
+    /^(?:cut -d: -f1|cut -f1 -d:|cut -d : -f 1)$/.test(st[1].words.map((w) => w.text).join(' '));
+}
+// bash evaluates a variable's value as an expression in an arithmetic context, and `a[$(cmd)]`
+// there runs cmd. Approve only when every name such a context reads is either never set by this
+// command (it comes from the user's environment) or only ever set to a literal integer.
+function arithSafe(ast) {
+  if (!ast.arith || !ast.arith.length) return true;
+  const unsafe = new Set();
+  let cur = new Map();
+  const num = (w) => w && ((w.lit && /^-?\d+$/.test(w.text)) || (w.text === '$(_)' && w.subs.length === 1 && countsOnly(w.subs[0], cur)));
+  walk(ast, new Map(), (p, v) => {
+    cur = v;
+    for (const st of p.stages) {
+      if (st.type === 'simple') {
+        for (const a of st.assigns) if (a.array || !num(a.value)) unsafe.add(a.name);
+        if (st.words.length && (setsVars(st) || /^(?:export|declare|typeset|readonly|local|let|getopts)$/.test(st.words[0].text))) unsafe.add('*');
+      } else if (st.type === 'for' && !(st.words && st.words.every(num))) unsafe.add(st.name);
+    }
+    return true;
+  }, false);
+  return ast.arith.every((e) => !(e.match(/[A-Za-z_]\w*/g) || []).some((n) => unsafe.has(n) || unsafe.has('*')));
+}
 function approveAst(ast, vals, depth, approvedScripts) {
+  if (!arithSafe(ast)) return false;
   return walk(ast, vals, (p, v) => p.stages.every((st) => approveStage(st, v, depth, approvedScripts)), false);
 }
 
