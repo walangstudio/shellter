@@ -3335,7 +3335,7 @@ console.log('\n--- 0.11.0 r2 step 8: fail-closed PowerShell scan (N8, B H-2, H-3
   const M = join('node ', 'x.js'), E = join('.e', 'nv');
   testPosh('N8: a here-string is not modelled', "echo @'\n'\n'@ | " + M + ' #\'', 'fallthrough');
   testPosh('H-2: a lone CR ends a line', 'Get-ChildItem\r' + M, 'fallthrough');
-  testPosh('H-2: a comment is not modelled', 'Get-ChildItem # list', 'fallthrough');
+  testPosh('H-2: a comment is removed for the approve path (r3 P1)', 'Get-ChildItem # list', 'allow');
   testPosh('H-2 twin: a pipeline allows', 'Get-ChildItem | Select-Object -First 3', 'allow');
   for (const c of ['echo\\..\\x.cmd', 'type.bat', 'Get-ChildItem.exe', 'ls\\x.exe']) testPosh('H-3: ' + c + ' runs a file, no approve', c, 'fallthrough');
   testPosh('H-3 twin: echo hi allows', 'echo hi', 'allow');
@@ -3636,6 +3636,22 @@ console.log('\n--- 0.11.0 r3 step 9: an unread argument does not approve an exec
     testBash('R4: ' + c + ' does not approve', c, 'fallthrough');
   for (const c of ['ls ~/.claude/hooks', 'cat ~/.claude/settings.json', 'cp fixtures/a.json test/tmp/shellter-trust.json'])
     testBash('R4 twin: ' + c + ' allows', c, 'allow');
+}
+
+console.log('\n--- 0.11.0 r3 step 10: PowerShell reads strings, methods and comments in one walk ---');
+{
+  const IC = ['$ExecutionContext', 'InvokeCommand', 'InvokeScript'].join('.');
+  // B F9: a method call in argument mode; quote mis-pairing
+  for (const c of ['echo ' + IC + "('node x.js')", '"it\'s" + ' + IC + "('node x.js') + \"it's\"", 'Write-Output $x.Delete()',
+    "'a`' ; node x.js ; 'b'"])
+    testPosh('F9: ' + c + ' does not approve', c, 'fallthrough');
+  for (const c of ['(Get-Date).AddDays(-1)', '$_.Name.ToUpper()', '"it\'s" + "x"', "Write-Output 'a`'"])
+    testPosh('F9 twin: ' + c + ' allows', c, 'allow');
+  // P1: comments are stripped for the approve path only
+  testPosh('comment: a quote in a comment does not hide the next line', "Get-ChildItem # '\nnode x.js #'", 'fallthrough');
+  for (const c of ['git status # x', 'Get-Content f.txt -TotalCount 5 # head', 'git status\n# then\ngit log -1', 'Get-Date | % DayOfWeek', '(Get-Date).DayOfWeek'])
+    testPosh('comment / DateTime twin: ' + c.replace(/\n/g, ' / ') + ' allows', c, 'allow');
+  testPosh('comment: a here-string with a comment still does not approve', "git status # x\n@'\nx\n'@", 'fallthrough');
 }
 
 console.log('\n--- prompt-rate corpus ---');

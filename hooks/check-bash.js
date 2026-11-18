@@ -3041,16 +3041,16 @@ function checkBashApprove(seg, depth, idx) {
 // call/background `&` appears anywhere but the start of a stage. null = unbalanced.
 function poshScan(seg) {
   if (/\r(?!\n)/.test(seg)) return null;   // a lone CR ends a line for PowerShell
-  const stages = [], groups = [], redirs = [];
-  let cur = '', q = null, amp = false;
+  const stages = [], blanks = [], groups = [], redirs = [];
+  let cur = '', curB = '', q = null, amp = false;
   const CLOSE = { '(': ')', '{': '}' };
   const group = (i) => {                       // seg[i] is ( or {; returns index of its closer or -1
     const stack = [CLOSE[seg[i]]];
     let gq = null;
     for (let j = i + 1; j < seg.length; j++) {
       const c = seg[j];
-      if (c === '`') { j++; continue; }
       if (gq === "'") { if (c === "'") gq = null; continue; }
+      if (c === '`') { j++; continue; }
       if (gq === '"') { if (c === '"') gq = null; else if (c === '$' && seg[j + 1] === '(') { stack.push(')'); j++; } else if (c === ')' && stack.length > 1 && stack[stack.length - 1] === ')') stack.pop(); continue; }
       if (c === "'" || c === '"') { gq = c; continue; }
       if (c === '(' || c === '{') { stack.push(CLOSE[c]); continue; }
@@ -3061,36 +3061,58 @@ function poshScan(seg) {
   for (let i = 0; i < seg.length; i++) {
     const c = seg[i];
     if (/[\u2018-\u201E]/.test(c)) return null;   // PowerShell reads typographic quotes as quotes: not modelled
-    if (c === '`') { cur += c + (seg[i + 1] || ''); i++; continue; }
-    if (q === "'") { if (c === "'") q = null; cur += c; continue; }
+    if (q === "'") { if (c === "'") { q = null; curB += c; } cur += c; continue; }   // a backtick is literal here
+    if (c === '`') { cur += c + (seg[i + 1] || ''); if (!q) curB += c + (seg[i + 1] || ''); i++; continue; }
     if (q === '"') {
-      if (c === '"') q = null;
+      if (c === '"') { q = null; curB += c; }
       if (c === '$' && seg[i + 1] === '(') {
         const e = group(i + 1); if (e < 0) return null;
-        groups.push(seg.slice(i + 2, e)); cur += '$()'; i = e; continue;
+        groups.push(seg.slice(i + 2, e)); cur += '$()'; curB += '$()'; i = e; continue;
       }
       cur += c; continue;
     }
-    if (c === "'" || c === '"') { q = c; cur += c; continue; }
+    if (c === "'" || c === '"') { q = c; cur += c; curB += c; continue; }
     if (c === '@' && (seg[i + 1] === "'" || seg[i + 1] === '"')) return null;   // here-string: not modelled
     if (c === '#' && (i === 0 || /[\s;|(){}]/.test(seg[i - 1]))) return null;   // comment: not modelled
     if (c === '<' && seg[i + 1] === '#') return null;                              // block comment: not modelled
     if (c === '(' || c === '{') {
       const e = group(i); if (e < 0) return null;
-      groups.push(seg.slice(i + 1, e)); cur += c + CLOSE[c]; i = e; continue;
+      groups.push(seg.slice(i + 1, e)); cur += c + CLOSE[c]; curB += c + CLOSE[c]; i = e; continue;
     }
     if (c === ')' || c === '}') return null;
-    if (c === '|' && seg[i + 1] !== '|') { stages.push(cur); cur = ''; continue; }
+    if (c === '|' && seg[i + 1] !== '|') { stages.push(cur); blanks.push(curB); cur = curB = ''; continue; }
     if (c === '&' && cur.trim() !== '' && !/>\s*$/.test(cur)) { amp = true; }   // `2>&1` is a stream merge
     if (c === '>') {
       const m = /^>>?\s*(?:&\d|("[^"]*"|'[^']*'|[^\s|;&]+))/.exec(seg.slice(i, i + 400));
       if (m && m[1] !== undefined) redirs.push(m[1].replace(/^(['"])(.*)\1$/, '$2'));
     }
-    cur += c;
+    cur += c; curB += c;
   }
   if (q) return null;
-  stages.push(cur);
-  return { stages: stages.map((s) => s.trim()).filter(Boolean), groups, redirs, amp };
+  stages.push(cur); blanks.push(curB);
+  const keep = stages.map((s, k) => [s.trim(), blanks[k].trim()]).filter(([s]) => s);
+  // stagesBlank: each stage with string contents removed (quotes kept), for the member and method checks.
+  return { stages: keep.map((x) => x[0]), stagesBlank: keep.map((x) => x[1]), groups, redirs, amp };
+}
+
+// The approve view of a PowerShell command: each comment removed to the end of its line. A `#` at
+// token start opens a comment; quotes and backtick escapes are walked left to right. null when the
+// text holds a comment and something this walk does not model (here-string, block comment, `${ }`,
+// a substitution inside a string, an open quote).
+function poshStripComments(text) {
+  if (!text.includes('#')) return text;
+  if (/@['"]|<#|\$\{/.test(text)) return null;
+  let out = '', q = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q === "'") { if (c === "'") q = null; out += c; continue; }
+    if (c === '`') { out += c + (text[i + 1] || ''); i++; continue; }
+    if (q === '"') { if (c === '"') q = null; else if (c === '$' && text[i + 1] === '(') return null; out += c; continue; }
+    if (c === "'" || c === '"') { q = c; out += c; continue; }
+    if (c === '#' && (i === 0 || /[\s;|(){}]/.test(text[i - 1]))) { while (i + 1 < text.length && text[i + 1] !== '\n') i++; continue; }
+    out += c;
+  }
+  return q ? null : out;
 }
 
 const POSH_SAFE_METHOD = /^(?:ToString|Trim(?:Start|End)?|Split|Replace|Substring|ToUpper|ToLower|StartsWith|EndsWith|Contains|IndexOf|PadLeft|PadRight|Add(?:Days|Hours|Minutes|Seconds|Months|Years)|GetType)$/;
@@ -3098,16 +3120,15 @@ const POSH_SAFE_METHOD = /^(?:ToString|Trim(?:Start|End)?|Split|Replace|Substrin
 const POSH_SAFE_STATIC = /\[(?:math|int|long|double|decimal|string|datetime|timespan|regex|version|guid|char|bool)\]::[A-Za-z_]\w*/gi;
 // An expression that cannot invoke anything: variables, property access, operators, literals.
 // (Groups were already collapsed and approved separately by the caller.)
-function isSimplePoshExpr(flat) {
-  let b = flat.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
-  b = b.replace(POSH_SAFE_STATIC, '0');
+function isSimplePoshExpr(blank) {
+  const b = blank.replace(POSH_SAFE_STATIC, '0');
   if (!/^\s*(?:[$'"\d\[!]|-\d|-(?:not|join|split)\b|\(\))/.test(b)) return false;
   if (/[|;&{}`]|::|(?<![-=!<>])=(?!=)/.test(b.replace(/\{\}/g, ''))) return false;
   for (const m of b.matchAll(/\.\s*([A-Za-z_]\w*)\s*\(\)/g)) if (!POSH_SAFE_METHOD.test(m[1])) return false;
   return !/(?:^|[\s,])[A-Za-z_][\w-]*\s*\(\)/.test(b);       // bare word + call parens
 }
 
-const POSH_SAFE_MEMBER = /^(?:Name|FullName|BaseName|Extension|Line|LineNumber|Path|Length|Count|Id|ProcessName|Value|Key|Matches|Directory|DirectoryName|LastWriteTime|CreationTime|Mode|Status|Source|Version|Definition)$/i;
+const POSH_SAFE_MEMBER = /^(?:Name|FullName|BaseName|Extension|Line|LineNumber|Path|Length|Count|Id|ProcessName|Value|Key|Matches|Directory|DirectoryName|LastWriteTime|CreationTime|Mode|Status|Source|Version|Definition|DayOfWeek|Day|Month|Year|Hour|Minute|Second|Date|Ticks|DayOfYear)$/i;
 function checkPoshApprove(seg, depth, idx) {
   if (depth > 6) return false;
   const sc = poshScan(seg);
@@ -3117,7 +3138,7 @@ function checkPoshApprove(seg, depth, idx) {
     for (const s of splitPoshSegments(inner)) if (!checkPoshApprove(s, depth + 1, idx)) return false;
   }
   if (!sc.stages.length) return true;
-  if (sc.stages.length === 1 && isSimplePoshExpr(sc.stages[0])) return true;
+  if (sc.stages.length === 1 && isSimplePoshExpr(sc.stagesBlank[0])) return true;
   if (hasUnresolvedPoshRead(seg, idx)) return false;
   for (let k = 0; k < sc.stages.length; k++) {
     const st = sc.stages[k];
@@ -3134,8 +3155,8 @@ function checkPoshApprove(seg, depth, idx) {
     }
     // A content reader whose argument is a group reads paths we cannot see.
     if (/^(?:Get-Content|gc|cat|type|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)$/i.test(name) && /(?:^|\s)\$?\(\)/.test(st)) return false;
-    const body = st.replace(/\.\s*([A-Za-z_]\w*)\s*\(\)/g, (m0, name) => (POSH_SAFE_METHOD.test(name) ? '' : m0));
-    if (/\(\)\s*\.\s*[A-Za-z_]\w*\s*\(\)/.test(body)) return false;   // (cmd).Method(): unknown method
+    const body = sc.stagesBlank[k].replace(/\.\s*([A-Za-z_]\w*)\s*\(\)/g, (m0, name) => (POSH_SAFE_METHOD.test(name) ? '' : m0));
+    if (/\.\s*[A-Za-z_]\w*\s*\(\)/.test(body)) return false;   // `(cmd).M()`, `$v.M()`: unknown method
     if (!POSH_APPROVE_PATTERNS.some((p) => p.test(st))) return false;
   }
   return true;
@@ -4936,9 +4957,12 @@ if (MAIN) watchdog.input((data) => {
     process.exit(0);
   }
 
-  let allApproved = true;
-  for (let i = 0; allApproved && i < segments.length; i++) {
-    const seg = segments[i];
+  const poshView = poshStripComments(work);
+  let approveSegs = poshView === null ? [] : segments;
+  if (poshView !== null && poshView !== work) { approveSegs = splitPoshSegments(poshView.replace(/\n/g, ' ; ')); expandSegments(approveSegs, cwd, true); }
+  let allApproved = poshView !== null && approveSegs.length > 0;
+  for (let i = 0; allApproved && i < approveSegs.length; i++) {
+    const seg = approveSegs[i];
     if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh, i)) {
       allApproved = false;
       break;
