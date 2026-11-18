@@ -2425,86 +2425,38 @@ function isSafeRelativePath(p) {
   return true;
 }
 
-// Detects a single heredoc write (`cat|tee REDIRECT << ['"]?MARKER['"]?`) whose body is
-// injection-scanned here. Returns { trailing } (the commands after the terminator, which the
-// caller runs through the full pipeline) or false.
-function isSafeHeredocInvocation(rawCmd) {
-  if (!rawCmd || !rawCmd.includes('<<')) return false;
-  // postMarker (between marker and body's first newline) may carry a single
-  // safe redirection like `> file`, which is the common `cat <<EOF > file` form.
-  // Only the first `<<WORD` is tried: retrying the body search from every later one was quadratic.
-  const at = rawCmd.search(/<<-?\s*(['"]?)[A-Za-z_]\w*\1/);
-  const head = at < 0 ? null : (rawCmd.slice(0, at) + '\0' + rawCmd.slice(at)).match(
-    /^([^\0]*)\0<<(-?)\s*(['"]?)([A-Za-z_]\w*)\3([^\n]*)\n([\s\S]*?)\n([\t]*)\4(?:\r?\n|$)([\s\S]*)$/
-  );
-  if (!head) return false;
-  const preface   = head[1].trim();
-  const dash      = head[2];
-  const quoted    = head[3] === "'" || head[3] === '"';
-  const postMark  = head[5];
-  const body      = head[6];
-  const endPad    = head[7];
-  const trailing  = head[8];
-
-  if (dash === '' && endPad !== '') return false;
-  if (/<<-?\s*['"]?[A-Za-z_]\w*['"]?/.test(trailing)) return false;
-  if (!quoted && /\$\(|`|\$\{|\$[A-Za-z_]/.test(body)) return false;
-  // Unquoted, bash joins a body line ending in `\` with the next, so the terminator may not be where it looks.
-  if (!quoted && /\\\r?$/m.test(body)) return false;
-
-  let postMarkerTarget = null;
-  if (postMark.trim() !== '') {
-    const redirM = postMark.match(/^\s*>>?\s+(['"]?)([^\s'"<>|;&]+)\1\s*$/);
-    if (!redirM) return false;
-    postMarkerTarget = redirM[2];
+// A command that opens with one heredoc write (`cat > F <<'EOF'`, `tee [-a] F <<'EOF'`; F a literal safe
+// relative path; the body quoted, or free of `$` and backticks): its body is injection-scanned here
+// and removed, so the raw passes do not read inert prose as commands. It never approves: the whole
+// command, with the body gone, then takes the normal route. Returns the text without the body, or null.
+let routedTarget = null;   // the instruction file whose body was just scanned clean
+function routedHeredoc(raw) {
+  if (!raw.includes('<<')) return null;
+  const ast = parseBash(raw);
+  if (!ast || !ast.items.length) return null;
+  const p = ast.items[0], st = p.stages[0], src = ast.src;
+  if (p.stages.length !== 1 || st.type !== 'simple' || st.assigns.length || !st.words.every((w) => w.lit)) return null;
+  const hs = st.redirs.filter((r) => r.heredoc), outs = st.redirs.filter((r) => !r.heredoc);
+  if (hs.length !== 1 || !/^[ \t]*\n$/.test(src.slice(p.end, hs[0].heredoc.s))) return null;
+  const h = hs[0].heredoc, w = st.words.map((x) => x.text);
+  if (/<<-?\s*['"]?[A-Za-z_]\w*/.test(src.slice(h.t))) return null;
+  if (!h.quoted && /[$`]/.test(h.body)) return null;
+  let target = null;
+  if (w.length === 1 && w[0] === 'cat' && outs.length === 1 && /^>>?$/.test(outs[0].op) && outs[0].target.lit) target = outs[0].target.text;
+  else if (w[0] === 'tee' && !outs.length && (w.length === 2 || (w.length === 3 && /^(?:-a|--append)$/.test(w[1]))) && !w[w.length - 1].startsWith('-')) target = w[w.length - 1];
+  if (target === null || !isSafeRelativePath(target)) return null;
+  const inj = scan.scanInjection(h.body, { decode: true });
+  const hi = inj.find((x) => x.severity === 'high');
+  if (hi) deny('Prompt injection in heredoc-written content: ' + hi.signal, h.body);
+  if (scan.isAgentInstructionFile(target)) {
+    const med = inj.find((x) => x.severity === 'medium' && x.category === 'injection');
+    if (med) deny('Prompt injection in heredoc-written agent-instruction file: ' + med.signal, h.body);
+    if (inj.some((x) => x.signal === 'instruction-override-quoted')) ask('Quoted instruction-override phrase in a heredoc-written agent-instruction file', h.body);
+    routedTarget = target;
   }
-
-  const tokens = preface.split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return false;
-  const interp = tokens[0].toLowerCase();
-  const restTokens = tokens.slice(1);
-  let writeTarget = null;
-
-  if (interp === 'cat') {
-    // The preface is exactly `cat` or `cat > target`: anything else (`cat .env >`, `cat ; rm`) is a
-    // command the fast path would approve unread.
-    if (!/^cat(?:\s+>>?\s*(['"]?)[^\s'"<>|;&]+\1)?$/.test(preface)) return false;
-    let target = null;
-    const prefRedir = preface.match(/(?:^|\s)>>?\s+(['"]?)([^\s'"<>|;&]+)\1\s*$/);
-    if (prefRedir) target = prefRedir[2];
-    else if (postMarkerTarget !== null) target = postMarkerTarget;
-    else return false;
-    if (!isSafeRelativePath(target)) return false;
-    writeTarget = target;
-  } else if (interp === 'tee') {
-    if (postMarkerTarget !== null) return false;
-    let i = 0;
-    if (restTokens[i] === '-a' || restTokens[i] === '--append') i++;
-    if (restTokens.length - i !== 1) return false;
-    const target = restTokens[i].replace(/^['"]|['"]$/g, '');
-    // Reject flag-shaped targets like `--append=out.log` (the `=`-joined long
-    // form would land in the target slot otherwise).
-    if (target.startsWith('-')) return false;
-    if (!isSafeRelativePath(target)) return false;
-    writeTarget = target;
-  } else {
-    return false;
-  }
-
-  if (interp === 'cat' || interp === 'tee') {
-    const inj = scan.scanInjection(body, { decode: true });
-    const hiInj = inj.find(f => f.severity === 'high');
-    if (hiInj) deny('Prompt injection in heredoc-written content: ' + hiInj.signal, body);
-    // Class-B (MEDIUM) injection denies only when the heredoc writes an agent-instruction file.
-    if (scan.isAgentInstructionFile(writeTarget)) {
-      const medInj = inj.find(f => f.severity === 'medium' && f.category === 'injection');
-      if (medInj) deny('Prompt injection in heredoc-written agent-instruction file: ' + medInj.signal, body);
-      if (inj.some(f => f.signal === 'instruction-override-quoted')) ask('Quoted instruction-override phrase in a heredoc-written agent-instruction file', body);
-    }
-  }
-
-  return { trailing };
+  return src.slice(0, h.s) + src.slice(h.t);
 }
+const instructionTarget = (t) => scan.isAgentInstructionFile(t) && t !== routedTarget;
 
 // mode 'hard' (default): Tier-1 deny rules fire (ask-tagged rules skipped).
 // mode 'ask': ONLY the ask-tagged Tier-2 rules fire, via ask(). The caller runs
@@ -2714,14 +2666,14 @@ function heredocWriteUnsafe(seg) {
       const target = r[1] !== '' ? r[1] : toks[++k];
       if (target === undefined) return true;
       if (/^&\d*-?$/.test(target) || target === '/dev/null') continue;
-      if (!isSafeRelativePath(target) || scan.isAgentInstructionFile(target)) return true;
+      if (!isSafeRelativePath(target) || instructionTarget(target)) return true;
       continue;
     }
     if (/^[|;&]/.test(t)) { tee = false; continue; }
     if (/(?:^|\/)tee$/.test(t)) { tee = true; continue; }
     if (tee) {
       if (t.startsWith('-')) { if (t.includes('=')) return true; continue; }
-      if (!isSafeRelativePath(t) || scan.isAgentInstructionFile(t)) return true;
+      if (!isSafeRelativePath(t) || instructionTarget(t)) return true;
     }
   }
   return false;
@@ -3251,8 +3203,10 @@ function parseBash(src0, depth) {
     i++;
     for (const h of pending) {
       const lines = [];
+      h.s = i;
       for (;;) {
         if (i >= n) bad();
+        h.t = i;
         let e = src.indexOf('\n', i);
         if (e === -1) e = n;
         const line = src.slice(i, e);
@@ -3572,6 +3526,7 @@ function parseBash(src0, depth) {
         while (blanks(), src[i] === '\n') newline();
         continue;
       }
+      p.end = i;
       return p;
     }
   };
@@ -3617,7 +3572,7 @@ function parseBash(src0, depth) {
     const ast = list([]);
     blanks();
     if (i < n || pending.length) return null;
-    ast.arith = arith;
+    ast.arith = arith; ast.src = src;
     return ast;
   } catch (e) {
     return null;
@@ -3893,7 +3848,7 @@ function writeTargets(st, vals) {
 }
 function heredocTargetsUnsafe(node) {
   if (!node.redirs.some((r) => r.heredoc)) return false;
-  const bad = (w) => !w.lit || !isSafeRelativePath(w.text) || scan.isAgentInstructionFile(w.text);
+  const bad = (w) => !w.lit || !isSafeRelativePath(w.text) || instructionTarget(w.text);
   for (const r of node.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>|>&)$/.test(r.op) && r.target.text !== '/dev/null' && bad(r.target)) return true;
   const w0 = node.words.length ? base(node.words[0].text) : '';
   if (w0 === 'tee') for (const w of node.words.slice(1)) { if (w.text.startsWith('-')) { if (w.text.includes('=')) return true; continue; } if (bad(w)) return true; }
@@ -3970,7 +3925,8 @@ function approveArgv(words, vals, depth, approvedScripts) {
 
   resolvableAt[0] = new Set([...vals.keys()].filter((k) => k[0] !== ' '));
   if (hasUnresolvedRead(text, 0)) return false;
-  for (const pattern of APPROVE_PATTERNS) if (pattern.test(text)) return true;
+  // A pattern approves only when its match spans the whole command word (`test/x.sh` is not `test`).
+  for (const pattern of APPROVE_PATTERNS) { const m = pattern.exec(text); if (m && m[0].length >= canonWord(words[0]).length) return true; }
   return false;
 }
 function approveText(src, vals, depth) {
@@ -4572,18 +4528,12 @@ if (MAIN) watchdog.input((data) => {
   const cmd = unjoined.replace(/\\\n/g, '');
   let work = cmd, workRaw = unjoined;
 
-  // Heredoc invocations (bash-only): a single safe `python|cat|tee << MARKER`
-  // followed by auto-approved trailing commands is approved as a whole. This
-  // bypasses the flat chain-split (which mangles heredoc bodies into bogus
-  // segments) and the body validators ensure no exec/network primitives slip
-  // through. The validator may also call checkSegmentDeny on trailing
-  // segments, which calls deny()+exit on a match. Any unexpected exception
-  // falls through to the normal flow (chain-split + deny + approve) with an
-  // audit entry so the operator can diagnose.
+  // A leading heredoc write: its body is scanned and removed (the flat split would read prose as
+  // commands); everything else, the now-empty heredoc included, takes the normal route below.
   if (!isPosh) {
     try {
-      const h = isSafeHeredocInvocation(unjoined);
-      if (h) { if (!h.trailing.trim()) approve(rawCmd); workRaw = h.trailing; work = h.trailing.replace(/\\\r?\n/g, ''); }
+      const h = routedHeredoc(unjoined);
+      if (h !== null) { workRaw = h; work = h.replace(/\\\n/g, ''); }
     } catch (err) {
       noteGap('heredoc-parse');
       audit('fallthrough', 'heredoc-check-threw: ' + (err && err.message), rawCmd);

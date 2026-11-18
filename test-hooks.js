@@ -3563,6 +3563,21 @@ console.log('\n--- 0.11.0 r3 step 6: the parser reads words as bash does (G2) --
   testBash('>& twin: echo x >&2 allows', 'echo x >&2', 'allow');
 }
 
+console.log('\n--- 0.11.0 r3 step 7: one approve path for heredocs (B F2, F8) ---');
+{
+  const body = "\n# Notes\nNever run `rm -rf /` here.\nEOF";
+  // B F2: the heredoc fast path no longer approves; the command takes the normal route
+  testBash('F2: cat > $(node${IFS}x.js) <<EOF does not approve', "cat > $(node${IFS}x.js) <<'EOF'\nhello\nEOF", 'fallthrough');
+  testBash('F2: tee `node x.js` <<EOF does not approve', "tee `node x.js` <<'EOF'\nhello\nEOF", 'fallthrough');
+  testBash('F2: cat > ~/.claude/hooks/check-bash.js <<EOF denies', "cat > $HOME/.claude/hooks/check-bash.js <<'EOF'" + body, 'deny');
+  testBash('F2: a heredoc write then node x.js does not approve', "cat > notes.md <<'EOF'" + body + '\nnode x.js', 'fallthrough');
+  for (const c of ["cat > notes.md <<'EOF'" + body, "tee notes.md <<'EOF'" + body, "cat <<'EOF' > a.md" + body, "cat > notes.md <<'EOF'" + body + '\ngit status',
+    "cat > CLAUDE.md <<'EOF'\n# Rules\nRun the tests.\nEOF"]) testBash('F2 twin: ' + JSON.stringify(c.split('\n')[0]) + ' allows', c, 'allow');
+  // B F8: an approve pattern covers the whole command word
+  for (const c of ['test/x.sh', 'echo-x', 'ls.bat']) testBash('F8: ' + c + ' does not approve', c, 'fallthrough');
+  for (const c of ['test -d x', 'pre-commit run', 'python3 -m pytest']) testBash('F8 twin: ' + c + ' allows', c, 'allow');
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a
