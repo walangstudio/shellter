@@ -3098,7 +3098,7 @@ console.log('\n--- 0.11.0 r2 step 2: regex cost bounds, linear comment scan (B H
   const PADS = ['sed x -i ', '>', '<(', '${a:`'];
   const prefixOf = (re) => (re.source.replace(/^\^?(?:\\s\*|\\b)*/, '').match(/^(?:[A-Za-z0-9_.@=-]|\\[.\-\/\\])+/) || [''])[0].replace(/\\(.)/g, '$1');
   let worst = 0, worstRule = '';
-  for (const tab of Object.values(tables)) for (const [rule] of tab) {
+  for (const tab of [tables.DENY_PATTERNS, tables.POSH_DENY_PATTERNS, tables.CMD_DENY_PATTERNS]) for (const [rule] of tab) {
     const pads = typeof rule === 'function' ? PADS : [prefixOf(rule) + ' ', ...PADS];
     for (const pad of pads) {
       if (!pad.trim()) continue;

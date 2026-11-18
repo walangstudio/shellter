@@ -3234,7 +3234,7 @@ function parseBash(src0, depth) {
       const expr = src.slice(i + 3, j);
       if (!/^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(expr) || /\$\(/.test(expr)) bad();   // a $( ) inside would run unread
       arith.push(expr);
-      w.text += '1'; i = j + 2; return;
+      w.text += '1'; w.arith = true; i = j + 2; return;
     }
     if (c === '(') { i += 2; w.subs.push(subList(')')); w.text += '$(_)'; w.lit = false; return; }
     if (c === '{') {
@@ -4408,7 +4408,7 @@ function scanShellRedirectInjection(seg) {
 // Run as a hook (or loaded fresh by the in-process replay); when `require`d, only expose the
 // rule tables (for the regex cost test).
 const MAIN = !module.parent;
-if (!MAIN) module.exports = { DENY_PATTERNS, POSH_DENY_PATTERNS, CMD_DENY_PATTERNS };
+if (!MAIN) module.exports = { DENY_PATTERNS, POSH_DENY_PATTERNS, CMD_DENY_PATTERNS, parseBash, walk, argvVariants };
 if (MAIN) watchdog.input((data) => {
   let input;
   try {
