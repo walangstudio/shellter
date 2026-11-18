@@ -75,7 +75,7 @@ function normalizeObfuscation(s) {
 // or the quoted payload is lost. Matching a `$var`/`${var}` command word here does that,
 // without matching a literal non-interpreter like `git -c ... commit` (config, not exec),
 // which must still relax so a `curl | bash` in its commit message is not a false deny.
-const INTERP_EXEC_RE = /\beval\b|\s-(?:exec|execdir|ok|okdir)\b|\bxargs\b|\$\(|`|(?:\b(?:bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b|\$\{?[A-Za-z_]\w*\}?)\S{0,256}\s+-[A-Za-z]*[ceErsi]\b/i;
+const INTERP_EXEC_RE = /\beval\b|\s-(?:exec|execdir|ok|okdir)\b|\bxargs\b|\$\(|`|(?:\b(?:bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b|(?<![^\s;&|(`"'={])\$\{?[A-Za-z_]\w*\}?)\S{0,256}\s+-[A-Za-z]*[ceErsi]\b/i;
 // Gate on the RAW string: if anything COULD execute quoted content, keep the raw text so the
 // payload is not hidden; otherwise strip quoted prose. Tested against the raw string, not the
 // skeleton, on purpose -- a quoted interpreter word still executes (`"$SHELL" -c "..."`,
@@ -110,7 +110,7 @@ function commandSkeleton(s) {
 // `| command bash`, `| "bash"`) is handled tokenized in pipeToWrappedInterpDanger, which reuses
 // the CMD_WRAPPERS + WRAPPER_VALUE_FLAGS flag-arity model -- a regex wrapper prefix could not
 // model a flag whose value is a separate token (`-u root`) and auto-approved the wrapped RCE.
-const DL_EXEC_RE = /\b(curl|wget)\s+.*\|\s*(?:[^\s]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i;
+const DL_EXEC_RE = /\b(curl|wget)\s+.*\|\s*(?:[^\s|]*\/)?(?:bash|sh|zsh|dash|ash|ksh|fish|perl|ruby|node|deno|bun|php|lua|tclsh|python[23]?(?!\s+-m))\b/i;
 function downloadExecDanger(s) {
   return DL_EXEC_RE.test(analysisText(s)) ? 'Download-and-execute pipe blocked -- inspect script first' : null;
 }
@@ -122,8 +122,8 @@ const FORK_BOMB_RE = /([:\w]{1,256})\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&/;
 function forkBombDanger(s) {
   return FORK_BOMB_RE.test(analysisText(s)) ? 'Fork bomb blocked' : null;
 }
-const PIPE_BARE_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i;
-const PIPE_FLAG_RE = /\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i;
+const PIPE_BARE_RE = /\|\s*(?:[^\s|]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s*$/i;
+const PIPE_FLAG_RE = /\|\s*(?:[^\s|]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\s+(-[a-zA-Z]*c|-i|-s)\b/i;
 function pipeToInterpDanger(s) {
   const sk = analysisText(s);
   if (PIPE_BARE_RE.test(sk)) return 'Pipe to bare shell/interpreter blocked';
@@ -849,8 +849,25 @@ function parseXargs(segment, strict) {
   return tokens.slice(i).join(' ');
 }
 
+// Every `(` outside quotes mapped to its `)`, in one pass (the same quote rules as extractParenContent,
+// which scans to the end of the text for each unclosed opener: quadratic on a run of them).
+function parenCloses(s) {
+  const out = new Map(), stack = [];
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q === "'") { if (c === "'") q = null; continue; }
+    if (q === '"') { if (c === '\\') i++; else if (c === '"') q = null; continue; }
+    if (c === "'" || c === '"') q = c;
+    else if (c === '(') stack.push(i);
+    else if (c === ')' && stack.length) out.set(stack.pop(), i);
+  }
+  return out;
+}
+
 function extractProcessSubstitutions(segment) {
   const results = [];
+  const closes = parenCloses(segment);
   let i = 0;
   let inSingle = false;
   let inDouble = false;
@@ -866,13 +883,11 @@ function extractProcessSubstitutions(segment) {
     if (ch === '\\' && inDouble) { i += 2; continue; }
     if (ch === '"') { inDouble = !inDouble; i++; continue; }
     if (inDouble) { i++; continue; }
-    if ((ch === '<' || ch === '>') && next === '(') {
-      const r = extractParenContent(segment, i + 1);
-      if (r) {
-        results.push(r.inner);
-        i = r.end;
-        continue;
-      }
+    if ((ch === '<' || ch === '>') && next === '(' && closes.has(i + 1)) {
+      const e = closes.get(i + 1);
+      results.push(segment.slice(i + 2, e));
+      i = e + 1;
+      continue;
     }
     i++;
   }
@@ -1808,7 +1823,7 @@ const DENY_PATTERNS = [
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
     'Encoded payload piped to shell blocked'],
-  [/\becho\s+[^|]{0,4096}\|\s*(base64|xxd)\s[^|]{0,1024}\|\s*(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\b/i,
+  [/\becho\s+[^|]{0,4096}\|\s*(base64|xxd)\s[^|]{0,1024}\|\s*(?:[^\s|]*\/)?(bash|sh|zsh|dash|ash|ksh|fish)\b/i,
     'Encoded execution chain blocked'],
 
   // eval of DECODED or DOWNLOADED content is the real threat -> hard deny. A plain
@@ -2419,8 +2434,10 @@ function isSafeHeredocInvocation(rawCmd) {
   if (!rawCmd || !rawCmd.includes('<<')) return false;
   // postMarker (between marker and body's first newline) may carry a single
   // safe redirection like `> file`, which is the common `cat <<EOF > file` form.
-  const head = rawCmd.match(
-    /^([\s\S]*?)<<(-?)\s*(['"]?)([A-Za-z_]\w*)\3([^\n]*)\n([\s\S]*?)\n([\t]*)\4(?:\r?\n|$)([\s\S]*)$/
+  // Only the first `<<WORD` is tried: retrying the body search from every later one was quadratic.
+  const at = rawCmd.search(/<<-?\s*(['"]?)[A-Za-z_]\w*\1/);
+  const head = at < 0 ? null : (rawCmd.slice(0, at) + '\0' + rawCmd.slice(at)).match(
+    /^([^\0]*)\0<<(-?)\s*(['"]?)([A-Za-z_]\w*)\3([^\n]*)\n([\s\S]*?)\n([\t]*)\4(?:\r?\n|$)([\s\S]*)$/
   );
   if (!head) return false;
   const preface   = head[1].trim();
@@ -2553,10 +2570,45 @@ function poshGlobSecretRead(seg) {
   return null;
 }
 
+// A rule shaped `START [^...]{0,512} TARGET` costs up to 512 steps at every START, so a long run of
+// START tokens is slow. Every match of such a rule contains a match of its tail (the part after the
+// last top-level item holding a bounded gap), and the tail is a target found in linear time: test it
+// first. Sound only without a top-level `|` and without a backreference in the tail.
+const tailCache = new WeakMap();
+function requiredTail(re) {
+  if (tailCache.has(re)) return tailCache.get(re);
+  const s = re.source;
+  let depth = 0, cut = -1, alt = false, gap = false;
+  const quant = (i) => { const m = /^(?:[?*+]|\{\d*,?\d*\})\??/.exec(s.slice(i, i + 16)); return m ? m[0].length : 0; };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\') { i++; continue; }
+    if (c === '[') { for (i++; i < s.length && s[i] !== ']'; i++) if (s[i] === '\\') i++; continue; }
+    if (c === '(') { if (depth++ === 0) gap = false; }
+    else if (c === ')') { if (--depth === 0 && gap) { cut = i + 1 + quant(i + 1); i = cut - 1; } }
+    else if (c === '|' && depth === 0) alt = true;
+    else if (c === '{') {
+      const m = /^\{\d*,(\d+)\}\??/.exec(s.slice(i, i + 16));
+      if (m && +m[1] >= 64) { if (depth === 0) { cut = i + m[0].length; i = cut - 1; } else gap = true; }
+    }
+  }
+  let tail = null;
+  if (!alt && cut > 0 && cut < s.length && !/\\[1-9]|\\k</.test(s.slice(cut))) {
+    try { tail = new RegExp(s.slice(cut), re.flags.replace(/[gy]/g, '')); } catch (_) { tail = null; }
+  }
+  tailCache.set(re, tail);
+  return tail;
+}
+
+// A segment repeated thousands of times (`<<EOF` lines) is checked once: the check has no state.
+const segChecked = new Set();
 function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (depth === undefined) depth = 0;
   if (mode === undefined) mode = 'hard';
   if (depth > 6) { noteGap('nesting-depth'); return; }
+  const key = mode + '\0' + depth + '\0' + (extraVariant || '') + '\0' + seg;
+  if (segChecked.has(key)) return;
+  segChecked.add(key);
 
   const stripped = seg.replace(/^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
   const emit = mode === 'hard' ? deny : ask;
@@ -2599,7 +2651,8 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
       if (typeof pattern === 'function') {
         for (const v of variants) { const r = pattern(v); if (r) emit(typeof r === 'string' ? r : reason, seg); }
       } else {
-        for (const v of variants) { if (pattern.test(v)) emit(reason, seg); }
+        const tail = requiredTail(pattern);
+        for (const v of variants) { if ((!tail || tail.test(v)) && pattern.test(v)) emit(reason, seg); }
       }
     }
   }
@@ -3651,15 +3704,17 @@ function walk(l, vals, cb, conditional) {
 }
 
 // Every text bash could run for this pipeline given the known variable values (capped).
-function expansions(text, vals) {
+function expansions(text, vals, budget = Infinity) {
   let out = [text];
   const names = new Set();
   for (const m of text.matchAll(/\$\{?([A-Za-z_]\w*)\}?/g)) if (vals.has(m[1]) && vals.get(m[1]).length) names.add(m[1]);
   for (const name of names) {
     const next = [];
+    let bytes = 0;
     for (const t of out) for (const val of vals.get(name)) {
-      if (next.length === 32) { structIncomplete = true; break; }
+      if (next.length === 32 || bytes > budget) { structIncomplete = true; break; }
       next.push(expandVars(t, new Map([[name, val]]), false));
+      bytes += next[next.length - 1].length;
     }
     out = next;
   }
@@ -4336,11 +4391,11 @@ function checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs) {
 function scanShellRedirectInjection(seg) {
   // No end-anchor and the target class stops at |/&/</> so a trailing `| cat`,
   // `&`, or `#comment` after the redirect can't hide the write from the scan.
-  const m = seg.match(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:echo|printf)\s+([\s\S]*?)\s*>>?\s*([^\s|;&<>]+)/i);
+  const m = seg.match(/^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:echo|printf)\s+([\s\S]*?)>>?\s*([^\s|;&<>]+)/i);
   if (!m) return;
   const target = m[2].replace(/^['"]|['"]$/g, '');   // strip quotes so `>> "CLAUDE.md"` still gates
   if (/\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|bz2|xz|7z|tar|wasm|exe|dll|so|dylib|bin|woff2?|ttf|otf)$/i.test(target)) return;
-  const content = m[1].replace(/^(['"])([\s\S]*)\1$/, '$2');   // unwrap one outer quote
+  const content = m[1].trimEnd().replace(/^(['"])([\s\S]*)\1$/, '$2');   // unwrap one outer quote
   const inj = scan.scanInjection(content, { decode: true });
   const hi = inj.find(f => f.severity === 'high');
   if (hi) deny('Prompt injection in shell-redirected content: ' + hi.signal, seg);
@@ -4506,7 +4561,7 @@ if (MAIN) process.stdin.on('end', () => {
   };
   const structuralPass = (mode) => astWalk((p, v) => {
     const text = p.stages.map(canonStage).join(' | ');
-    const xs = structBytes > STRUCT_BYTES ? [] : expansions(text, v);
+    const xs = structBytes > STRUCT_BYTES ? [] : expansions(text, v, STRUCT_BYTES - structBytes);
     for (const x of xs) structBytes += x.length;
     if (structBytes > STRUCT_BYTES) { structIncomplete = true; xs.length = 0; }
     structCheck(mode, text, xs[0]);

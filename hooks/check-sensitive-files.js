@@ -276,7 +276,9 @@ function globNamesSecret(g) {
     const last = parts[parts.length - 1];
     // Without `*`, a `?` or a class stands for one character: `.e?v`, `id_rs?` name the secret itself.
     if (!last.includes('*')) { const rx = scan.globComponentRe(last); if (rx && SECRET_NAMES.some((s) => rx.test(s))) return true; }
-    return SECRET_STEM.test(last.replace(/\[[^\]]*\]|[*?]+/g, ''));
+    // No `[` after the last `]` can close: split there so the class scan stays linear.
+    const k = last.lastIndexOf(']') + 1;
+    return SECRET_STEM.test(last.slice(0, k).replace(/\[[^\]]*\]|[*?]+/g, '') + last.slice(k).replace(/[*?]+/g, ''));
   });
 }
 

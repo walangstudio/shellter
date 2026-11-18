@@ -689,7 +689,11 @@ function isAgentInstructionFile(p) { return typeof p === 'string' && AGENT_INSTR
 
 // One path component of a glob as an anchored, case-insensitive RegExp (null if unparseable).
 // A leading `*`/`?`/`[` never matches a leading dot, as in bash.
+// Callers test it against short names: a component of 512+ characters after a run of `*` becomes
+// one `*` needs 256+ characters to match, so it is null too.
 function globComponentRe(comp) {
+  comp = comp.replace(/\*+/g, '*');
+  if (comp.length > 512) return null;
   let re = /^[*?[]/.test(comp) ? '^(?!\\.)' : '^';
   for (let i = 0; i < comp.length; i++) {
     const c = comp[i];
@@ -716,7 +720,8 @@ const GLOB_DECOYS = ['.eslintrc', '.editorconfig', '.gitignore', '.nvmrc', 'READ
 function globHitsSecret(tok) {
   if (typeof tok !== 'string' || !/[*?[]/.test(tok)) return null;
   let verdict = null;
-  for (const comp of tok.split(/[\\/]/)) {
+  // A run of `*` is one `*`: after that, a component over 128 characters needs 64+ to match.
+  for (const comp of tok.replace(/\*+/g, '*').split(/[\\/]/)) {
     if (!/[*?[]/.test(comp) || comp.length > 128) continue;
     const rx = globComponentRe(comp);
     if (!rx || !GLOB_SECRETS.some((n) => rx.test(n))) continue;

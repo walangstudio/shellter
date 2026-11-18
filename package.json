@@ -20,7 +20,7 @@
     "powershell"
   ],
   "scripts": {
-    "test": "node test-hooks.js",
+    "test": "node test-hooks.js && node test-perf.js",
     "install-hooks": "node merge-settings.js",
     "scan": "node hooks/shellter-scan.js"
   },
