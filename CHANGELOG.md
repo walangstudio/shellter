@@ -75,13 +75,14 @@ every pipe stage and every `( )`, `$( )` and `{ }` body must approve, `2>&1` is 
 - On instruction files, `<system>` tags, `User:`/`Assistant:` examples, persona phrasing, "you are
   now a ...", an override phrase quoted in inline code, a fenced block, a blockquote or after an
   opening quote, and an HTML comment holding a link or "token" are advisory.
-- Grep denies a token-shape regex (`AKIA[`, `ghp_[`, `BEGIN ... PRIVATE KEY`, case-sensitive) or a
+- Grep denies a token-shape regex (a token prefix followed by regex syntax: `AKIA[`, `AKIA.{16}`,
+  `gh[pousr]_[`, `xoxb-[`, `BEGIN ... PRIVATE KEY`) or a
   `password\s*=` search only over a broad path: a filesystem or drive root, a home root, an ancestor
   of your home, a dot-directory directly under a home, or system config. A project below your home is
   not broad (`privateKey`, `beginSection`, `token: string` searches were denying).
 - A glob denies only through a literal secret stem after brace expansion (`**/.env*`, `**/id_rsa*`,
   `*.pem`, `*.{pem,key}`, `[.]env`, `.{ssh,aws}/**`); `**/*credential*`, `**/*id*`, `**/*.p*` fall
-  through. Not caught: `*env`, `?env`, `**/*nv`, `*ssh/*`, `**/id_rs*`.
+  through. One-character wildcards (`.e?v`, `id_rs?`) still deny. Not caught: `*env`, `**/*nv`, `*ssh/*`, `**/id_rs*`.
 - The decode budget counts tokens that decode to text, so a CLAUDE.md or memory file listing paths or
   commit SHAs no longer asks "too many encoded tokens".
 - PowerShell `git status 2>&1`, `(Get-Date).AddDays(-1)` and `tar --use-compress-program=zstd` allow.
@@ -95,10 +96,10 @@ paths, NTFS stream and trailing-dot spellings, junctions into `.claude/`, `.envr
 `~/.claude.json` ask.
 
 **Trust store.** A `:*` allow rule is matched against the script's own segment, never the whole
-compound command. A project's `.claude/settings.local.json` is honoured only when git positively
-reports it untracked, in any letter case, with `.claude` itself not tracked and every `GIT_*`
-variable stripped; without git, or when git cannot answer, it is not honoured (the trust store still
-works). `SHELLTER_TRUST_FILE` must be an absolute path outside the working directory and outside any
+compound command. A `.claude/settings.local.json` inside a git checkout is honoured only when git
+positively reports it untracked, in any letter case, with `.claude` itself not tracked and every
+`GIT_*` variable stripped; when git cannot answer there, it is not honoured. Outside any checkout
+(your own `~/.claude`) it is honoured as before. `SHELLTER_TRUST_FILE` must be an absolute path outside the working directory and outside any
 git checkout. shellter denies writes to its trust store, its installed hook files, its plugin cache
 and a module-type `package.json` beside the hooks, and ships `hooks/package.json` as CommonJS; writing
 `.claude/settings*.json` asks (silent in bypass and auto mode).
@@ -135,14 +136,17 @@ through; tool shapes are best-effort.
 - Constructs the parser does not model prompt (`((i++))`, functions).
 - These now deny because the read is seen: `for f in .env; do cat $f; done`, `D=$HOME/.ssh; cat
   $D/known_hosts`, a read hidden behind an apostrophe in a comment.
-- A project's `settings.local.json` outside a git repo no longer silences a flagged script.
+- Arithmetic (`$((x))`, `[[ x -eq 0 ]]`, `${s:x}`, a subscript, `${!x}`) over a variable the command
+  sets approves only when every value is an integer or a count-only substitution (`grep -n X f | cut
+  -d: -f1`, `grep -c`, `awk '{print NR}'`): `x='a[$(cmd)]'; echo $((x))` runs cmd. `${x@P}` and a
+  `$( )` inside `$(( ))` are not modelled.
 - Measured on one maintainer's real command log (5,389 unique commands, 3,384 benign auto-approvals
   at 0.10.0): 56 benign commands (1.7%) now prompt, all in the classes above; 346 that used to prompt
   now auto-approve (pnpm `--dir`/`--filter` and script-name forms, `npx --prefix`, `gh api` reads,
   loops and conditionals whose body approves, `[ ]`, subshells, commit and PR heredocs, variables over
   known paths). In that replay no benign command went to deny, and no PowerShell row moved untriaged. The reviewers' probes are pinned as tests.
 
-1887 tests in test-hooks.js (one POSIX-only), 41 shim checks, 33 bun adapter checks (opencode 18, pi 15).
+1919 tests in test-hooks.js (one POSIX-only), 43 shim checks, 33 bun adapter checks (opencode 18, pi 15).
 
 ## [0.10.0] - 2026-09-30
 

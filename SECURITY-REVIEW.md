@@ -99,7 +99,7 @@ log against the previous release) gate every change on not adding prompts.
 | B-M3 `bun x <pkg>`, `go run host/mod@v`, `~/.kube/config`, gh `hosts.yml`, `/proc/self/environ` | allow | fallthrough / deny |
 | F-C1 `:*` rule matched against the whole compound command | allow | segment only |
 | F-C2 Windows backslash paths | fallthrough | deny |
-| F-H1 repo-committed `settings.local.json` | allow | ignored when git reports it tracked, in any letter case; not honoured when git cannot answer |
+| F-H1 repo-committed `settings.local.json` | allow | inside a git checkout: ignored when git reports it tracked, in any letter case, and when git cannot answer. Outside any checkout: honoured (the user's own `~/.claude`) |
 | F-H2 agent writes its own trust / hooks / relative `SHELLTER_TRUST_FILE` | fallthrough / allow | deny for the trust store, installed shellter hook files, the plugin cache subtree and a `package.json` beside the hooks that switches them to ESM; `SHELLTER_TRUST_FILE` inside any git checkout ignored. Settings edits are ask-only, silent in bypass and auto mode |
 | F-H3 Grep `glob`, token-shape regexes | fallthrough | deny for explicit secret-name globs; token shapes only over a broad path. Adapters pass include globs through |
 | F-H4 adapter write tools unscanned | allow | scanned (best-effort shapes) |
@@ -172,7 +172,7 @@ classes.
 - **Derived-name and recursive reads.** A name produced by `find`, `ls`, `grep -l`, `git ls-files`
   counts as resolved for the approve floor, and `grep -r` / `--include` over a tree is allowed: the
   same reach as recursive content search, which is the tool's purpose.
-- **Glob forms that are not a literal secret stem** (`*env`, `?env`, `**/*nv`, `*ssh/*`) in Grep and
+- **Glob forms that are not a literal secret stem** (`*env`, `**/*nv`, `*ssh/*`) in Grep and
   Glob fall through: any rule that catches them re-creates the false denies.
 - **One-character regex evasions** of the token-shape Grep rule (`AK[I]A`): it is a tripwire for mass
   harvesting, not a boundary.

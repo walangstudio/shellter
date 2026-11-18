@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.11.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-1887%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-1919%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -154,8 +154,9 @@ node ~/.claude/hooks/shellter-trust.js remove <hash|path>
 
 Trust survives move/rename; editing the script invalidates it. Store at
 `~/.claude/shellter-trust.json` (override with `SHELLTER_TRUST_FILE`, an absolute path outside any
-git repository). A `:*` allow rule is matched against the script segment only, and a project's
-`.claude/settings.local.json` is honoured only when git positively reports it untracked: a cloned
+git repository). A `:*` allow rule is matched against the script segment only, and a
+`.claude/settings.local.json` inside a git checkout is honoured only when git positively reports it
+untracked: a cloned
 repo cannot whitelist its own script. shellter denies writes to its trust store, its installed files
 and a module-type `package.json` beside them. If a build doesn't
 surface `ask` reasons, set `SCRIPT_RISK_DECISION` in `check-bash.js` to `'deny'`.
