@@ -486,13 +486,25 @@ function scanShell(text, opts) {
 
 // Is text[at] quoted rather than said: inside `inline code` or a ``` fence, on a `>` blockquote
 // line, or right after an opening quote character?
+// Linear per scan: newlines, backticks and fence lines are indexed once per text, then each call is
+// a few binary searches (slicing the text per call was quadratic on long input).
+let mentionIx = null;
+const countBelow = (a, x) => { let lo = 0, hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m] < x) lo = m + 1; else hi = m; } return lo; };
 function isMention(text, at) {
-  const ls = text.lastIndexOf('\n', at - 1) + 1;
-  const line = text.slice(ls, at);
-  if (/^\s*>/.test(line)) return true;
-  if (((line.match(/`/g) || []).length % 2) === 1) return true;
-  if (/["'“‘«]\s*$/.test(line)) return true;
-  return ((text.slice(0, ls).match(/^\s*```/gm) || []).length % 2) === 1;
+  if (!mentionIx || mentionIx.text !== text) {
+    const pos = (re) => Array.from(text.matchAll(re), (m) => m.index);
+    mentionIx = { text, nl: pos(/\n/g), ticks: pos(/`/g), fences: pos(/^[ \t]*```/gm), quote: new Map() };
+  }
+  const ix = mentionIx;
+  const k = countBelow(ix.nl, at);
+  const ls = k ? ix.nl[k - 1] + 1 : 0;
+  if (!ix.quote.has(ls)) ix.quote.set(ls, /^[^\S\n]*>/.test(text.slice(ls, k < ix.nl.length ? ix.nl[k] : text.length)));
+  if (ix.quote.get(ls)) return true;
+  if ((countBelow(ix.ticks, at) - countBelow(ix.ticks, ls)) % 2 === 1) return true;
+  let j = at - 1;
+  while (j >= ls && /\s/.test(text[j])) j--;
+  if (j >= ls && /["'“‘«]/.test(text[j])) return true;
+  return countBelow(ix.fences, ls) % 2 === 1;
 }
 
 function scanInjectionText(findings, text, decodedLayer) {
@@ -539,7 +551,7 @@ function scanInjectionText(findings, text, decodedLayer) {
   // role-prompt boilerplate -> B2.
   let best = null;
   const allOv = new RegExp(OVERRIDE_RE.source, 'gi');
-  for (let ov, k = 0; k < 50 && (ov = allOv.exec(folded)); k++) {
+  for (let ov; (ov = allOv.exec(folded));) {
     const window = folded.slice(Math.max(0, ov.index - 200), ov.index + 200);
     const boiler = /^you\s+are\s+now/i.test(ov[0]);
     const quoted = !boiler && isMention(folded, ov.index);
@@ -647,7 +659,7 @@ function scanInjection(text, opts) {
   // has both an emphasis marker and an override word.
   if (/[*_~`<\[]/.test(text) && /\b(?:ignore|disregard|forget|previous|prior|instructions?|system)\b/i.test(text)) {
     const plain = text.replace(/<\/?[A-Za-z][\w-]{0,16}>/g, '').replace(/\[([^\]\n]{1,64})\]\([^)\s]{0,256}\)/g, (m, t) => t)
-      .replace(/(?<=\w)[*_~]+|[*_~]+(?=\w)|(?<=\w)`+(?=\w)/g, '');   // a code span stays a mention
+      .replace(/(?<=\w)[*_~]{1,4}|[*_~]{1,4}(?=\w)|(?<=\w)`+(?=\w)/g, '');   // a code span stays a mention
     if (plain !== text) {
       const sub = [];
       scanInjectionText(sub, plain, true);

@@ -75,7 +75,7 @@ function normalizeObfuscation(s) {
 // or the quoted payload is lost. Matching a `$var`/`${var}` command word here does that,
 // without matching a literal non-interpreter like `git -c ... commit` (config, not exec),
 // which must still relax so a `curl | bash` in its commit message is not a false deny.
-const INTERP_EXEC_RE = /\beval\b|\s-(?:exec|execdir|ok|okdir)\b|\bxargs\b|\$\(|`|(?:\b(?:bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b|\$\{?[A-Za-z_]\w*\}?)\S*\s+-[A-Za-z]*[ceErsi]\b/i;
+const INTERP_EXEC_RE = /\beval\b|\s-(?:exec|execdir|ok|okdir)\b|\bxargs\b|\$\(|`|(?:\b(?:bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)\b|\$\{?[A-Za-z_]\w*\}?)\S{0,256}\s+-[A-Za-z]*[ceErsi]\b/i;
 // Gate on the RAW string: if anything COULD execute quoted content, keep the raw text so the
 // payload is not hidden; otherwise strip quoted prose. Tested against the raw string, not the
 // skeleton, on purpose -- a quoted interpreter word still executes (`"$SHELL" -c "..."`,
@@ -1051,6 +1051,8 @@ const ASK_NOTICE =
 // Pass through instead: bypass runs it, auto lets its classifier judge. Denies are unaffected.
 let quietAsk = false;
 let isPoshTool = false;   // set in main; bash-only deny variants check it
+// A cap stopped an expansion short: the deny passes saw only part of what bash could run. Never approve.
+let structIncomplete = false;
 function ask(reason, snippet) {
   if (quietAsk) { audit('fallthrough', 'ask suppressed (bypass/auto mode): ' + reason, snippet); process.exit(0); }
   audit('ask', reason, snippet);
@@ -3535,7 +3537,7 @@ const subst = (text, vals) => {
     if (lit.includes('$') || !vs || !vs.length) return null;
     const next = [];
     for (const o of out) for (const v of vs) next.push(o + lit + v);
-    if (next.length > VALS_MAX) return null;
+    if (next.length > VALS_MAX) { structIncomplete = true; return null; }
     out = next; last = m.index + m[0].length;
   }
   const tail = text.slice(last);
@@ -3655,8 +3657,11 @@ function expansions(text, vals) {
   for (const m of text.matchAll(/\$\{?([A-Za-z_]\w*)\}?/g)) if (vals.has(m[1]) && vals.get(m[1]).length) names.add(m[1]);
   for (const name of names) {
     const next = [];
-    for (const t of out) for (const val of vals.get(name)) next.push(expandVars(t, new Map([[name, val]]), false));
-    out = next.slice(0, 32);
+    for (const t of out) for (const val of vals.get(name)) {
+      if (next.length === 32) { structIncomplete = true; break; }
+      next.push(expandVars(t, new Map([[name, val]]), false));
+    }
+    out = next;
   }
   return out.filter((t) => t !== text);
 }
@@ -4488,11 +4493,24 @@ if (MAIN) process.stdin.on('end', () => {
       ast = null;
     }
   };
+  // Each text is checked once per mode, and at most STRUCT_BYTES of variant text per command: past
+  // that the pass stops expanding (the command text itself is still checked) and nothing approves.
+  const STRUCT_BYTES = 256 * 1024;
+  const structSeen = { hard: new Set(), ask: new Set() };
+  let structBytes = 0;
+  const structCheck = (mode, t, extra) => {
+    const key = t + '\0' + (extra || '');
+    if (structSeen[mode].has(key)) return;
+    structSeen[mode].add(key);
+    checkSegmentDeny(t, 0, mode, extra);
+  };
   const structuralPass = (mode) => astWalk((p, v) => {
     const text = p.stages.map(canonStage).join(' | ');
-    const xs = expansions(text, v);
-    checkSegmentDeny(text, 0, mode, xs[0]);
-    for (const x of xs.slice(1)) checkSegmentDeny(x, 0, mode);
+    const xs = structBytes > STRUCT_BYTES ? [] : expansions(text, v);
+    for (const x of xs) structBytes += x.length;
+    if (structBytes > STRUCT_BYTES) { structIncomplete = true; xs.length = 0; }
+    structCheck(mode, text, xs[0]);
+    for (const x of xs.slice(1)) structCheck(mode, x);
     return true;
   });
   structuralPass('hard');
@@ -4599,8 +4617,8 @@ if (MAIN) process.stdin.on('end', () => {
       try { ok = approveAst(ast, hostSeed(), 0, approvedCanon); } catch (e) { if (!(e instanceof Error)) throw e;   // process.exit stubs (in-process replay) pass through
       ok = false; }
     }
-    if (ok) approve(rawCmd);
-    audit('fallthrough', ast ? '' : 'unparsed', rawCmd);
+    if (ok && !structIncomplete) approve(rawCmd);
+    audit('fallthrough', ast ? (structIncomplete ? 'expansion cap' : '') : 'unparsed', rawCmd);
     process.exit(0);
   }
 
