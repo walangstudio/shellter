@@ -232,7 +232,7 @@ classes (`[[:alpha:]]`) match any one character. The `package.json` write deny c
   known paths). In that replay one benign command went to deny (a PowerShell `Remove-Item -Recurse -Force` sent to the
   Bash tool), and no PowerShell row moved untriaged. The reviewers' probes are pinned as tests.
 
-2539 tests in test-hooks.js, 810 cases in test-perf.js, 20,000 in test-parser-fuzz.js, 47 shim checks, 37 bun adapter checks (opencode 22, pi 15).
+2657 tests in test-hooks.js, 810 cases in test-perf.js, 20,000 in test-parser-fuzz.js, 47 shim checks, 37 bun adapter checks (opencode 22, pi 15).
 
 ## [0.10.0] - 2026-09-30
 
