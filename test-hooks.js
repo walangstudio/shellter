@@ -20,7 +20,9 @@ function runHook(hookPath, input, env) {
     const out = execFileSync('node', [hookPath], {
       input: JSON.stringify(input),
       encoding: 'utf8',
-      timeout: 15000,   // a loaded CI runner: the perf gate, not this, bounds hook time
+      // The adapters' 25 s kill: the watchdog answers within it (two 8 s attempts plus the allow check),
+      // so a loaded machine gives the timeout verdict, not a killed test. The perf gate bounds hook time.
+      timeout: 25000,
       // CLAUDE_HOOK_LOG cleared: test traffic must not land in the decision log the replay gate reads.
       env: { ...process.env, CLAUDE_HOOK_LOG: '', SHELLTER_GIT_GUARDS: '', ...(env || {}) },
     });
@@ -38,7 +40,7 @@ function testBash(description, command, expected) {
   const ok = result.decision === expected;
   console.log('[' + (ok ? 'PASS' : 'FAIL') + '] ' + description);
   if (!ok) {
-    console.log('       expected=' + expected + ' got=' + result.decision);
+    console.log('       expected=' + expected + ' got=' + result.decision + (result.message ? ' (' + result.message.split('\n')[0] + ')' : ''));
     failed++;
   } else {
     passed++;
@@ -63,7 +65,7 @@ function testPosh(description, command, expected) {
   const ok = result.decision === expected;
   console.log('[' + (ok ? 'PASS' : 'FAIL') + '] ' + description);
   if (!ok) {
-    console.log('       expected=' + expected + ' got=' + result.decision);
+    console.log('       expected=' + expected + ' got=' + result.decision + (result.message ? ' (' + result.message.split('\n')[0] + ')' : ''));
     failed++;
   } else {
     passed++;
@@ -75,7 +77,7 @@ function testFile(description, toolName, toolInput, expected) {
   const ok = result.decision === expected;
   console.log('[' + (ok ? 'PASS' : 'FAIL') + '] ' + description);
   if (!ok) {
-    console.log('       expected=' + expected + ' got=' + result.decision);
+    console.log('       expected=' + expected + ' got=' + result.decision + (result.message ? ' (' + result.message.split('\n')[0] + ')' : ''));
     failed++;
   } else {
     passed++;
@@ -3805,6 +3807,104 @@ console.log('\n--- 0.11.0 r3 code review: glob classes, cd into .claude, git, un
   testFile('CR7 twin: a horizontal rule of 9 stars in CLAUDE.md falls through', 'Write', { file_path: 'CLAUDE.md', content: 'Ignore the build dir.\n\n' + st + '\n\nPrevious notes below.' }, 'fallthrough');
 }
 
+console.log('\n--- 0.11.0 final review (bash B1-B7, files B1-B3) ---');
+{
+  const NL = '\n', CR = '\r', BT = '`';
+  // B1 / B2: a PowerShell comment ends at CR too; a `#` after a backtick escape is inside the token
+  testPosh('B1: a lone CR ends a comment, the next command does not approve', 'git status # x' + CR + 'node x.js', 'fallthrough');
+  testPosh('B1 twin: a comment, LF, an approved command allows', 'git status # x' + NL + 'git log -1', 'allow');
+  for (const esc of [' ', ';', '|', '(', NL]) {
+    testPosh('B2: # after an escaped ' + JSON.stringify(esc) + ' is not a comment', 'Write-Output a' + BT + esc + '# x ; node x.js', 'fallthrough');
+  }
+  testPosh('B2 twin: # after a plain space is a comment', 'Write-Output a # x ; node x.js', 'allow');
+  // B3: ${F:=x} assigns wherever bash expands it
+  for (const carrier of ['cat <<EOF' + NL + '${F:=.env}' + NL + 'EOF' + NL, '[[ ${F:=.env} ]]; ', 'for i in ${F:=.env}; do :; done; ', 'case ${F:=.env} in x) ;; esac; ']) {
+    testBash('B3: ${F:=...} in ' + JSON.stringify(carrier.slice(0, 12)) + ' leaves F unread', 'F=; ' + carrier + 'cat $F', 'fallthrough');
+  }
+  testBash('B3 twin: ${F:-x} assigns nothing', 'F=notes.txt; [[ ${F:-x} ]]; cat $F', 'allow');
+  // B4: bash sets $_ and BASH_REMATCH from the command's own text
+  testBash('B4: $_ is not an environment name (find flag)', ': -delete; find . $_', 'fallthrough');
+  testBash('B4: $((_)) evaluates the last argument', ": 'a[$(node x.js)]'; echo $((_))", 'fallthrough');
+  testBash('B4: BASH_REMATCH carries a secret name', '[[ .env =~ .* ]]; cp $BASH_REMATCH out.txt', 'fallthrough');
+  testBash('B4: ${_} as a sed line number', ': 1e; sed -n "${_}p" notes.txt', 'fallthrough');
+  testBash('B4 twin: an environment name as a sed line number allows', 'sed -n "${N}p" notes.txt', 'allow');
+  // B5: an array-assignment subscript is arithmetic
+  for (const a of ['y=([x]=1)', 'y+=([x]=1)', 'y=(1 [x+0]=1)']) testBash('B5: ' + a + ' evaluates x', "x='a[$(node x.js)]'; " + a, 'fallthrough');
+  testBash('B5 twin: literal subscripts allow', 'y=([0]=a [1]=b); echo ${y[1]}', 'allow');
+  // B6: a write that can reach shellter's own files never approves
+  const H = '~/.claude/hooks/';
+  for (const c of ['> ' + H + 'check-bash.js', '2> ' + H + 'check-bash.js', 'ls; > ' + H + 'check-bash.js', 'X=1 > ' + H + 'watchdog.js',
+    'cd ~/.claude/hooks; > check-bash.js', 'ls &> ' + H + 'check-bash.js', 'cat notes.txt &>> ' + H + 'watchdog.js', '> ' + H + 'package.json',
+    'ls > ' + H + 'check-bash.j?', ': > ' + H + '[c]heck-bash.js', 'cp notes.txt ~/.cl*/hooks/check-bash.js']) {
+    testBash('B6: ' + c + ' denies', c, 'deny');
+  }
+  for (const c of ['cp notes.txt ~/.claude/hook?/', 'for f in ' + H + '*.js; do : > "$f"; done', 'find ~/.claude/hooks -name "*.js" | xargs -I{} cp notes.txt {}',
+    'd=$(dirname ' + H + 'x); cp notes.txt "$d/check-bash.js"', 'ln -s ~/.claude lnk; echo x > lnk/hooks/check-bash.js', '> ~/.claude/plugins/installed_plugins.json',
+    'echo x > ~/.claude/plugins/installed_plugins.json', 'echo x >> ~/.claude/./plugins/known_marketplaces.json']) {
+    testBash('B6: ' + c + ' does not approve', c, 'fallthrough');
+  }
+  for (const c of ['> out.txt', 'ls &> out.log', 'npm test &>> test.log', 'ls ' + H, 'cat ' + H + 'check-bash.js | head -5', 'echo x >> ~/.claude/CLAUDE.md']) {
+    testBash('B6 twin: ' + c + ' allows', c, 'allow');
+  }
+  // B7: a revision from git itself cannot become an option
+  for (const c of ['sha=$(git rev-parse HEAD); git show "$sha" --stat', 'base=$(git merge-base HEAD main); git log "$base"..HEAD',
+    'git diff $(git merge-base HEAD main) --stat', 'git show $(git rev-parse HEAD~1):package.json', 'd=$(date +%F); git log --since="$d" --oneline']) {
+    testBash('B7: ' + c + ' allows', c, 'allow');
+  }
+  for (const c of ['x=$(cat notes.txt); git log "$x"', 'git log $(git rev-parse --sq-quote x)', 'b=$(git branch --show-current); git diff --ext-diff "$b"',
+    'b=$(git branch --show-current); git log --output=o.txt "$b"', 'git show $(git rev-parse HEAD~1):.env', 'git diff $(git rev-parse HEAD) --textconv',
+    'x=$(cat notes.txt); git log --since=$x', 'b=$(git branch --show-current); git fetch origin "$b"', 'git fetch origin $(git describe --tags)',
+    'b=$(git symbolic-ref --short HEAD); git grep x "$b"', 'b=$(git rev-parse --abbrev-ref HEAD); git ls-remote origin "$b"',
+    'b=$(git branch --show-current); git log "$b"', 'tag=$(git describe --tags --abbrev=0); git log "$tag"..HEAD']) {
+    testBash('B7 attack: ' + c + ' does not approve', c, 'fallthrough');
+  }
+  // code review of the final fixes
+  testBash('CR1: a glob target past 256 expansions still checks the raw path', 'tee ~/.claude/plugins/cache/*/shellter/*/hooks/check-bash.js < notes.txt', 'deny');
+  for (const c of ['x=$(date +%Z); find . $x', 'x=$(git describe --tags); find . $x', 'find . $(git branch --show-current)']) {
+    testBash('CR2/3: a revision or date is never trusted outside git: ' + c, c, 'fallthrough');
+  }
+  for (const c of ['for f in ~/.claude/./hooks/*.js; do cp notes.txt "$f"; done', 'for f in ~/x/../.claude/hooks/*.js; do : > "$f"; done']) {
+    testBash('CR4: a non-normal spelling of the hooks dir: ' + c, c, 'fallthrough');
+  }
+  for (const c of ['git -C /etc log $(git rev-parse HEAD)', 'b=$(git branch --show-current); git --git-dir=/x/.git log "$b"']) {
+    testBash('CR5: another repository with an unread revision: ' + c, c, 'fallthrough');
+  }
+  testBash('CR5 twin: an unread -C value alone allows', 'root=$(git rev-parse --show-toplevel); git -C "$root" status', 'allow');
+  testBash('CR7: a producer value on one branch keeps the name unread', 'x=foo; [ -d a ] && x=$(ls | head -1); find . $x', 'fallthrough');
+  testBash('CR7 twin: literal values on both branches allow', 'x=foo; [ -d a ] && x=bar; find . -name $x', 'allow');
+  for (const c of ['ls ~/.claude/hooks > /tmp/list', 'ls ~/.claude/hooks > out.txt']) testBash('CR8 twin: reading the hooks dir into a literal file allows: ' + c, c, 'allow');
+  // code review of the final fixes, round 2
+  for (const c of ['for f in ~/.claude/hooks/*.js; do echo x >& "$f"; done', 'd=$(ls -d ~/.claude/hooks); echo x >& "$d/check-bash.js"']) {
+    testBash('CR9: >& after a word naming the hooks does not approve: ' + c, c, 'fallthrough');
+  }
+  testBash('CR9 twin: >&2 after reading the hooks dir allows', 'ls ~/.claude/hooks >&2', 'allow');
+  testBash('CR10: a nested array subscript is arithmetic', "x='a[$(node x.js)]'; y=([a[x]]=1)", 'fallthrough');
+  testBash('CR10 twin: a nested subscript fails closed, a flat one allows', 'y=([1+2]=1); echo ok', 'allow');
+  testBash('CR12: a glob target past 256 expansions outside .claude allows', 'cp notes.txt out/*/*/*', 'allow');
+  testBash('CR12 twin: a glob past 256 expansions that can name an rc file asks', 'cp notes.txt ~/*/*/.*rc', 'ask');
+  testBash('CR13: a literal non-reader after reading the plugins dir allows', 'ls ~/.claude/plugins; npm test', 'allow');
+  testBash('CR13 twin: a writer onto an unread target after it does not approve', 'f=$(ls ~/.claude/plugins | head -1); cp notes.txt "$f"', 'fallthrough');
+  // files B1: a reversed range matches nothing; the rest of the class still counts
+  for (const c of ['cat "src/app/[post-id]/page.tsx"', 'head -20 app/users/[user-id]/route.ts', 'grep -n foo "app/[order-id]/page.tsx"']) {
+    testBash('files B1: ' + c + ' allows', c, 'allow');
+  }
+  testFile('files B1: Glob **/[post-id].tsx falls through', 'Glob', { pattern: '**/[post-id].tsx' }, 'fallthrough');
+  testFile('files B1: Grep glob [post-id].tsx falls through', 'Grep', { pattern: 'x', glob: '[post-id].tsx' }, 'fallthrough');
+  testBash('files B1 attack: a class with a reversed range and e still reads .env', 'cat .[z-ae]nv', 'deny');
+  // files B2: POSIX classes match any one character
+  for (const c of ['cat .[[:alpha:]]nv', 'cat .[[=e=]]nv', 'cat .[[.e.]]nv', 'cat .en[[:alpha:]]', 'cat .[e[:digit:]]nv']) testBash('files B2: ' + c + ' denies', c, 'deny');
+  testFile('files B2: Glob .[[:alpha:]]nv denies', 'Glob', { pattern: '.[[:alpha:]]nv' }, 'deny');
+  testBash('files B2 twin: a POSIX class on an ordinary file allows', 'cat src/[[:alpha:]]*.ts', 'allow');
+  // files B3: only shellter's own hooks package.json
+  testFile('files B3: a project .claude/hooks/package.json Write falls through', 'Write', { file_path: 'proj/.claude/hooks/package.json', content: '{"dependencies":{}}' }, 'fallthrough');
+  testFile('files B3: a project .claude/hooks/package.json under home falls through', 'Edit', { file_path: '/home/x/proj/.claude/hooks/package.json', old_string: '{}', new_string: '{"a":1}' }, 'fallthrough');
+  testFile('files B3 attack: ~/.claude/hooks/package.json still denies', 'Write', { file_path: '/home/x/.claude/hooks/package.json', content: '{}' }, 'deny');
+  for (const p of ['/home/x/./.claude/hooks/package.json', '/home/x/p/../.claude/hooks/package.json', '/home/x//.claude/hooks/package.json',
+    require('path').join(require('os').homedir(), '.claude', 'hooks', 'package.json')]) {
+    testFile('CR14: a non-normal or real-home spelling of the hooks package.json denies: ' + p, 'Write', { file_path: p, content: '{}' }, 'deny');
+  }
+}
+
 console.log('\n--- prompt-rate corpus ---');
 // Sanitised real commands (shapes from an audit log) and benign twins that are auto-approved
 // today and must stay that way: a new prompt on any of them is a regression. Never weaken a
@@ -3952,7 +4052,19 @@ for (const c of [
   "# it's a comment\nls",
   "for p in 5192 5193; do curl -s -o /dev/null http://localhost:$p/ && break; sleep 1; done",
   "pnpm --filter web build",
+  // final review B7: git with a revision from git itself (267 everyday commands)
+  'sha=$(git rev-parse HEAD); git show "$sha" --stat',
+  'base=$(git merge-base HEAD main); git diff "$base"...HEAD --stat',
+  'base=$(git merge-base HEAD main); git diff $base --stat',
+  'git diff $(git merge-base HEAD main) --stat',
+  'git diff "$(git merge-base HEAD main)" --stat',
+  'git show $(git rev-parse HEAD~1):package.json',
+  'd=$(date +%F); git log --since="$d" --oneline',
 ]) testBash('corpus: ' + corpusLabel(c), c, 'allow');
+// A ref name can start with `--` (`--output=x`, `--upload-pack=x` from a fetched ref): these prompt.
+for (const c of ['branch=$(git branch --show-current); git log "$branch" -3', 'branch=$(git branch --show-current) && git log $branch -3',
+  'tag=$(git describe --tags --abbrev=0); git log "$tag"..HEAD --oneline', 'git log $(git describe --tags --abbrev=0)..HEAD --oneline',
+]) testBash('corpus (ref name prompts): ' + c, c, 'fallthrough');
 // $TEMP is seeded from the environment, which Linux and macOS do not set.
 testBashCwd('corpus: sed -n 1,20p "$TEMP/x.log"', 'sed -n 1,20p "$TEMP/x.log"', undefined, 'allow', { TEMP: os.tmpdir() });
 for (const c of [

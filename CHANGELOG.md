@@ -15,7 +15,7 @@ Secret reads see through globs, escapes and variables, the trust store can no lo
 cloned repo, and a set of false denies from the first round is gone. **In bypassPermissions and auto
 mode this release adds no prompts**; the new denies there are the shapes whose plain form already
 denies, plus four deliberate ones: writing shellter's trust store, its installed files or plugin
-cache, any write to the `package.json` beside the hooks, and a `data:text/html` link in Markdown. A
+cache, any write to the `package.json` beside the installed hooks, and a `data:text/html` link in Markdown. A
 command the hooks cannot finish analysing within 8 s (twice for a small input) asks in default mode and denies in bypass and auto
 mode.
 
@@ -145,8 +145,9 @@ that resolves to it through a short-name or trailing-dot alias (`CLAUDE~1/`), an
 variable stripped; when git cannot answer there, it is not honoured. Outside any checkout
 (your own `~/.claude`, and also a downloaded directory with no `.git`) it is honoured as before. `SHELLTER_TRUST_FILE` must be an absolute path outside the working directory and outside any
 git checkout. shellter denies writes to its trust store, its installed hook files, its plugin cache
-and any write to the `package.json` beside the hooks; the hooks create it as CommonJS when missing,
-which makes parent `package.json` files irrelevant; writing
+and any write to the `package.json` beside the hooks (`~/.claude/hooks/package.json` or the directory
+the hooks run from; a project's own `.claude/hooks/package.json` is not it); the hooks create it as
+CommonJS when missing, which makes parent `package.json` files irrelevant; writing
 `.claude/settings*.json` asks (silent in bypass and auto mode).
 
 **A hook always answers.** Both hooks analyse on a worker thread (`hooks/watchdog.js`). With no answer
@@ -176,7 +177,7 @@ and `plugin.json` MCP and LSP server command lines and loader variables, `status
 `hooks` path, reads quoted and flow-list `allowed-tools`, and flags `Bash(**)`, `Bash(:*)`,
 `Bash(*:*)`, `defaultMode: auto` and remote `type: http` hooks. The codex/agy shim and the opencode
 adapter share one patch parser (`hooks/patch-targets.js`) and gate patch blobs per file (`Move to:`,
-indented headers, unified diffs when the blob has no `***` header, the argv form); a read tool's
+indented headers, unified `+++` headers, also inside a `***` blob, the argv form); a read tool's
 `paths` and `path` are both checked; more
 edit shapes (`new_str`, `file_text`, `code_edit`, `ReplacementChunks`) and pass Grep include globs
 through; tool shapes are best-effort.
@@ -188,6 +189,20 @@ plain reader only for `status`, `log`, `show`, `diff` (without `--output`), `add
 ` *** ` context line no longer hides later `+++` headers a git-quoted `+++ "b/x"` is decoded as git does (octal escapes included), and `+++ /dev/null` checks the deleted file;
 Glob `.git*` falls through (a prefix must be half the secret name); any run of emphasis markers
 inside an override phrase is stripped; the trust check lists two index levels with a 16 MB buffer.
+
+**Final review.** A PowerShell comment ends at CR as well as LF, and a `#` after a backtick escape is
+inside its token. `${x:=w}` / `${x=w}` assigns wherever bash expands it (heredoc bodies, `[[ ]]`, `for`
+and `case` words). `$_`, `BASH_*`, `REPLY`, `PIPESTATUS`, `OPTARG`, `MAPFILE` are never environment
+names. An array-assignment subscript (`y=([x]=1)`, nested too) is arithmetic. `&>` and `&>>` are redirects, a
+redirect with no command word is write-checked, a glob target is matched component-wise against
+shellter's own files, and a command that names `~/.claude`, `.claude/hooks` or `.claude/plugins`
+approves no command with an unread argument or one naming them, and no redirect to an unread target
+or into `.claude/plugins` (`installed_plugins.json`), after it. git with a commit id from
+`git rev-parse` or `merge-base`, or an unread value of `--since=`-style options, approves again unless
+an exec-capable or other-repository git option is present; a ref name (`describe`,
+`branch --show-current`, `--abbrev-ref`) can start with `-`, so it still prompts. A reversed bracket range (`[post-id]`) matches nothing, as in bash; POSIX
+classes (`[[:alpha:]]`) match any one character. The `package.json` write deny covers
+`~/.claude/hooks` and the running hooks' own directory only.
 
 **Behaviour changes you may notice** (default, acceptEdits and plan mode only):
 - These used to auto-approve and now prompt, because the bare command prompts: an env prefix over a
@@ -207,8 +222,11 @@ inside an override phrase is stripped; the trust check lists two index levels wi
 - Arithmetic (`$((x))`, `[[ x -eq 0 ]]`, `${s:x}`, a subscript, `${!x}`) over a variable the command
   sets approves only when every value is an integer (see above): `x='a[$(cmd)]'; echo $((x))` runs
   cmd. `${x@P}` is not modelled.
+- A command after a word naming `~/.claude` itself, `.claude/hooks` or `.claude/plugins` prompts when an
+  argument is unread or names them (`cp CLAUDE.md ~/.claude/`): a file copied there can be the trust store.
+  git with a ref name from a substitution (`git log "$(git branch --show-current)"`) prompts.
 - Measured on one maintainer's real command log (5,389 unique commands, 3,384 benign auto-approvals
-  at 0.10.0): 57 benign commands (1.7%) now prompt, all in the classes above; 333 that used to prompt
+  at 0.10.0): 60 benign commands (1.8%) now prompt, all in the classes above; 335 that used to prompt
   now auto-approve (pnpm `--dir`/`--filter` and script-name forms, `npx --prefix`, `gh api` reads,
   loops and conditionals whose body approves, `[ ]`, subshells, commit and PR heredocs, variables over
   known paths). In that replay one benign command went to deny (a PowerShell `Remove-Item -Recurse -Force` sent to the

@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.11.0-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-2539%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-2657%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -322,7 +322,7 @@ tried once and reverted as a confirmed security regression.
 - **Hook not firing** — plugin: check `/plugin list`; manual: `~/.claude/settings.json` needs the `hooks` key with absolute OS-correct paths.
 - **False positive** — set `CLAUDE_HOOK_LOG`, reproduce, read the matched reason, adjust the regex or add a project allow rule.
 - **Crash / no output** — non-zero exit (except 2) or empty output falls through to the prompt; `CLAUDE_HOOK_DEBUG=1` mirrors decisions to stderr.
-- **"could not finish analysing"** - the watchdog budget ran out twice. Allow the exact command in `~/.claude/settings.json` (the message names the rule), or trust the script with `node ~/.claude/hooks/shellter-trust.js add <script>`.
+- **"could not finish analysing"** - the watchdog budget ran out (twice for an input under 16 KB). Allow the exact command in `~/.claude/settings.json` (the message names the rule), or trust the script with `node ~/.claude/hooks/shellter-trust.js add <script>`.
 
 ```bash
 echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | node ~/.claude/hooks/check-bash.js
