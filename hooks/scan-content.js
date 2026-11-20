@@ -710,7 +710,27 @@ function globComponentRe(comp) {
     else if (c === '[') {
       const e = lastClose < i + 2 ? -1 : comp.indexOf(']', i + 2);
       if (e < 0) { re += '\\['; continue; }
-      re += '[' + comp.slice(i + 1, e).replace(/^!/, '^').replace(/[\\\]]/g, (m) => '\\' + m) + ']';
+      // `[[:alpha:]]`, `[[=e=]]`, `[[.e.]]`: the class runs past the first `]`. Any one character.
+      if (/\[[:=.]/.test(comp.slice(i + 1, e))) {
+        let j = i + 1 + (/[!^]/.test(comp[i + 1]) ? 1 : 0);
+        if (comp[j] === ']') j++;
+        while (j < comp.length && comp[j] !== ']') {
+          const k = comp[j] === '[' && ':=.'.includes(comp[j + 1]) ? comp.indexOf(comp[j + 1] + ']', j + 2) : -1;
+          j = k < 0 ? j + 1 : k + 2;
+        }
+        if (j >= comp.length) { re += '\\['; continue; }
+        re += '.'; i = j; continue;
+      }
+      // A reversed range (`[post-id]`: `t-i`) matches nothing in bash; the rest of the class still counts.
+      let body = comp.slice(i + 1, e), cls = '';
+      const neg = /^[!^]/.test(body);
+      if (neg) body = body.slice(1);
+      const esc = (ch) => ch.replace(/[\\\]^]/g, '\\$&');
+      for (let k = 0; k < body.length; k++) {
+        if (body[k + 1] !== '-' || k + 2 >= body.length) cls += esc(body[k]);
+        else { if (body[k] <= body[k + 2]) cls += esc(body[k]) + '-' + esc(body[k + 2]); k += 2; }
+      }
+      re += cls ? '[' + (neg ? '^' : '') + cls + ']' : neg ? '.' : '(?!)';
       i = e;
     } else re += c.replace(/[.*+?^${}()|\\]/g, (m) => '\\' + m);
   }

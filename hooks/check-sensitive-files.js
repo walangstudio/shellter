@@ -291,6 +291,11 @@ function globNamesSecret(g) {
 }
 
 const HOOKS_PKG = canon(path.join(__dirname, 'package.json')).toLowerCase();
+// Shellter's install dir is `~/.claude/hooks`; a project's own `.claude/hooks/package.json` is not it.
+const HOME_HOOKS_PKG = new RegExp('^(?:~|(?:/[a-z])?' + HOME_ROOT + ')/\\.claude/hooks/package\\.json$', 'i');
+let homePkg = '';
+try { homePkg = path.posix.join(canon(require('os').homedir()), '.claude/hooks/package.json').toLowerCase(); } catch { /* no home */ }
+const homeHooksPkg = (p) => { const n = path.posix.normalize(canon(p)); return HOME_HOOKS_PKG.test(n) || n.toLowerCase() === homePkg; };
 // The real trust store, resolved: a fixture that shares its file name is not it.
 function isTrustStore(p) {
   let store = '';
@@ -476,7 +481,7 @@ watchdog.input((data) => {
       deny('Access to sensitive file/path blocked: ' + reason, p);
     }
     if (WRITE_TOOLS.has(tool) && (SHELLTER_SELF.test(p) || isTrustStore(p) || SHELLTER_PLUGIN_CACHE.test(p) ||
-        /(^|\/)\.claude\/hooks\/package\.json$/i.test(p) || canon(p).toLowerCase() === HOOKS_PKG)) {   // any content: it decides how node loads the hooks
+        homeHooksPkg(p) || canon(p).toLowerCase() === HOOKS_PKG)) {   // any content: it decides how node loads the hooks
       deny('Writing shellter\'s own trust store or hooks blocked', p);
     }
     if (WRITE_TOOLS.has(tool) && CLAUDE_SETTINGS.test(p)) {
