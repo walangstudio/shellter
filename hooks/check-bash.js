@@ -2762,16 +2762,20 @@ const EXEC_FLAGS = {
 // Commands whose flags or arguments can run something: for them every argument must be readable.
 const EXEC_ARG = new Set([...Object.keys(EXEC_FLAGS), 'find', 'xargs', 'curl', 'wget', 'less', 'tmux', 'sed']);
 const MSG_FLAG = /^(?:-m|--message|-b|--body|-t|--title|--notes)$/;
+const GIT_UNSAFE = /^(?:-[cCOou]|--(?:ext|textc|ou|op|upl|rece|exe|no-i|conf|pre|git-d|work-t))/;
+const GIT_VALUE_OPT = /^--(?:since|until|after|before|author|committer|grep|format|pretty|date|max-count|skip)=$/;
 // A word whose text the hook can read: literal (or resolved / derived by argvVariants), only integer
 // or environment expansions, a quoted expansion behind a literal prefix that is not a flag, a quoted
 // message-flag value, or a quoted word after a literal `--` (not for find).
 function argReadable(words, k, w0, vals) {
   const w = words[k];
   if (w.lit) return true;
+  const rev = w0 === 'git' && !SECRET_TOKENS_RE.test(w.text);
   let sub = 0, ints = true, der = false;
   for (const m of w.text.matchAll(/\$\(_\)|\$\{[^}]*\}|\$(?:[A-Za-z_]\w*|[0-9@*?$!#-])|[<>]\(_\)/g)) {
-    if (m[0] === '$(_)') { if (!intProducer(w.subs[sub++], vals)) ints = false; continue; }
+    if (m[0] === '$(_)') { const l = w.subs[sub++]; if (!intProducer(l, vals) && !(rev && revSub(l))) ints = false; continue; }
     const n = /^\$\{?([A-Za-z_]\w*)\}?$/.exec(m[0]);
+    if (n && rev && vals.get(n[1]) === REV) continue;
     if (n && (vals.get(n[1]) || [0]).length === 0) { der = true; continue; }   // a derived name: file names
     if (!n || !intName(outerTypes, n[1])) ints = false;
   }
@@ -2779,6 +2783,7 @@ function argReadable(words, k, w0, vals) {
   if (ints && (!der || (pre && !pre.startsWith('-')))) return true;
   if (w.uexp) return false;
   if (pre && !pre.startsWith('-')) return true;
+  if (w0 === 'git' && GIT_VALUE_OPT.test(pre)) return true;   // `--since="$d"`: one argument, a value only
   if (k > 1 && words[k - 1].lit && MSG_FLAG.test(words[k - 1].text)) return true;
   return w0 !== 'find' && words.slice(1, k).some((x) => x.lit && x.text === '--');
 }
@@ -3099,21 +3104,22 @@ function poshScan(seg) {
   return { stages: keep.map((x) => x[0]), stagesBlank: keep.map((x) => x[1]), groups, redirs, amp };
 }
 
-// The approve view of a PowerShell command: each comment removed to the end of its line. A `#` at
+// The approve view of a PowerShell command: each comment removed to the end of its line (CR or LF). A `#` at
 // token start opens a comment; quotes and backtick escapes are walked left to right. null when the
 // text holds a comment and something this walk does not model (here-string, block comment, `${ }`,
 // a substitution inside a string, an open quote).
 function poshStripComments(text) {
   if (!text.includes('#')) return text;
   if (/@['"]|<#|\$\{/.test(text)) return null;
-  let out = '', q = null;
+  let out = '', q = null, escaped = -1;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (q === "'") { if (c === "'") q = null; out += c; continue; }
-    if (c === '`') { out += c + (text[i + 1] || ''); i++; continue; }
+    if (c === '`') { out += c + (text[i + 1] || ''); escaped = ++i; continue; }
     if (q === '"') { if (c === '"') q = null; else if (c === '$' && text[i + 1] === '(') return null; out += c; continue; }
     if (c === "'" || c === '"') { q = c; out += c; continue; }
-    if (c === '#' && (i === 0 || /[\s;|(){}]/.test(text[i - 1]))) { while (i + 1 < text.length && text[i + 1] !== '\n') i++; continue; }
+    // A `#` after an escaped character is inside a token; a comment ends at CR or LF.
+    if (c === '#' && (i === 0 || (escaped !== i - 1 && /[\s;|(){}]/.test(text[i - 1])))) { while (i + 1 < text.length && !/[\r\n]/.test(text[i + 1])) i++; continue; }
     out += c;
   }
   return q ? null : out;
@@ -3273,6 +3279,7 @@ function parseBash(src0, depth) {
         for (const m of h.body.matchAll(/\$\{[!#]?\w+\[([^\]]*)\]/g)) if (!/^[@*]$/.test(m[1])) arith.push(m[1]);
         for (const m of h.body.matchAll(/\$\{\w+:(?![-=?+])([^}]*)\}/g)) arith.push(m[1]);
         for (const m of h.body.matchAll(/\$\(\(([\s\S]*?)\)\)/g)) arith.push(m[1]);
+        h.sets = [...h.body.matchAll(/\$\{(\w+)(?:\[[^\]]*\])?:?=/g)].map((m) => m[1]);   // ${x:=w} assigns x
       }
     }
     pending = [];
@@ -3470,7 +3477,7 @@ function parseBash(src0, depth) {
     const node = { type: 'simple', assigns: [], words: [], redirs: [] };
     for (;;) {
       blanks();
-      if (i >= n || /[\n;&|)]/.test(src[i])) break;
+      if (i >= n || (/[\n;&|)]/.test(src[i]) && !src.startsWith('&>', i))) break;   // `&>` / `&>>` redirect
       if (redirect(node)) continue;
       if (src[i] === '(') bad();               // function definition, or `((`
       if (!node.words.length) {
@@ -3481,7 +3488,19 @@ function parseBash(src0, depth) {
           const as = { name: a[1], append: !!a[3] || !!a[2], value: null, array: null };
           if (src[i] === '(') {
             i++; as.array = [];
-            for (;;) { blanks(); if (src[i] === '\n') { newline(); continue; } if (src[i] === ')') { i++; break; } if (i >= n) bad(); as.array.push(...braced(word())); }
+            for (;;) {
+              blanks();
+              if (src[i] === '\n') { newline(); continue; }
+              if (src[i] === ')') { i++; break; }
+              if (i >= n) bad();
+              const el = word();
+              if (el.text[0] === '[') {   // `y=([x]=1)`: the subscript, to its matching `]`, is arithmetic
+                let d = 0, e = 0;
+                for (; e < el.text.length; e++) { if (el.text[e] === '[') d++; else if (el.text[e] === ']' && --d === 0) break; }
+                if (/^\+?=/.test(el.text.slice(e + 1))) arith.push(el.text.slice(1, e));
+              }
+              as.array.push(...braced(el));
+            }
           } else if (i < n && !/[\s;&|<>()]/.test(src[i])) as.value = word();
           else as.value = { text: '', lit: true, subs: [], bare: true };
           node.assigns.push(as);
@@ -3675,8 +3694,11 @@ const canonStage = (st) => (st.type === 'simple' ? canonSimple(st, true)
 // A name that is absent is unresolved. cb(pipeline, vals) -> false stops the walk.
 const VALS_MAX = 32;
 function wordSubs(w) { return w ? w.subs : []; }
-// Names a ${x:=w} / ${x=w} in a stage's words, assignment values or redirect targets assigns.
-const wordSets = (st) => [...st.words, ...st.assigns.flatMap((a) => a.array || [a.value]), ...st.redirs.map((r) => r.target)].flatMap((w) => (w && w.sets) || []);
+// Names a ${x:=w} / ${x=w} assigns anywhere bash expands it: a stage's words (also `for`, `[[ ]]` and
+// `case` words), assignment values, redirect targets and unquoted heredoc bodies.
+const stageWords = (st) => (st.type === 'simple' ? [...st.words, ...st.assigns.flatMap((a) => a.array || [a.value])]
+  : st.type === 'case' ? [st.subject, ...st.arms.flatMap((a) => a.pats)] : st.words || []);
+const wordSets = (st) => [...stageWords(st), ...(st.redirs || []).flatMap((r) => [r.target, r.heredoc])].flatMap((w) => (w && w.sets) || []);
 // What a stage sets: { names: [{ name, value, kind }], all, bad }. value is a word, or null when the
 // stage sets the name to something unread. all = it may set any name (let, eval, source). bad = a
 // name position holds something other than a name (bash evaluates a subscript there), or a declare
@@ -3690,11 +3712,11 @@ function nameAfterV(ws, out) {
 function stageSets(st) {
   const out = { names: [], all: false, bad: false };
   const add = (name, value, kind) => out.names.push({ name, value, kind });
+  for (const n of wordSets(st)) add(n, null, 'word');
   if (st.type === 'for') { add(st.name, null, 'for'); return out; }
   if (st.type === 'test') { nameAfterV(st.words, out); return out; }
   if (st.type !== 'simple') return out;
   for (const a of st.assigns) add(a.name, a.array ? null : a.value, 'assign');
-  for (const n of wordSets(st)) add(n, null, 'word');
   if (!st.words.length) return out;
   const w0 = base(st.words[0].text), ws = st.words.slice(1);
   const name = (w) => { if (w && w.lit && NAME_RE.test(w.text)) add(w.text, null, 'cmd'); else out.bad = true; };
@@ -3752,6 +3774,7 @@ function nodeSubs(st) {
 }
 function assignedNames(l, out) {
   for (const p of l.items) for (const st of p.stages) {
+    for (const n of wordSets(st)) out.add(n);
     if (st.type === 'simple') {
       for (const a of st.assigns) out.add(a.name);
       const ss = stageSets(st);
@@ -3788,8 +3811,22 @@ const literalValue = (w, vals) => (w.lit ? [w.text] : subst(w.text, vals));
 // A name producer: its output is file names that exist, not text the command line spells out.
 // A variable or argument fed only by one is resolved for the approve floor (same reach as grep -r).
 const DERIVED = [];
+const REV = [];   // the output of a revProducer: a commit id
 const PRODUCER = /^(?:find|ls|fd|which|pwd|mktemp)$/;
 const SELECTOR = /^(?:head|tail|sort|uniq|grep|rg)$/;
+// A commit id from git itself (hex, or a literal operand echoed back), trusted as a git argument only.
+// A ref name (`--abbrev-ref`, `describe`, `branch --show-current`) can start with `-`; `date` follows TZ.
+function revProducer(w0, fl) {
+  if (w0 !== 'git') return false;
+  const flags = fl.slice(1).filter((t) => t.startsWith('-'));
+  if (fl[0] === 'rev-parse') return flags.every((t) => /^(?:--short(?:=\d+)?|--verify|-q|--quiet)$/.test(t));
+  return fl[0] === 'merge-base' && !flags.length && fl.length === 3;
+}
+function revSub(l) {
+  const st = l.items.length === 1 && l.items[0].stages.length === 1 && l.items[0].stages[0];
+  return !!st && st.type === 'simple' && !st.assigns.length && st.words.length > 0 && st.words.every((w) => w.lit) &&
+    revProducer(base(st.words[0].text), st.words.slice(1).map((w) => w.text));
+}
 function producerOk(ast) {
   if (!ast || !ast.items.length) return false;
   return ast.items.every((p) => producerPipeline(p.stages));
@@ -3816,7 +3853,7 @@ function producerPipeline(st) {
   return true;
 }
 function derivedWord(w, vals) {
-  if (/^\$\{?[A-Za-z_]\w*\}?$/.test(w.text)) { const v = vals.get(w.text.replace(/[${}]/g, '')); return !!v && v.length === 0; }
+  if (/^\$\{?[A-Za-z_]\w*\}?$/.test(w.text)) { const v = vals.get(w.text.replace(/[${}]/g, '')); return !!v && v.length === 0 && v !== REV; }
   if (w.subs.length !== 1 || !w.text.endsWith('$(_)')) return false;
   const pre = w.text.slice(0, -4);
   if (pre !== '') { const p = subst(pre, vals); if (!p || !p.every((x) => x.endsWith('/') && !SECRET_TOKENS_RE.test(x))) return false; }
@@ -3865,6 +3902,8 @@ function walkMaybe(body, v, cb) {
   }
   return true;
 }
+// `${x:=w}` / `${x=w}` assigns nothing when every value x can hold is set and non-empty.
+const keepsValue = (v, n) => !!v.get(n) && v.get(n).length > 0 && v.get(n).every((x) => x !== '');
 function walk(l, vals, cb, conditional) {
   for (const p of l.items) {
     const cond = conditional || p.cond;
@@ -3879,10 +3918,11 @@ function walk(l, vals, cb, conditional) {
     if (cb(p, vals) === false) return false;
     for (const st of p.stages) {
       const v = piped || st.type === 'subshell' ? new Map(vals) : vals;   // a pipe stage / subshell cannot set ours
+      if (st.type !== 'simple') for (const n of wordSets(st)) if (!keepsValue(vals, n)) vals.delete(n);
       if (st.type === 'simple') {
         const ss = stageSets(st);
         for (const x of ss.names) {
-          if (x.kind === 'assign') continue;
+          if (x.kind === 'assign' || (x.kind === 'word' && keepsValue(v, x.name))) continue;
           v.delete(x.name);
           if (envTaints(x.name)) v.set(' taint', [...(v.get(' taint') || []), { name: x.name, raw: '$', persisted: true }]);
         }
@@ -3891,9 +3931,9 @@ function walk(l, vals, cb, conditional) {
         if (w0 === null) {
           for (const a of st.assigns) {
             if (envTaints(a.name)) v.set(' taint', [...(v.get(' taint') || []), { name: a.name, raw: a.array ? '(' : a.value.text, persisted: true }]);
-            const lv = a.array || a.append ? null : (literalValue(a.value, v) || (derivedWord(a.value, v) ? DERIVED : null));
+            const lv = a.array || a.append ? null : (literalValue(a.value, v) || (a.value.text === '$(_)' && revSub(a.value.subs[0]) ? REV : derivedWord(a.value, v) ? DERIVED : null));
             if (!lv) v.delete(a.name);
-            else if (cond && v.has(a.name)) { const u = [...new Set([...v.get(a.name), ...lv])]; if (u.length > VALS_MAX) v.delete(a.name); else v.set(a.name, u); }
+            else if (cond && v.has(a.name)) { const u = [...new Set([...v.get(a.name), ...lv])]; if (u.length > VALS_MAX || !lv.length || !v.get(a.name).length) v.delete(a.name); else v.set(a.name, u); }
             else if (cond) v.set(a.name, lv.length ? [...lv, ''] : lv);   // set on one path, empty on the other
             else v.set(a.name, lv);
           }
@@ -3962,41 +4002,74 @@ const sub0 = (words, at) => words.slice(at);
 // files deny; Claude Code settings and shell rc files ask.
 const WRITE_OPERANDS = /^(?:tee|cp|mv|install|ln|rsync|dd|truncate|sed|rm|chmod)$/;
 const RC_BASE = /^\.(?:bashrc|zshrc|profile|bash_profile|zprofile|zshenv|zlogin|kshrc|cshrc|inputrc|fishrc)$|^config\.fish$/i;
+let storeCache;
 function protectedWrite(p, baseOnly) {
   const c = p.replace(/\\/g, '/').toLowerCase();
   const b = c.replace(/^.*\//, '');
-  let store = '';
-  try { store = trust.trustStorePath().replace(/\\/g, '/').toLowerCase(); } catch (_) { /* no home */ }
+  if (storeCache === undefined) try { storeCache = trust.trustStorePath().replace(/\\/g, '/').toLowerCase(); } catch (_) { storeCache = ''; }
+  const store = storeCache;
   if ((store && c === store) || /\/\.claude\/shellter-trust\.json$/.test(c) || (baseOnly && b === 'shellter-trust.json')) return 'deny';
   if (/\/\.claude\/(?:hooks|plugins)\/(?:.*\/)?(?:check-bash|check-sensitive-files|scan-content|watchdog|patch-targets|shellter-(?:trust|scan))\.js$/.test(c) ||
       /\/\.claude\/hooks\/package\.json$/.test(c) || /\/\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^/]+\/)*shellter\//.test(c)) return 'deny';
   if (/(?:^|\/)\.claude\/settings(?:\.local)?\.json$/.test(c) || RC_BASE.test(b)) return 'ask';
   return null;
 }
+// A write target as every protected path it can expand to: each glob component stands for itself and for
+// every protected name it matches. null past 256 paths (the caller fails closed).
+const PROTECTED_NAMES = ['.claude', 'hooks', 'plugins', 'cache', 'marketplaces', 'shellter', 'package.json', 'shellter-trust.json',
+  'settings.json', 'settings.local.json', ...'check-bash check-sensitive-files scan-content watchdog patch-targets shellter-trust shellter-scan'.split(' ').map((n) => n + '.js'),
+  ...'bashrc zshrc profile bash_profile zprofile zshenv zlogin kshrc cshrc inputrc fishrc'.split(' ').map((n) => '.' + n)];
+function globPaths(p) {
+  let out = [''];
+  for (const [k, c] of p.split(/[\\/]/).entries()) {
+    const g = /[*?[]/.test(c), rx = g && scan.globComponentRe(c);
+    const names = [c, ...(g ? PROTECTED_NAMES.filter((n) => n !== c && (!rx || rx.test(n))) : [])];
+    out = out.flatMap((o) => names.map((x) => (k ? o + '/' : '') + x));
+    if (out.length > 256) return null;
+  }
+  return out;
+}
 const PLAIN_READER = /^(?:ls|cat|head|tail|grep|rg|stat|wc|diff|file|find|test|\[|cd|echo|printf|less|bat|tree|du|realpath|readlink|dirname|basename|sha256sum|md5sum|cmp|jq)$/;
 // Set while approving the commands after a `cd` into a `.claude` directory: there a relative or
 // absent argument can be a protected file (`cd ~/.claude/hooks && tar xf x.tar`).
-let cdProtected = false, approving = false;
+// claudeNamed: a word named `~/.claude`, its hooks or plugins (a loop, xargs, dirname over them): writers and
+// redirects to an unread target after it do not approve.
+let cdProtected = false, claudeNamed = false, approving = false;
 // git subcommands that only read (or stage) the paths they name: a plain reader unless `--output`.
 function gitReads(toks) {
   let k = 1;
   while (k < toks.length && /^-/.test(toks[k])) k += /^-[Cc]$/.test(toks[k]) ? 2 : 1;
   return /^(?:status|log|show|diff|add|blame|ls-files|grep)$/.test(toks[k] || '') && !toks.some((t) => /^--output/.test(t));
 }
+// The home `~/.claude` itself, or any `.claude/hooks`, `.claude/plugins`, or a glob below a `.claude`.
+const CLAUDE_REACH = /(?:^|[\\/])\.claude[\\/]+(?:hooks|plugins)(?:[\\/]|$)/i;
+const claudeGlob = (c) => { if (!/[*?[]/.test(c)) return false; const rx = scan.globComponentRe(c); return !rx || rx.test('.claude'); };
+const globBelowClaude = (t) => /(?:^|[\\/])\.claude[\\/]+[^\\/]*[*?[]/i.test(t) || t.split(/[\\/]/).some(claudeGlob);
+function homeClaude(t) {
+  if (!/\.claude[\\/]*$/i.test(t)) return false;   // first: the trims below are quadratic on a run of slashes
+  const h = safeHomedir().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const c = t.replace(/\\/g, '/').replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/)/, h).replace(/\/+$/, '').toLowerCase();
+  return c === h + '/.claude';
+}
+function namesClaude(w, vals) {
+  const ts = [w.text, ...(w.lit ? [] : subst(w.text, vals) || [])].flatMap((t) => [t, path.posix.normalize(t.replace(/\\/g, '/'))]);
+  return ts.some((t) => CLAUDE_REACH.test(t) || homeClaude(t) || ((w.glob || w.uexp) && globBelowClaude(t)));
+}
 function noteCd(st, vals) {
+  // A word that names them (a loop over the hooks, xargs, dirname, a symlink): any later write may land there.
+  for (const w of [...stageWords(st), ...(st.redirs || []).map((r) => r.target)]) {
+    if (!w || !namesClaude(w, vals)) continue;
+    claudeNamed = true;
+    if (st.type === 'simple' && st.words.length && /^(?:ln|mount|bindfs)$/.test(base(st.words[0].text))) cdProtected = true;   // a link to it
+  }
   if (st.type !== 'simple' || !st.words.length) return;
   const ws = /^(?:builtin|command)$/.test(st.words[0].text) ? st.words.slice(1) : st.words;
   if (!ws.length || !/^(?:cd|pushd)$/.test(ws[0].text)) return;
   const a = ws.find((w, k) => k > 0 && !/^-[LPe@]+$/.test(w.text));
   const ts = !a ? [] : a.lit ? [a.text] : subst(a.text, vals) || [a.text];
-  const claudeDir = (c) => {
-    if (!/[*?[]/.test(c)) return /^\.claude$/i.test(c);
-    const rx = scan.globComponentRe(c);
-    return !rx || rx.test('.claude');
-  };
-  if (ts.some((t) => t.split(/[\\/]/).some(claudeDir))) cdProtected = true;
+  if (ts.some((t) => t.split(/[\\/]/).some((c) => /^\.claude$/i.test(c) || claudeGlob(c)))) cdProtected = true;
 }
-function writeTargets(st, vals) {
+function writeTargets(st, vals, globs) {
   const out = [];
   for (const r of st.redirs) if (r.target && /^(?:>|>>|>\||&>|&>>|<>|>&)$/.test(r.op)) out.push(r.target);
   const w0 = st.words.length && st.words[0].lit ? base(st.words[0].text) : '';
@@ -4014,7 +4087,11 @@ function writeTargets(st, vals) {
     if (destOnly) { if (ops.length > 1) out.push(ops[ops.length - 1]); } else out.push(...ops);
   }
   const res = [];
-  for (const w of out) res.push(...(w.lit ? [w.text] : subst(w.text, vals) || [w.text]));   // unresolved: its raw text
+  for (const w of out) {
+    const ts = w.lit ? [w.text] : subst(w.text, vals) || [w.text];   // unresolved: its raw text
+    res.push(...ts);
+    if (globs && (w.glob || (w.uexp && ts.some((t) => /[*?[]/.test(t))))) ts.forEach((t) => globs.add(t));   // bash expands it
+  }
   return res;
 }
 function heredocTargetsUnsafe(node) {
@@ -4054,6 +4131,8 @@ function approveArgv(words, vals, depth, approvedScripts) {
   }
   if ((EXEC_ARG.has(w0) && w0 !== 'sed') || (w0 === 'gh' && toks[1] === 'api')) {
     for (let k = 1; k < words.length; k++) if (!argReadable(words, k, w0, vals)) return false;
+    // An unread or derived git argument, and an option that runs, writes or reads outside the repo.
+    if (w0 === 'git' && words.some((w, k) => k > 0 && (!w.lit || w.text === '_derived_') && toks[k - 1] !== '-C') && toks.some((t) => GIT_UNSAFE.test(t))) return false;
   }
   if (w0 === 'find') {
     for (let k = 1; k < toks.length; k++) {
@@ -4070,6 +4149,7 @@ function approveArgv(words, vals, depth, approvedScripts) {
     return true;
   }
   if (w0 === 'xargs') {
+    if (claudeNamed) return false;   // its arguments come from a stream that named `.claude/hooks` / `plugins`
     let at = 1;
     for (; at < toks.length; at++) {
       const t = toks[at];
@@ -4100,7 +4180,8 @@ function approveArgv(words, vals, depth, approvedScripts) {
   if (secretArg(words, w0)) return false;
 
   if (!PLAIN_READER.test(w0) && !(w0 === 'git' && gitReads(toks)) && !(w0 === 'sed' && !toks.some((t) => /^-[A-Za-z]*i|^--in-place/.test(t)))) {
-    if (cdProtected) return false;
+    // After a word naming `.claude/hooks` / `plugins`: a non-reader approves only over literal arguments that do not name them.
+    if (cdProtected || (claudeNamed && words.some((w, k) => k > 0 && (!w.lit || w.text === '_derived_' || namesClaude(w, vals))))) return false;
     const home = os.homedir();
     for (const t of w0 === 'cp' ? writeTargets({ redirs: [], words }, vals) : toks.slice(1)) {
       const p = t.replace(/^--?[\w-]+=/, '').replace(/^~(?=[\\/]|$)/, home);
@@ -4126,6 +4207,9 @@ function approveStage(st, vals, depth, approvedScripts) {
     const ts = r.target.lit ? [r.target.text] : subst(r.target.text, vals);
     if (!ts || ts.some((t) => SECRET_TOKENS_RE.test(t) || scan.globHitsSecret(t))) return false;
   }
+  if (cdProtected && writeTargets({ redirs: st.redirs, words: [] }, vals).some((t) => !/^\/dev\/(?:null|stdout|stderr)$/.test(t))) return false;
+  // A redirect into `.claude/hooks` / `.claude/plugins` (installed_plugins.json decides what loads), or an unread one after them.
+  if (claudeNamed && st.redirs.some((r) => r.target && /^(?:>|>>|>\||&>|&>>|<>|>&)$/.test(r.op) && (!r.target.lit || r.target.glob || namesClaude(r.target, vals)))) return false;
   if (!st.words.length) return true;
   const w0 = st.words[0].text;
   // `IFS=.. read` scopes IFS to that read; anywhere else IFS changes how later words split.
@@ -4211,7 +4295,9 @@ function nameTypes(ast) {
   return t;
 }
 // An integer, or a name from the user's environment: what an arithmetic context may read.
-const intName = (t, n) => !t.all && !t.notInt.has(n);
+// bash itself sets `_`, `BASH_REMATCH` and the like from text the command supplies.
+const SHELL_VARS = /^(?:_|BASH_\w*|REPLY|PIPESTATUS|OPTARG|MAPFILE|READLINE_\w+|COMP_\w+|COPROC\w*)$/;
+const intName = (t, n) => !t.all && !t.notInt.has(n) && !SHELL_VARS.test(n);
 function arithOk(ast, t) {
   if (t.bad) return false;
   if (!(ast.arith || []).every((e) => /^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(e) && (e.match(/[A-Za-z_]\w*/g) || []).every((n) => intName(t, n)))) return false;
@@ -4220,10 +4306,10 @@ function arithOk(ast, t) {
 function approveAst(ast, vals, depth, approvedScripts) {
   const t = nameTypes(ast);
   if (!arithOk(ast, t)) return false;
-  const saved = outerTypes, savedCd = cdProtected, savedAp = approving;
+  const saved = outerTypes, savedCd = cdProtected, savedNamed = claudeNamed, savedAp = approving;
   outerTypes = t; approving = true;
   try { return walk(ast, vals, (p, v) => p.stages.every((st) => { noteCd(st, v); return approveStage(st, v, depth, approvedScripts); }), false); }
-  finally { outerTypes = saved; cdProtected = savedCd; approving = savedAp; }
+  finally { outerTypes = saved; cdProtected = savedCd; claudeNamed = savedNamed; approving = savedAp; }
 }
 
 // ---- argument models for the fail-closed approve ------------------------------------------
@@ -4877,10 +4963,10 @@ if (MAIN) watchdog.input((data) => {
     const home = safeHomedir();
     astWalk((p, v) => {
       for (const st of p.stages) {
-        if (st.type !== 'simple' || !st.words.length) continue;
+        if (st.type !== 'simple') continue;
         // `cd X` resolves; any other directory change (`cd -P`, `pushd`, `builtin cd`, `cd -`) makes
         // the directory unknown, and a relative write then counts by its basename.
-        const w0 = st.words[0].text;
+        const w0 = st.words.length ? st.words[0].text : '';
         const CD = /^(?:cd|pushd|popd)$/;
         if (CD.test(w0) || (/^(?:builtin|command)$/.test(w0) && CD.test((st.words[1] || {}).text))) {
           const a = st.words[1];
@@ -4889,16 +4975,19 @@ if (MAIN) watchdog.input((data) => {
           else known = false;
           continue;
         }
-        for (const t of writeTargets(st, v)) {
+        const globs = new Set();
+        for (const t of writeTargets(st, v, globs)) {
           const abs = path.resolve(dir, t.replace(/^~(?=[\\/]|$)/, home));
-          let hit = protectedWrite(abs, (!known || t.includes('$')) && !/^[~\\/]|^[A-Za-z]:/.test(t) || /^\$/.test(t));
-          const last = t.replace(/^.*[\\/]/, '');
-          if (!hit && /[*?[]/.test(last)) {   // a glob operand: test it against the protected names
-            const rx = scan.globComponentRe(last);
-            for (const n of ['shellter-trust.json', 'settings.json', 'settings.local.json', 'package.json', '.bashrc', '.zshrc', '.profile']) {
-              if (!rx || rx.test(n)) hit = hit || protectedWrite(path.join(path.dirname(abs), n));
-            }
+          const baseOnly = (!known || t.includes('$')) && !/^[~\\/]|^[A-Za-z]:/.test(t) || /^\$/.test(t);
+          const cands = globs.has(t) ? globPaths(abs) : [];
+          let hit = protectedWrite(abs, baseOnly);
+          // Too many expansions: deny if it can reach a `.claude`, ask if its last component can name an rc file.
+          if (!cands && hit !== 'deny') {
+            const rx = scan.globComponentRe(abs.replace(/^.*[\\/]/, ''));
+            if (abs.split(/[\\/]/).some((c) => /^\.claude$/i.test(c) || claudeGlob(c))) hit = 'deny';
+            else if (PROTECTED_NAMES.some((n) => RC_BASE.test(n) && (!rx || rx.test(n)))) hit = 'ask';
           }
+          for (const c of cands || []) { const h = protectedWrite(c, baseOnly); if (h === 'deny' || !hit) hit = h || hit; }
           if (hit === 'deny' && mode === 'hard') deny('Writing shellter\'s own trust store or installed files blocked', t);
           if (hit === 'ask' && mode === 'ask') ask('Writing Claude Code settings or a shell rc file -- approve only if intended', t);
         }
