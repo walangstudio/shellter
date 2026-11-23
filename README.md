@@ -1,9 +1,9 @@
 # shellter
 
-[![version](https://img.shields.io/badge/version-0.11.0-blue)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-0.11.1-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-2657%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-2807%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -21,7 +21,7 @@ Unix parsing, PowerShell gets PS parsing and the PowerShell/cmd rule sets.
 - Descends into `bash`/`sh`/`zsh`/`dash`/`ash`/`ksh`/`fish -c`, `find -exec`, `xargs`, process substitution, `powershell -Command`/`pwsh -c`/`cmd /c`
 - Strips invisible/steganographic Unicode (zero-widths, bidi overrides, tag chars) before matching
 - Scans the contents of executed scripts (`bash X`, `./X`, `source X`, `pwsh -File X`, `& ./X.ps1`): reads the resolved file (first 256 KB) for download-pipe-to-shell, dev-tcp reverse shells, base64/xxd decode-then-exec, EncodedCommand/IEX/DownloadString, LOLBins. High-risk + untrusted → `ask`; trusted → allow. See [Script trust](#script-trust)
-- DENY (cross-platform): reverse shells (incl. `socat EXEC:`, `nc -c`, `php -r` fsockopen), exfiltration (`tar`/`zip`/`7z` of a secret or whole `.ssh`/`.aws`; `curl -d "$(env)"`/secret-env-var POST to a URL), encoded payloads, *setting* a command-exec `git config` key (`core.hooksPath`/`credential.helper`/`core.sshCommand`/`gpg.program`/`!`-aliases; `user.name`/`user.email` allowed, and reading any key back is allowed), persistence (`.git/hooks/`, CI configs, `~/.ssh/authorized_keys`), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`), crypto miners, container escape, fork bombs, `rm -rf` of system dirs (incl. across a `\`-newline continuation, and `eval "rm -rf /"` / `command eval …`)
+- DENY (cross-platform): reverse shells (incl. `socat EXEC:`, `nc -c`, `php -r` fsockopen), exfiltration (`tar`/`zip`/`7z` of a secret or whole `.ssh`/`.aws`; `curl -d "$(env)"`, a secret-named env var in a curl/wget URL or body, or piped to `nc`), encoded payloads, *setting* a command-exec `git config` key (`core.hooksPath`/`credential.helper`/`core.sshCommand`/`gpg.program`/`!`-aliases; `user.name`/`user.email` allowed, and reading any key back is allowed), persistence (`.git/hooks/`, CI configs, `~/.ssh/authorized_keys`), kernel module load, loader injection (`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`), crypto miners, container escape, fork bombs, `rm -rf` of system dirs (incl. across a `\`-newline continuation, and `eval "rm -rf /"` / `command eval …`)
 - DENY (macOS): `csrutil disable`, `spctl --master-disable`, `launchctl`/LaunchAgents, `security` Keychain extraction, `dscl` user creation, `kextload`, `tccutil reset`, `diskutil erase`, quarantine stripping, `rm -rf /System|/Library|/Applications|/Users|/Volumes`
 - DENY (PowerShell): `Remove-Item -Recurse -Force` of home/root/wildcard, `Invoke-Expression`/`iex`, `iwr|iex` and `-OutFile`/`DownloadString` download-exec, EncodedCommand, `Set-ExecutionPolicy`, `Set-MpPreference`, service/scheduled-task/Run-key/`$PROFILE` persistence, lsass MiniDump, secret reads and archive/copy exfil
 - DENY (cmd): `del`/`rmdir /s`, `format`, `vssadmin delete shadows`, `bcdedit`, `reg add …\Run`, `schtasks /create`, `sc create`, `net user … /add`, `netsh advfirewall`, `takeown`, `icacls /grant`, `certutil -urlcache`, `bitsadmin /transfer`, `mshta`/`regsvr32`/`rundll32`
@@ -32,7 +32,7 @@ Unix parsing, PowerShell gets PS parsing and the PowerShell/cmd rule sets.
 
 **check-sensitive-files.js** — gates `Read`, `Write`, `Edit`, `Glob`, `Grep`.
 - Resolves symlinks first (`ln -s ~/.env /tmp/x; Read /tmp/x` is blocked)
-- Blocks `.env*` (`.example`/`.sample`/`.template` excluded), `.pem`, `.key`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, and their `.bak`/`.old`/`.backup` variants. Public `.crt` certificates are not treated as secrets
+- Blocks `.env*` (`.example`/`.sample`/`.template` excluded), `.pem`, `.key`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, and their `.bak`/`.old`/`.backup` variants. Public `.crt` certificates are not treated as secrets, nor a `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`, `__fixtures__/` or `testdata/` dir. Glob lists names only, so it denies only when it walks a secret directory (`.ssh/**`)
 - Blocks credential files: `.gitconfig`, `.git-credentials`, `.npmrc`, `.pypirc`, `.cargo/credentials`, `.docker/config.json`, `.config/gh/hosts.yml`, `.ssh/config`; and non-code files under a `secrets/`/`credentials/` directory (a source file like `credentials/oauth.ts` is treated as code, not a secret)
 - Blocks wallets/keystores, browser-cookie DBs, macOS Keychain, Windows secrets (`*.ppk`, `NTUSER.DAT`, registry hives under a `…\config\` path (`SAM`/`SYSTEM`/`SECURITY` — a repo file named `SECURITY` is not flagged), `AppData\…\Credentials`)
 - Prompt-injection detection in written content is **two-tier** (see [Injection-on-write](#injection-on-write)):
@@ -331,7 +331,7 @@ node test-hooks.js
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Current: 0.11.0 - security-fix release: bash auto-approve is
+See [CHANGELOG.md](CHANGELOG.md). Current: 0.11.1 - a secret variable sent to the network denies; write-then-run, code-loading runner flags and environment dumps prompt; PowerShell writes match bash; Glob and test-fixture keys no longer false-deny. Previously 0.11.0 - security-fix release: bash auto-approve is
 fail-closed (one parser reads the command; what it cannot read is never auto-approved), secret reads see through globs and escapes, Windows backslash paths are canonicalised,
 the trust store ignores repo-committed allow rules, and a hook always answers within its budget. Previously 0.10.0 - never asks in bypass or auto mode
 (denies still block), stops false "could not fully analyze" prompts on heredocs, nested `$( … )`

@@ -7,6 +7,42 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
+## [0.11.1] - 2026-11-20
+
+Fixes from an end-to-end eval of 0.11.0 (562 benign operations, 283 attack probes, 4 real Claude Code
+sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
+
+- **A secret-shaped variable sent to the network denies.** curl, wget, nc, socat, `iwr`/`irm` with
+  `$GITHUB_TOKEN`-style names (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `PASS`, `AUTH`, `PAT` parts;
+  `AWS_REGION` and `AWS_PROFILE` are not secrets) in the URL, a body (`-d`, `--data*`, `-F`), the user
+  agent, or piped in (`echo $TOKEN | nc host 1`). A header or credential value (`-H "x-api-key: $KEY"`,
+  `-u me:$TOKEN`, `-su`, `iwr -Headers @{..}`) is how a token is meant to be sent: it prompts. A curl or
+  wget with any variable never auto-approves. Literal text (`git commit -m '... $API_KEY'`) is not a send.
+- **Written commands are scanned.** Literal content a command writes (a heredoc body, `echo`/`printf`
+  words, a `sed -i` script) and Write/Edit content for a command-definition file (`package.json`,
+  `Makefile`, `build.rs`, `conftest.py`, `setup.py`, `pyproject.toml`, `.npmrc`, ...) get the shell scan:
+  a secret upload (`curl -d @.env`) or download-exec (`curl | sh`) denies. Content the hook cannot read
+  (`cp`, `cat x >`, `curl -o`, `wget`, `patch`, `git apply`, an unpack) into a command-definition file,
+  then a runner in the same command, prompts. Ordinary edits (`sed -i src/x.ts && npm test`) still
+  approve. Code that reads `.env` and posts it from JS/Python/Go source is not detected (accepted limit).
+- **Runner flags that load code prompt**: `--script-shell`, `go test -exec`, `cargo --config`,
+  `pytest -p`, `node -r`, `make SHELL=`, eslint/prettier plugins, and a `--config`/`-c`/`--dir`/`-C` or
+  `cd` into a temp dir or Downloads (a cloned payload). The project's own config files and sibling
+  checkouts still approve.
+- **Environment dumps prompt**: `env`, `printenv`, `export -p`, `ps e`, `echo $SECRET_NAME`,
+  PowerShell `Get-ChildItem Env:`.
+- **`~/.bash_aliases`, `~/.bash_login`, `~/.bash_logout` are rc files** (writes ask).
+- **PowerShell parity with bash**: `Remove-Item`, `Set-Content`, `Add-Content`, `Out-File`, `Copy-Item
+  -Destination`, `>` and `*>>` onto shellter's files or trust store deny and onto Claude settings ask,
+  after a readable `Set-Location` too; `Add-Content`/`Out-File`/`>` of injection text into CLAUDE.md denies
+  (named, positional or piped content).
+- **Write/Edit of a `.git/hooks` file with download-exec content denies** (bash already did).
+- **False denies removed**: Glob lists names and reads nothing, so only a walked secret directory
+  (`.ssh/**`) denies, not `**/.env*`; `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`,
+  `__fixtures__/` or `testdata/` dir is fixture data; `cat ~/.gitconfig` names the right reason.
+
+2807 tests in test-hooks.js (2657 at 0.11.0).
+
 ## [0.11.0] - 2026-11-18
 
 A security-fix release from three review rounds. Bash auto-approve is now fail-closed: one parser reads

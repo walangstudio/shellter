@@ -335,9 +335,35 @@ prompting; the hooks `package.json` deny not normalised. All fixed and pinned.
 - **More than 2,000 tracked depth-2 names with `~`, `:`, a non-ASCII character or a trailing dot**: the trust
   check gives up on alias resolution and the untracked `settings.local.json` is not honoured (its scripts ask).
 - **`merge-settings.js` replaces an existing `~/.claude/hooks/package.json`** with `{"type":"commonjs"}`.
-- **Glob `.npm*`, `.np*`, `**/.net*` deny** (literal prefix of `.npmrc` / `.netrc`, intended).
+- **Glob `.npm*`, `.np*`, `**/.net*` deny** (literal prefix of `.npmrc` / `.netrc`, intended). Since 0.11.1
+  a Glob name pattern falls through; only a walked secret directory denies.
 - **A Write of this repository's own `CHANGELOG.md` denies**: the entry quotes an encoded-exec call form.
 - **CI has not run the two new gates on hosted runners**; `test-perf.js` has a 3 s wall-clock bound.
+
+## Seventh review - E2E eval (v0.11.1, 2026-11-20)
+
+An end-to-end eval of 0.11.0 (562 benign operations, 283 attack probes, 4 headless Claude Code sessions)
+found five attack classes auto-approved by 0.11.0 and 0.10.0, three parity holes and five benign denies.
+
+| Finding | v0.11.0 | v0.11.1 |
+| --- | --- | --- |
+| A secret-shaped variable in a curl/wget URL, body, `-F`, `-A`, or piped to nc/curl | allow | deny |
+| A secret-shaped variable in a header or `-u` value | allow | fallthrough (decision: how tokens are meant to be sent) |
+| B written content with a secret upload or download-exec (heredoc/echo/printf/`sed -i`, Write/Edit of `package.json`, Makefile, ...) | allow | deny |
+| B unreadable content (`cp`, `curl -o`, `wget`, `git apply`) into a command-definition file, then a runner | allow | fallthrough |
+| C `--script-shell`, `go -exec`, `cargo --config`, `pytest -p`, `node -r`, `make SHELL=`, a config or `cd` in a temp dir | allow | fallthrough |
+| D `env`, `printenv`, `export -p`, `ps e`, `echo $TOKEN`, `Get-ChildItem Env:` | allow | fallthrough |
+| E `>> ~/.bash_aliases`, `~/.bash_login`, `~/.bash_logout` | allow | ask |
+| PowerShell writes to shellter's files, trust store, settings (incl. `Copy-Item -Destination`, `>`, `Set-Location`) | fallthrough | deny / ask (as bash) |
+| PowerShell injection text into CLAUDE.md (positional, named, piped, `>`) | fallthrough | deny |
+| Write/Edit `.git/hooks/*` with download-exec content | fallthrough | deny |
+| Glob `**/.env*` (names only) | deny | fallthrough |
+| Read/cat a `.pem`/`.key` under a project test or fixtures dir | deny | fallthrough / allow |
+
+Out of scope, unchanged: destructive and tamper commands that fall through in bypass mode.
+Accepted limit: source code that reads `.env` and posts it (JS `readFileSync` + `fetch`, Python, Go, Rust)
+is not detected in a Write or a shell write; a runner after it still approves. A two-call split
+(Write, then `npm test`) was never covered by the same-command rule, so the content scan is the control.
 
 ## Read the verdict labels precisely
 
