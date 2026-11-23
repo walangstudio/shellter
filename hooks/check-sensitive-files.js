@@ -200,6 +200,13 @@ const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 // real secret material, not code.
 const CODE_FILE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|kt|kts|swift|scala|clj|ex|exs|css|scss|less|vue|svelte|html)$/i;
 const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
+// A key or certificate a test suite ships (`test/fixtures/fake_key.pem`) is fixture data.
+// Files whose content is a command a runner runs (kept in step with check-bash.js CMD_DEF).
+const CMD_DEF = /(?:^|[\\/])(?:package\.json|[Mm]akefile|GNUmakefile|[^\\/]*\.mk|build\.rs|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|pytest\.ini|noxfile\.py|\.npmrc|\.yarnrc(?:\.yml)?|Cargo\.toml|config\.toml|Rakefile|[Jj]ustfile|Taskfile\.ya?ml)$/;
+// Only inside the project (`/etc/ssl/private/tests/server.key` is not fixture data).
+const TEST_KEY = /^(?:[^\\/]+[\\/])*(?:test|tests|fixtures|__fixtures__|testdata)[\\/](?:[^\\/]+[\\/])*[^\\/]+\.(?:pem|key)$/i;
+let projectRoot = process.cwd();
+const testKey = (p) => { const r = path.relative(projectRoot, path.resolve(projectRoot, p)); return !r.startsWith('..') && !path.isAbsolute(r) && TEST_KEY.test(r); };
 
 // Wallet / crypto / browser cookie files.
 const WALLET_PATTERN = /\b(wallet\.dat|keystore\.json|UTC--\d{4}-\d{2}-\d{2}T)\b|(^|\/)\.electrum\/wallets\/|(^|\/)\.bitcoin\/wallet\.dat$/i;
@@ -305,7 +312,7 @@ function isTrustStore(p) {
 
 function pathMatchesAnySensitive(p) {
   if (!p) return null;
-  if (SENSITIVE_EXTENSIONS.test(p)) return 'sensitive extension';
+  if (SENSITIVE_EXTENSIONS.test(p) && !testKey(p)) return 'sensitive extension';
   if (SENSITIVE_DIRS.test(p)) return 'sensitive directory/file';
   if (SENSITIVE_FILES.test(p)) return 'sensitive credential file';
   if (ENV_FILE.test(p)) return '.env file';
@@ -328,6 +335,7 @@ watchdog.input((data) => {
   } catch {
     process.exit(0);
   }
+  if (typeof input?.cwd === 'string' && input.cwd) projectRoot = input.cwd;
   quietAsk = typeof input?.permission_mode === 'string' && /^(?:bypassPermissions|auto)$/.test(input.permission_mode);
 
   const tool = input?.tool_name || '';
@@ -379,6 +387,15 @@ watchdog.input((data) => {
 
       if (ENCODED_EVAL_PATTERN.test(flat)) {
         deny('Encoded eval/exec pattern in file content blocked', filePath);
+      }
+      // A git hook runs on the next commit: high-risk shell content there is the bash `> .git/hooks/` deny.
+      if (pathForms(filePath).some((p) => /(?:^|[\\/])\.git[\\/]hooks[\\/]/i.test(p)) && scan.hasHigh(scan.scanShell(content))) {
+        deny('Writing to .git/hooks blocked -- possible persistence', filePath);
+      }
+      // A file whose content is a command a runner runs (package.json scripts, a Makefile recipe): the
+      // shell scan bash applies to written content (secret upload, download-exec).
+      if (CMD_DEF.test(filePath) && scan.hasHigh(scan.scanShell(content))) {
+        deny('Writing a secret upload or download-exec command to a file blocked', filePath);
       }
       if (ENCODED_METHOD_EXEC.test(flat)) {
         pendingAsk = pendingAsk || { reason: 'exec/eval method call on decoded data in file content', snippet: filePath };
@@ -439,9 +456,10 @@ watchdog.input((data) => {
       filePath = input?.tool_input?.notebook_path || input?.tool_input?.file_path || '';
       break;
     case 'Glob': {
+      // Glob lists names and reads nothing: only the directories it walks are checked, not the names it matches.
       const pattern = input?.tool_input?.pattern || '';
       const dir = input?.tool_input?.path || '';
-      filePath = dir ? `${dir}/${pattern}` : pattern;
+      filePath = [dir, pattern.replace(/(?:^|[\\/])[^\\/]*$/, '')].filter(Boolean).join('/');
       break;
     }
     case 'Grep': {
@@ -490,8 +508,8 @@ watchdog.input((data) => {
     if (PERSONAL_HISTORY.test(p)) {
       pendingAsk = pendingAsk || { reason: 'Shell history / Claude config may hold tokens', snippet: p };
     }
-    if (tool === 'Glob' && (SENSITIVE_GLOB.test(p) || globNamesSecret(p))) {
-      deny('Glob pattern targeting sensitive files blocked', p);
+    if (tool === 'Glob' && (SENSITIVE_GLOB.test(p) || globNamesSecret(p + '/'))) {   // p is the walked directory
+      deny('Glob over a sensitive directory blocked', p);
     }
   }
 
