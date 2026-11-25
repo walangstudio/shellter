@@ -40,7 +40,7 @@ const join = (...a) => a.join('');
 const OV = join('ign', 'ore all prev', 'ious instr', 'uctions.');
 const PADS = ['$a$b$c', '$x', '$x,', '$x ', '*', '~', '_', '`', "'", '"', '(', ')', '{', '}', '${a:', '<(', '>', '<', '|', '&', ';', '\\',
   '#', '=', '-', '[', '!', '@', '%', '/', '.', '0', 'a ', '\n', ' \n', '\n ', '\r\n', '\t', '<!--', '-->', '<<EOF\n', 'sed x -i ',
-  '​', 'Ａ', 'ignore '];
+  '​', 'Ａ', 'ignore ', 'client_secret.', '-e open ', '/proc/', 'node '];
 const V32 = Array.from({ length: 32 }, (_, i) => 'v' + i).join(' ');
 const bash = (pre, post = '') => (p) => [BASH_HOOK, { tool_name: 'Bash', tool_input: { command: pre + p + post } }];
 const posh = (pre, post = '') => (p) => [BASH_HOOK, { tool_name: 'PowerShell', tool_input: { command: pre + p + post } }];

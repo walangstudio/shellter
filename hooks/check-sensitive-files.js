@@ -189,7 +189,7 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(?:env\s+)?(?:[\w.~\\/-]{0,128}[\\/])?(curl
 const SENSITIVE_EXTENSIONS = /\.(?:env(?!\.(?:example|sample|template|dist|defaults?)\b)|pem|key|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
 // .gitconfig deliberately excluded: tokens normally live in .git-credentials.
-const SENSITIVE_FILES = /(^|\/)(\.git-credentials|_netrc|proc\/(?:[^\/]+\/)+environ|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
+const SENSITIVE_FILES = /(^|\/)(\.git-credentials|_netrc|proc\/(?:[^\/]+\/){1,3}environ|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
 const ENV_FILE = /(^|\/)\.env(?:rc|[_-][A-Za-z0-9_-]+)?(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
 const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 // A source-code file inside a dir named credentials/secrets is code, not a secret
@@ -204,7 +204,7 @@ const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
 // Files whose content is a command a runner runs (kept in step with check-bash.js CMD_DEF).
 const CMD_DEF = /(?:^|[\\/])(?:package\.json|makefile|GNUmakefile|[^\\/]*\.mk|build\.rs|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|pytest\.ini|noxfile\.py|\.npmrc|\.yarnrc(?:\.yml)?|Cargo\.toml|config\.toml|Rakefile|justfile|Taskfile\.ya?ml|composer\.json|deno\.jsonc?|\.husky[\\/][^\\/]+)$/i;
 // Only inside the project (`/etc/ssl/private/tests/server.key` is not fixture data).
-const TEST_KEY = /^(?:[^\\/]+[\\/])*(?:test|tests|fixtures|__fixtures__|testdata)[\\/](?:[^\\/]+[\\/])*[^\\/]+\.(?:pem|key)$/i;
+const TEST_KEY = /^(?:[^\\/]+[\\/])*(?:test|tests|fixtures|__fixtures__|testdata)[\\/](?:[^\\/]+[\\/])*(?:[^\\/]+\.(?:pem|key)|credentials\.json)$/i;
 let projectRoot = process.cwd();
 let credHome = '';
 try { credHome = require('os').homedir(); } catch (_) { /* no home: the name heuristic is off */ }
@@ -330,7 +330,7 @@ function pathMatchesAnySensitive(p) {
   if (MACOS_KEYCHAIN.test(p)) return 'macOS Keychain database';
   if (WINDOWS_SECRETS.test(p)) return 'Windows credential / registry hive';
   if (UNIX_SHADOW.test(p)) return 'Unix password-hash / sudoers file';
-  if (scan.CRED_PATH_RE.test(p) || /(?:^|\/)credentials\.json$/i.test(p)) return 'credential file';
+  if (scan.CRED_PATH_RE.test(p) || (/(?:^|\/)credentials\.json$/i.test(p) && !testKey(p))) return 'credential file';
   return null;
 }
 

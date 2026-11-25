@@ -1093,8 +1093,9 @@ function ask(reason, snippet) {
 // dir is caught, not just reading one file inside it.
 const SECRET_TOKENS = '(?:' + [
   // `process.env.NODE_ENV`, `import.meta.env` and `Deno.env` are the runtime's variables, not a .env file.
-  // Only in code shape (`process.env.X)`, `process.env[`): a file named `process.env` is still a .env file.
-  '(?:(?<!\\b(?:process|meta|Deno|Bun))|(?!\\.env(?:\\.\\w+)?\\s*[)\\],;+[]))\\.env\\b(?!\\.(?:example|sample|template|dist|defaults?)\\b)',
+  // Only in code shape (`process.env.X`, `process.env[`, a quoted `'process.env'` pattern): a file named
+  // `process.env` is still a .env file.
+  '(?:(?<!\\b(?:process|meta|Deno|Bun))|(?!\\.env(?:\\?\\.|\\.(?!(?:local|production|prod|development|dev|test|staging|backup|bak|old)\\b)\\w+(?![\\w\\\\/])|\\s*[()\\],;+[\'"|&=!<>?])))\\.env\\b(?!\\.(?:example|sample|template|dist|defaults?)\\b)',
   // A key a test suite ships (`test/fixtures/fake_key.pem`, a relative path with no `..`) is fixture data.
   '(?<!(?:^|[\\s\'"=])(?![~\\\\/]|[A-Za-z]:|[^\\s\'"]*\\.\\.)(?:[^\\s\'"]*[\\\\/])?(?:test|tests|fixtures|__fixtures__|testdata)[\\\\/][^\\s\'"]*)\\.(?:pem|key)\\b',
   '\\.secret\\b', '\\.p12\\b', '\\.pfx\\b',
@@ -1105,7 +1106,7 @@ const SECRET_TOKENS = '(?:' + [
   '[\\\\/]credentials(?![\\w./])', 'credentials\\.(?:json|ya?ml|toml|ini|txt|xml|env|conf|cfg|properties|store)\\b', '\\.git-credentials\\b',
   '\\.ssh\\b', '\\.gnupg\\b', '\\.aws\\b', '\\.gcloud\\b', '\\.azure\\b',
   '\\.docker[\\\\/]config', '\\.gitconfig\\b',
-  '\\.kube[\\\\/]config', '\\.config[\\\\/]gh[\\\\/]hosts', '[\\\\/]proc[\\\\/]\\S*?[\\\\/]environ\\b',
+  '\\.kube[\\\\/]config', '\\.config[\\\\/]gh[\\\\/]hosts', '[\\\\/]proc[\\\\/](?:[^\\s\\\\/]*[\\\\/]){1,3}environ\\b',
   // Unix credential stores: password hashes and the sudoers policy. Anchored to
   // `/etc/` so the bare word "shadow" (box-shadow, shadow DOM, a game asset) never
   // matches; `master.passwd` is the BSD/macOS shadow file. `/etc/passwd` is NOT here
@@ -1153,6 +1154,9 @@ const READ_VERBS =
 
 const READ_VERB_SET = new Set([...READ_VERBS.split('|'), 'sort', 'uniq', 'diff', 'comm', 'expand', 'fmt', 'shuf', 'join', 'tsort']);
 const SECRET_TOKENS_RE = new RegExp(SECRET_TOKENS, 'i');
+const SECRET_TOKENS_G = new RegExp(SECRET_TOKENS, 'gi');
+const INTERP_RE = /\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php)\b/i;
+const INTERP_FLAG_RE = /(?:-[A-Za-z]{0,3}[ceprE][A-Za-z]{0,3}\b|--eval\b|\beval\s)/i;
 
 // ---- cross-segment variable indirection -------------------------------------
 // `X=.env; cat $X` puts the payload in one chain segment and the use in another,
@@ -1819,9 +1823,19 @@ function tokenizedSensitiveRead(seg) {
       if (skipProgramArg) { skipProgramArg = false; continue; }
       if (SECRET_TOKENS_RE.test(toks[i])) return 'Reading sensitive file via shell blocked';
       if (scan.globHitsSecret(toks[i]) === 'secret') return 'Reading sensitive file via a glob blocked';
+      const cv = credReadVerdict(toks[i]);
+      if (cv === 'deny') return 'Credential file blocked: its content holds a secret';
+      if (cv === 'ask') noteGap('credential-name');
     }
   }
   return null;
+}
+// The Read tool's credential heuristic for a shell reader's literal path (`cat ~/.zshrc`, `cat ~/.config/app/token`).
+function credReadVerdict(t) {
+  const home = safeHomedir();
+  const p = t.replace(/^\$\{?HOME\}?(?=[\\/])/, '~');
+  if (!home || !p || /[$`*?[\]{}]/.test(p)) return null;
+  try { return scan.credVerdict(hostPath(p, projectDir), home, projectDir); } catch (_) { return null; }
 }
 
 // A secret-shaped environment variable: an upper-case name with a credential word as a `_` part (`GH_TOKEN_2`,
@@ -1829,15 +1843,35 @@ function tokenizedSensitiveRead(seg) {
 // Not a name for a key's type, file, path, id or size (`TOKEN_TYPE`, `KEY_FILE`, `MAX_TOKENS`, `NEXT_PAGE_TOKEN`),
 // `AWS_REGION`, `PWD`, or a lower-case shell variable (`$key`, `$token`).
 const SECRET_PART = /(?:^|_)(?:TOKENS?|SECRETS?|PASSWORD|PASSWD|PASS|API_?KEY|PRIVATE_KEY|CREDENTIALS?|PAT|KEY_BASE)(?:_|$)|_PWD(?:_|$)|_(?:KEY|AUTH)$|PASSW(?:OR)?D$/;
-const BENIGN_VAR = /_(?:TYPE|FILE|PATH|DIR|URL|NAME|ID|LENGTH|LIMIT)$|(?:^|_)(?:PAGE_TOKEN|MAX_TOKENS|TOKEN_COUNT)(?:_|$)/;
+const BENIGN_VAR = /_(?:TYPE|FILE|PATH|DIR|URL|NAME|ID|LENGTH|LIMIT)$|(?:^|_)(?:TOTAL|INPUT|OUTPUT|USED|PROMPT|COMPLETION|CONTEXT)_TOKENS$|(?:^|_)(?:PAGE_TOKEN|MAX_TOKENS|TOKEN_COUNT)(?:_|$)|(?:^|_)(?:CACHE|SORT|PRIMARY|PARTITION|FOREIGN|MAP|HASH|ROUTING|IDEMPOTENCY|LOOKUP|GROUP|SHARD|DEDUP)_KEY$/;
 // Run-together names (`GITHUBTOKEN`, `JWTSECRET`, `PRIVATEKEY`) count too; a name holding SECRET is never benign.
 const SECRET_WORD = /SECRET|TOKEN(?!IZ)|PASSW(?:OR)?D|APIKEY|CREDENTIAL|PRIVATE_?KEY/;
 const secretVarName = (n) => /^[A-Z][A-Z0-9_]*$/.test(n) && (n === 'AWS_ACCESS_KEY_ID' ||
   ((SECRET_PART.test(n) || SECRET_WORD.test(n)) && (!BENIGN_VAR.test(n) || /SECRET/.test(n))));
 // `$X`, `${X}`, `${X:-..}`, PowerShell `$env:X` / `${env:X}` (any case: Windows names are), and a bare
 // `env:X` (`Get-Item env:X`). Not `${#X}` or `${X:+..}`, which print a length or a fixed word.
-const VAR_REF = /\$(\{)?(env:)?([A-Za-z_]\w*)(?!(?<=\{\w+):\+)|(?<![\w$])env:\\?([A-Za-z_]\w*)/gi;
-const secretVarRef = (t) => [...t.matchAll(VAR_REF)].find((m) => secretVarName(m[4] || m[2] ? (m[4] || m[3]).toUpperCase() : m[3]));
+// A PowerShell `$x` is a script variable, not the environment; a bare `env:X` is PowerShell syntax only.
+const VAR_REF = /\$(\{)?(env:)?([A-Za-z_]\w*)(?!\w)(?!(?<=\{\w+):\+)|(?<![\w$])env:\\?([A-Za-z_]\w*)(?!\w)/gi;
+const secretVarRef = (t, bound) => [...t.matchAll(VAR_REF)].find((m) => {
+  const posh = m[4] || m[2];
+  if (isPoshTool ? !posh : m[4]) return false;
+  const n = posh ? (m[4] || m[3]).toUpperCase() : m[3];
+  return secretVarName(n) && !(bound && bound.has(n));
+});
+// Names the command itself sets to a literal before any use (`PASS=0; ...; echo "$PASS"`, `for TOKEN in a b`):
+// they hold no inherited secret.
+let boundVars = new Set();
+function literalBound(t) {
+  const at = new Map();
+  for (const m of t.matchAll(/(?:^|[;&|(\s])([A-Za-z_]\w*)=(\$\(\([\w\s+*\/%-]*\)\)|'[^']*'|"[^"$`]*"|[^\s;&|()$`'"]*)(?=[\s;&|)]|$)/g)) {
+    const ids = (m[2].match(/^\$\(\(([\s\S]*)\)\)$/) || ['', ''])[1].match(/[A-Za-z_]\w*/g) || [];
+    if (secretVarName(m[1]) && ids.every((n) => n === m[1] || !secretVarName(n)) && !at.has(m[1])) at.set(m[1], m.index);
+  }
+  for (const m of t.matchAll(/\bfor\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)/g)) if (secretVarName(m[1]) && !/[$`]/.test(m[2]) && !at.has(m[1])) at.set(m[1], m.index);
+  const s = new Set();
+  for (const [n, i] of at) { const u = t.search(new RegExp('\\$\\{?' + n + '(?!\\w)')); if (u < 0 || u > i) s.add(n); }
+  return s;
+}
 // Text the shell expands: single-quoted spans outside double quotes, an escaped `\$` (PowerShell: backtick)
 // and quoted-delimiter heredoc bodies are dropped. The script of `sh -c '..'` / `eval '..'` is kept.
 function unexpanded(t) {
@@ -1846,7 +1880,11 @@ function unexpanded(t) {
   let out = '', dq = false;
   for (let i = 0; i < t.length; i++) {
     const c = t[i];
-    if (c === esc) { i++; out += ' '; continue; }
+    if (c === esc) {   // an escaped `\$X` / `` `$env:X `` is literal text: drop the whole reference
+      i++;
+      if (t[i] === '$') { const r = /^\{?(?:env:)?\w*\}?/i.exec(t.slice(i + 1, i + 128)); i += r[0].length; }
+      out += ' '; continue;
+    }
     if (c === '"') dq = !dq;
     else if (c === "'" && !dq) {
       const e = t.indexOf("'", i + 1), end = e < 0 ? t.length : e;
@@ -1861,15 +1899,19 @@ function unexpanded(t) {
 // compare it, never print it), or a read of the whole environment.
 function secretInText(raw) {
   // Only a quoted `-n` / `-z` operand of a test at command position: `[ $TOKEN -eq 1 ]` prints the value in
-  // its error, `echo do test $TOKEN` is an echo.
-  const t = unexpanded(raw).replace(/(?:^|[;&|(\n])[ \t]*(?:(?:if|then|elif|while|until|do|else|!|\{)[ \t]+)*(?:\[\[?|test)\s[^;&|\n]*/g,
-    (m) => /\$\(|`|>/.test(m) ? m : m.replace(/(^|\s)-[nz]\s+"\$\{?\w+\}?"/g, '$1'));
-  return !!secretVarRef(t);
+  // its error, `echo do test $TOKEN` is an echo, a `;[` inside quotes is an argument, and xtrace prints it.
+  const u = unexpanded(raw);
+  if (/\bset\s+(?:-\w*x|-o\s+xtrace)|\b(?:ba|z|k|da)?sh\s+-\w*x/.test(raw)) return !!secretVarRef(u, boundVars);
+  const dq = new Uint8Array(u.length);
+  for (let i = 0, q = 0; i < u.length; i++) { dq[i] = q; if (u[i] === '"') q ^= 1; }
+  const t = u.replace(/(?:^|[;&|(\n])[ \t]*(?:(?:if|then|elif|while|until|do|else|!|\{)[ \t]+)*(?:\[\[?|test)\s[^;&|\n]*/g,
+    (m, off) => dq[off] || /\$\(|`|>/.test(m) ? m : m.replace(/(^|\s)-[nz]\s+"\$\{?\w+\}?"/g, '$1'));
+  return !!secretVarRef(t, boundVars);
 }
 const ENV_DUMP = /\bENVIRON\b|\$ENV\b|\benv\s*\(|\b[jy]q\b[^|;&]*(?<![.\w$-])(?<!--(?:arg|argjson|slurpfile|rawfile)\s+(?:\S+\s+)?)env\b/;
 // `Get-ChildItem Env:`, `gci env:G*`, `[Environment]::GetEnvironmentVariable(..)`, or a lister given a
 // computed path (`Get-ChildItem ('en'+'v:')`).
-const POSH_ENV_DUMP = /(?<![\w$])env:(?!\\?[A-Za-z_]\w*(?![\w*?[\]]))|GetEnvironmentVariable|\b(?:Get-ChildItem|gci|ls|dir|Get-Item|gi|Get-ItemProperty|gp)\s+(?:-\w+\s+)*(?:\(|\$(?!env:[A-Za-z_]\w*(?![\w*?[\]:])|_(?!\w)|PSItem\b|(?:HOME|PWD|PSScriptRoot)(?![\w:])))/i;
+const POSH_ENV_DUMP = /(?<![\w$])env:(?!\\?[A-Za-z_]\w*(?![\w*?[\]]))|GetEnvironmentVariable|(?<![\w-])(?:Get-ChildItem|gci|ls|dir|Get-Item|gi|Get-ItemProperty|gp)\s+(?:-\w+\s+)*(?:\(|\$(?!env:[A-Za-z_]\w*(?![\w*?[\]:])|_(?!\w)|PSItem\b|(?:HOME|PWD|PSScriptRoot)(?![\w:])))/i;
 const NET_PROG = /^(?:curl|wget|nc|ncat|netcat|socat|telnet|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)$/i;
 const WRAPPERS = /^(?:sudo|doas|env|timeout|nohup|command|builtin|exec|time|nice|xargs|stdbuf|strace|watch|&)$/;
 // Header and credential values: how a token is meant to be sent (`-H "x-api-key: $KEY"`, `-su me:$TOKEN`,
@@ -1935,9 +1977,17 @@ function dumpStage(st) {
   while (at < toks.length && (/^[A-Za-z_]\w*=/.test(toks[at]) || STAGE_PREFIX.test(toks[at]))) at++;
   return { cmd: base(toks[at] || '').replace(/^\\/, ''), args: toks.slice(at + 1), text: st };
 }
-// Every later stage only passes text on; the last one is not redirected into a file.
+// A stage that keeps only names, a count or an exit status (`grep -q`, `grep -c`, `cut -d= -f1`, `select Name`).
+const namesOnly = (w) => (/^(?:grep|egrep|fgrep|rg)$/.test(w.cmd) && w.args.some((a) => /^-[A-Za-z]*[qcl]|^--(?:quiet|silent|count|files-with-matches)$/.test(a))) ||
+  (w.cmd === 'cut' && /\s-f\s*1(?!\S)/.test(w.text) && /\s-d\s*['"]?=/.test(w.text)) ||
+  /^\s*(?:Select-Object|select)\s+(?:-(?:ExpandProperty|Property)\s+)?['"]?Name['"]?\s*$/i.test(w.text);
+// Every later stage only passes text on; the last one is not redirected into a file. A `tee` to a process
+// substitution or the terminal (`tee >(cat >&2) | wc -c`) prints whatever follows it.
 function reachesTranscript(stages, k, toFileOk) {
-  for (let j = k + 1; j < stages.length; j++) if (!PASS_THROUGH.has(stages[j].cmd)) return false;
+  for (let j = k + 1; j < stages.length; j++) {
+    if (stages[j].cmd === 'tee' && /[>]\(|\/dev\/(?:std|tty|fd\/)/.test(stages[j].text)) return true;
+    if (!PASS_THROUGH.has(stages[j].cmd) || namesOnly(stages[j])) return false;
+  }
   return toFileOk || !/(?:^|[^<>&\d])\d?>>?\s*(?!&|\/dev\/(?:stdout|stderr|tty|fd\/))\S/.test(stages[stages.length - 1].text.replace(/'[^']*'|"[^"]*"/g, ''));
 }
 function envDumpStage(w) {
@@ -1984,8 +2034,8 @@ function secretVarPrinted(seg) {
   const stages = splitPipeStages(stripUnquotedComment(seg)).map(dumpStage);
   for (let k = 0; k < stages.length; k++) {
     const w = stages[k];
-    const src = (PRINTERS.test(w.cmd) && secretVarRef(unexpanded(w.text.replace(/^\s*\S+/, '')))) ||
-      (/<<<\s*/.test(w.text) && secretVarRef(unexpanded(w.text.slice(w.text.indexOf('<<<') + 3))));
+    const src = (PRINTERS.test(w.cmd) && secretVarRef(unexpanded(w.text.replace(/^\s*\S+/, '')), boundVars)) ||
+      (/<<<\s*/.test(w.text) && secretVarRef(unexpanded(w.text.slice(w.text.indexOf('<<<') + 3)), boundVars));
     if (src && reachesTranscript(stages, k, false)) {
       return 'Printing a secret environment variable blocked -- it would land in the transcript. Check it with [ -n "$X" ] or ${X:+set}.';
     }
@@ -1993,19 +2043,25 @@ function secretVarPrinted(seg) {
   return null;
 }
 // `node -e 'console.log(process.env)'`, `python -c 'print(os.environ)'`, or a print of one secret-named entry.
+// `$1` the interpreter, then its eval flag later in the same command (one linear pass per piece).
+const interpWithFlag = (s, prog, flag) => s.split(/[|;&]/).some((p) => { const i = p.search(prog); return i >= 0 && flag.test(p.slice(i)); });
+// A presence test prints true/false, not the value: `!!process.env.X`, `bool(os.getenv('X'))`, `X ? 'set' : ''`.
+const presenceOnly = (pre, post) => /(?:!|\bBoolean\s*\(|\bbool\s*\(|\blen\s*\()\s*$/.test(pre) ||
+  /^\s*(?:\?|[!=]==?|\.length\b|is\s+(?:not\s+)?None\b|\bin\b)/.test(post);
 function interpEnvDump(seg) {
   const s = stripUnquotedComment(seg);
-  if (/\b(?:node|deno|bun)\b[^|;&]*\s-(?:e|p|-eval|-print)\b/.test(s)) {
+  const SECRET = 'Printing a secret environment variable from an inline script blocked.';
+  if (interpWithFlag(s, /\b(?:node|deno|bun)\b/, /\s-(?:e|p|-eval|-print)\b/)) {
     if (/\s-(?:p|-print)\s+['"]?process\.env['"]?(?:\s|$)/.test(s) ||
         /(?:console\.\w+|JSON\.stringify|process\.std(?:out|err)\.write|util\.inspect|Object\.(?:entries|values))\s*\(\s*process\.env\s*[),]/.test(s)) return 'Printing the environment from an inline script blocked.';
-    for (const m of s.matchAll(/console\.\w+\s*\([^)]*process\.env(?:\.([A-Za-z_]\w*)|\[\s*['"]([A-Za-z_]\w*)['"]\s*\])/g)) {
-      if (secretVarName(m[1] || m[2])) return 'Printing a secret environment variable from an inline script blocked.';
+    for (const m of s.matchAll(/(?:console\.\w+|process\.std(?:out|err)\.write)\s*\(([^)]{0,200}?)process\.env(?:\.([A-Za-z_]\w*)|\[\s*['"]([A-Za-z_]\w*)['"]\s*\])(.{0,16})/g)) {
+      if (secretVarName(m[2] || m[3]) && !presenceOnly(m[1], m[4])) return SECRET;
     }
   }
-  if (/\bpython[\d.]*\b[^|;&]*\s-c\b/.test(s)) {
+  if (interpWithFlag(s, /\bpython[\d.]*\b/, /\s-c\b/)) {
     if (/print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)/.test(s)) return 'Printing the environment from an inline script blocked.';
-    for (const m of s.matchAll(/print\s*\([^)]*?(?:os\.environ\s*\[\s*['"]([A-Za-z_]\w*)['"]\s*\]|os\.(?:environ\.get|getenv)\s*\(\s*['"]([A-Za-z_]\w*)['"])/g)) {
-      if (secretVarName(m[1] || m[2])) return 'Printing a secret environment variable from an inline script blocked.';
+    for (const m of s.matchAll(/(?:print|sys\.std(?:out|err)\.write)\s*\(([^)]{0,200}?)(?:os\.environ\s*\[\s*['"]([A-Za-z_]\w*)['"]\s*\]|os\.(?:environ\.get|getenv)\s*\(\s*['"]([A-Za-z_]\w*)['"][^)]{0,40}\))(.{0,16})/g)) {
+      if (secretVarName(m[2] || m[3]) && !presenceOnly(m[1], m[4])) return SECRET;
     }
   }
   return null;
@@ -2393,17 +2449,26 @@ const POSH_DENY_PATTERNS = [
   [new RegExp('\\[(?:System\\.)?IO\\.File\\]::(?:Copy|Move|Replace)\\s*\\([^)]*' + SECRET_TOKENS, 'i'),
     'Copying a sensitive file via .NET blocked -- possible exfiltration'],
   // An inline interpreter writing the trust store (`node -e "fs.writeFileSync(process.env.HOME+'/.claude/shellter-trust.json')"`).
-  [new RegExp('\\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php)\\b[^|]*(?:-[A-Za-z]{0,3}[ceprE][A-Za-z]{0,3}\\b|--eval\\b|\\beval\\s)[^|]*' +
-    '(?:write|append|copy|rename|move|unlink|symlink|open)[^|]*\\.claude[\\\\/]+shellter-trust\\.json', 'i'),
-    'Writing the shellter trust store blocked -- trust a script with `node shellter-trust.js add <path>`'],
+  // Separate linear tests per pipe stage: three chained `[^|]*` spans were cubic on a long commit message.
+  [(s) => /\.claude[\\/]+shellter-trust\.json/i.test(s) && s.split('|').some((p) => /\.claude[\\/]+shellter-trust\.json/i.test(p) &&
+    interpWithFlag(p, /\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php)\b/i, /(?:-[A-Za-z]{0,3}[ceprE][A-Za-z]{0,3}\b|--eval\b|\beval\s)/) &&
+    /write|append|copy|rename|move|unlink|symlink|open/i.test(p)) && 'Writing the shellter trust store blocked -- trust a script with `node shellter-trust.js add <path>`', null],
   // Inline interpreter referencing a sensitive file (python -c / node -e / php -r /
   // deno eval / perl -ne ...). Flag set covers each interpreter's eval form. Spans
   // use `[^|]*` (not `[^;|]*`) because the `;` lives inside the quoted code string
   // (`python -c "x=1;open('.env')"`) -- segments are already split on unquoted `;`,
   // so allowing `;` here can't span two shell commands but DOES stop the trivial
   // "put a statement before the read" bypass.
-  [new RegExp('\\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php)\\b[^|]*(?:-[A-Za-z]{0,3}[ceprE][A-Za-z]{0,3}\\b|--eval\\b|\\beval\\s)[^|]*' + SECRET_TOKENS, 'i'),
-    'Inline interpreter referencing a sensitive file blocked -- possible exfiltration'],
+  // One pass per pipe stage (the chained `[^|]*` spans were quadratic on `node node ...`): the first
+  // interpreter, its first eval flag, then a secret anywhere after it, the lookbehinds seeing the whole stage.
+  [(s) => s.split('|').some((p) => {
+    const i = p.search(INTERP_RE);
+    if (i < 0) return false;
+    const f = INTERP_FLAG_RE.exec(p.slice(i));
+    if (!f) return false;
+    SECRET_TOKENS_G.lastIndex = i + f.index + f[0].length;
+    return SECRET_TOKENS_G.test(p);
+  }), 'Inline interpreter referencing a sensitive file blocked -- possible exfiltration'],
   // Encoded command execution.
   [/\b(powershell|pwsh)(\.exe)?\b[^;|]*-(?:e|ec|enc|encodedcommand)\b/i,
     'powershell -EncodedCommand blocked'],
@@ -2465,8 +2530,9 @@ const APPROVE_PATTERNS = [
   // so their executed sub-command is inspected (else `find -exec node x` launders in).
   /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|sort|uniq|tr|cut|paste|tee|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq|fd|bat|delta|hexdump|xxd|md5sum|sha1sum|sha256sum|sha512sum|cksum|crc32)\b/,
   // Read-only system inspection
-  // ps: a BSD `e` cluster (first argument) or `-E` prints each process's environment.
-  /^\s*(ss|ps(?![^|;&]*\s['"]?[auxwjlmrsvcfhSTe]*e[auxwjlmrsvcfhSTe]*['"]?(?=\s|$))(?![^|;&]*\s-[A-Za-z]*E[A-Za-z]*(?=\s|$))|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
+  // ps: a BSD cluster holding `e` (`axen`, `ewwo`; not a flag's value like `-C node`) or `-E` prints each
+  // process's environment.
+  /^\s*(ss|ps(?![^|;&]*(?<!\s-[A-Za-z]+)\s['"]?[A-Za-z]*e[A-Za-z]*['"]?(?=\s|$))(?![^|;&]*\s-[A-Za-z]*E[A-Za-z]*(?=\s|$))|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
   // HTTP requests (deny rules cover dangerous flags)
   /^\s*(curl|wget)\b/,
   // Version checks
@@ -2705,7 +2771,7 @@ function poshDeObfuscate(s) {
     if (next === out) break;
     out = next;
   }
-  return out.replace(/`(?=\S)/g, '').replace(/(?<=[\w.])(['"])([\w.]*)\1/g, (m, q, w) => w);
+  return out.replace(/`(?=[^\s$])/g, '').replace(/(?<=[\w.])(['"])([\w.]*)\1/g, (m, q, w) => w);
 }
 
 // A PowerShell content read whose path is a glob that expands to a secret (`gc .e?v`).
@@ -2816,14 +2882,16 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
     }
   }
 
+  // A nested script's output is its own: `true | xargs sh -c 'env'` prints the environment.
+  const nestedDeny = (...args) => { const p = inPipeStage; inPipeStage = false; try { checkSegmentDeny(...args); } finally { inPipeStage = p; } };
   const poshC = parsePoshInvocation(seg);
   if (poshC && poshC.innerCmd) {
-    for (const inner of splitPoshSegments(poshC.innerCmd)) checkSegmentDeny(inner, depth + 1, mode);
+    for (const inner of splitPoshSegments(poshC.innerCmd)) nestedDeny(inner, depth + 1, mode);
   }
 
   const cmdC = parseCmdInvocation(seg);
   if (cmdC && cmdC.innerCmd) {
-    for (const inner of splitChainSegments(cmdC.innerCmd)) checkSegmentDeny(inner, depth + 1, mode);
+    for (const inner of splitChainSegments(cmdC.innerCmd)) nestedDeny(inner, depth + 1, mode);
   }
 
   const shellC = parseShellCInvocation(seg);
@@ -2831,28 +2899,28 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
     if (mode === 'hard' && shellC.opaque) {
       deny('Opaque shell -c argument blocked -- contains $(...), backticks, or $VAR', seg);
     }
-    for (const inner of splitChainSegments(shellC.innerCmd)) checkSegmentDeny(inner, depth + 1, mode);
+    for (const inner of splitChainSegments(shellC.innerCmd)) nestedDeny(inner, depth + 1, mode);
   }
 
   const evalC = parseEvalInvocation(seg);
   if (evalC) {
-    for (const inner of splitChainSegments(evalC.inner)) checkSegmentDeny(inner, depth + 1, mode);
+    for (const inner of splitChainSegments(evalC.inner)) nestedDeny(inner, depth + 1, mode);
   }
 
   const findCmds = parseFindExec(seg);
   if (findCmds) {
     for (const cmd of findCmds) {
-      for (const inner of splitChainSegments(cmd)) checkSegmentDeny(inner, depth + 1, mode);
+      for (const inner of splitChainSegments(cmd)) nestedDeny(inner, depth + 1, mode);
     }
   }
 
   const xargsCmd = parseXargs(seg);
   if (xargsCmd) {
-    for (const inner of splitChainSegments(xargsCmd)) checkSegmentDeny(inner, depth + 1, mode);
+    for (const inner of splitChainSegments(xargsCmd)) nestedDeny(inner, depth + 1, mode);
   }
 
   for (const inner of extractProcessSubstitutions(seg)) {
-    for (const innerSeg of splitChainSegments(inner)) checkSegmentDeny(innerSeg, depth + 1, mode);
+    for (const innerSeg of splitChainSegments(inner)) nestedDeny(innerSeg, depth + 1, mode);
   }
 
   // Every pipe stage is a command of its own (`ls | xargs sh -c '...'`).
@@ -3377,6 +3445,7 @@ function checkPoshApprove(seg, depth, idx) {
     if (/\.\s*[A-Za-z_]\w*\s*\(\)/.test(body)) return false;   // `(cmd).M()`, `$v.M()`: unknown method
     const ws = st.trim().split(/\s+/).filter((t) => t !== '&').map((t) => ({ text: t.replace(/^['"]+|['"]+$/g, ''), lit: true }));
     if (ws.length && runnerDefHigh(ws, projectDir)) return false;   // npm test / make / pytest run the on-disk scripts
+    if (/^(?:npm|pnpm|yarn|bun|npx|bunx)$/i.test(name) && ws.slice(1).some((w) => /^(?:env|printenv)$/i.test(w.text))) return false;   // `npm run env`
     if (!POSH_APPROVE_PATTERNS.some((p) => p.test(st))) return false;
   }
   return true;
@@ -4523,8 +4592,8 @@ function approveArgv(words, vals, depth, approvedScripts) {
     if (/^[A-Za-z_]\w*=/.test(toks[at])) return false;      // `time X=v cmd`: not modelled
     return approveArgv(sub0(words, at), vals, depth + 1, approvedScripts);
   }
-  // `npm run env` prints the whole environment npm builds for scripts.
-  if (/^(?:npm|pnpm|yarn)$/.test(w0) && toks.some((t, k) => k > 0 && /^(?:run|run-script)$/.test(toks[k - 1]) && t === 'env')) return false;
+  // `npm run env`, `npm run -s env`, `pnpm exec env`, `bun run env` print the whole environment.
+  if (/^(?:npm|pnpm|yarn|bun|npx|bunx)$/.test(w0) && toks.slice(1).some((t) => /^(?:env|printenv)$/.test(t))) return false;
   // `env NODE_ENV=test npm test`, `env -u FOO cmd`: the same test a plain `NODE_ENV=test npm test` gets.
   if (w0 === 'env') {
     const envs = [];
@@ -5377,6 +5446,7 @@ if (MAIN) watchdog.input((data) => {
 
   const isPosh = input?.tool_name === 'PowerShell';
   isPoshTool = isPosh;
+  if (!isPosh) boundVars = literalBound(rawCmd);
   const cwd = input?.cwd || process.cwd();
   try { projectDir = path.resolve(cwd); } catch { /* keep process.cwd() */ }
 
@@ -5433,14 +5503,22 @@ if (MAIN) watchdog.input((data) => {
   // project's own file: after a directory change or a link in the command, or when it resolves outside the
   // project (a symlink), it denies. It is never auto-approved. Only a stage that can read it counts: a lister
   // or a git path argument (`ls fixtures/*.pem`, `git add tests/ca.pem`) does not.
-  const KEY_LISTER = /^\s*(?:ls|dir|Get-ChildItem|gci|stat|test|\[|realpath|readlink|basename|dirname|git\s+(?:add|rm|mv|status|ls-files|check-ignore))(?=\s|$)/i;
+  const KEY_LISTER = /^\s*(?:ls|dir|Get-ChildItem|gci|stat|test|\[|realpath|readlink|basename|dirname|echo|printf|Write-Output|Write-Host|git\s+(?:add|rm|mv|status|ls-files|check-ignore))(?=\s|$)/i;
   const keyStages = segments.flatMap((s) => splitPipeStages(s)).filter((s) => !KEY_LISTER.test(s) || /[$`<>]/.test(s)).join('\n');
   const fixtureKeys = [...new Set(keyStages.match(/(?<![^\s'"|;&<>()`])[^\s'"|;&<>()`]*\.(?:pem|key)\b/gi) || [])].filter((t) => !SECRET_TOKENS_RE.test(t));
   if (fixtureKeys.length) {
     let realCwd = cwd;
     try { realCwd = fs.realpathSync(cwd); } catch (_) { /* keep cwd */ }
-    const realIn = (p) => { try { return inside(realCwd, fs.realpathSync(path.resolve(cwd, p))); } catch (_) { return true; } };
-    if (/(?:^|[\s;&|({`])(?:cd|pushd|popd|ln|Set-Location|sl|chdir|Push-Location|New-Item|ni|mklink|subst|mount|bindfs)(?=\s|$)/i.test(rawCmd) || !fixtureKeys.every(realIn)) {
+    const realIn = (from, p) => { try { return inside(realCwd, fs.realpathSync(path.resolve(from, p))); } catch (_) { return inside(path.resolve(cwd), path.resolve(from, p)); } };
+    // A `cd` into a literal project subdirectory (`cd backend && openssl x509 -in tests/fixtures/cert.pem`) keeps
+    // the key in the project; a link, popd, a computed or outside target does not.
+    let dir = cwd, cdOk = !/(?:^|[\s;&|({`])(?:popd|ln|New-Item|ni|mklink|subst|mount|bindfs)(?=\s|$)/i.test(rawCmd);
+    for (const m of rawCmd.matchAll(/(?:^|[\s;&|({`])(?:cd|pushd|Set-Location|sl|chdir|Push-Location)(?=\s|$|[;&|)])(?:\s+(?:-LiteralPath\s+|-Path\s+)?(['"]?)([^\s'";&|()`]*)\1)?/gi)) {
+      const t = m[2] || '';
+      if (!t || /[$~*?%]|^-|^[\\/]|^[A-Za-z]:|(?:^|[\\/])\.\.(?:[\\/]|$)/.test(t) || !realIn(dir, t)) { cdOk = false; break; }
+      dir = path.resolve(dir, t);
+    }
+    if (!cdOk || !fixtureKeys.every((k) => realIn(cwd, k) && realIn(dir, k))) {
       deny('Reading sensitive file via shell blocked', fixtureKeys[0]);
     }
   }

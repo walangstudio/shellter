@@ -53,18 +53,25 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
   secret name), `export`/`export -p`, bare `set`, `declare -x`/`-p`, `typeset -x`, behind `sudo`,
   `command`, `bash -c`, `eval` or `$(..)`, and piped only through readers (`env | grep -i token`,
   `env > /tmp/e`); `echo`/`printf`/`<<<` of a secret-named variable reaching the screen;
-  `node -e 'console.log(process.env)'`, `python3 -c 'print(os.environ)'` and their one-secret forms;
-  PowerShell `Get-ChildItem Env:`, `echo $env:GITHUB_TOKEN`. A count (`env | wc -l`), a pipe into a
+  `node -e 'console.log(process.env)'`, `python3 -c 'print(os.environ)'` and their one-secret forms
+  (`process.stdout.write`, `sys.stdout.write` too);
+  PowerShell `Get-ChildItem Env:`, `echo $env:GITHUB_TOKEN`. A count, names or a quiet test (`env | wc -l`, `env | cut -d= -f1`, `env | grep -q CI`,
+  `gci env: | select Name`), a presence test (`!!process.env.X`, `bool(os.getenv(..))`), a variable the
+  command sets itself (`PASS=0; echo $PASS`, `for TOKEN in a b`), a PowerShell script variable, a pipe into a
   consumer (`echo "$T" | docker login --password-stdin`), a write to a file, `set -euo pipefail`,
   `declare -A` and `compgen -v` do not deny. Other dumps prompt: `ps e`, awk `ENVIRON`, jq `env`/`$ENV`,
   yq `env()`, `env:G*`, a computed path, `GetEnvironmentVariable`, `npm run env`. `printenv PATH`,
-  `ps -C node`, a test operand (`[ -n "$KEY" ]`), `${KEY:+set}` and an escaped `\$TOKEN` still approve.
+  `ps -C node`, a test operand (`[ -n "$KEY" ]`; not under `set -x` or inside a quoted argument),
+  `${KEY:+set}` and an escaped `\$TOKEN` still approve. A `tee` to the terminal or a process substitution
+  prints what it is given. `ps axen`/`ps ewwo`, `npm run -s env`, `pnpm exec env`, `bun run env` and
+  PowerShell `npm run env` prompt.
   `npm config get` of an auth or token key prompts. `env NODE_ENV=test npm test` approves as
   `NODE_ENV=test npm test` does.
 - **Credential stores deny from the shell as from Read**: `~/.claude.json` (was a prompt),
   `~/.codex/auth.json`, `~/.bitbucket-rest-cli-config.json`, `~/.atlassian-rest-cli-config.json`,
   `~/.config/figma/token`, `~/.mobiledev/authtoken`, `~/.emulator_console_auth_token`,
-  `~/.conda/aau_token`, `client_secret*.json`, `credentials.json`, a `.dailyclones-runner` dir, browser
+  `~/.conda/aau_token`, Google `client_secret[_<id>.apps.googleusercontent.com].json`, `credentials.json`
+  (not under a test fixtures dir), a `.dailyclones-runner` dir, browser
   profile `Cookies`/`Login Data`/`Web Data`/`Trust Tokens`, and `/proc/*/environ` at any depth
   (`/proc/self/task/1/environ`). `cat`, `jq`, `python3 -c open(..)` all deny. `process.env.X`,
   `import.meta.env` are not a `.env` file. Mentioning a path (`echo`, `ls`, a commit message) never
@@ -73,10 +80,12 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
   `auth.json`, `*credential*`, `*.enc`) and denies when its first 64 KB hold a token shape (GitHub,
   AWS, Slack, JWT, Atlassian, a private key). An rc file (`.zshenv`, `.bashrc`, ..) denies only when it
   exports a secret-named variable. Project files, package caches (`node_modules`, `site-packages`),
-  source files and tokenizer files never count.
+  source files and tokenizer files never count. Shell readers (`cat ~/.zshrc`) get the same verdict; an
+  empty or `$OTHER` value or a `*_TOKEN_FILE` path is not a secret.
 - **A `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`, `__fixtures__/` or `testdata/` dir**
-  is not denied but prompts when a stage reads it (a listing or `git add` keeps its result); after a `cd`
-  or `ln` in the command, or through a symlink out of the project, a read denies.
+  is not denied but prompts when a stage reads it (a listing, `echo` or `git add` keeps its result); after a
+  `cd` out of the project (or to a computed target, `popd`) or `ln` in the command, or through a symlink out
+  of the project, a read denies. A `cd` into a project subdirectory does not.
 - **`~/.bash_aliases`, `~/.bash_login`, `~/.bash_logout` are rc files** (writes ask).
 - **PowerShell parity with bash**: `Remove-Item`, `Set-Content`, `Add-Content`, `Out-File`, `New-Item`,
   `Copy-Item`, `Expand-Archive`, `[IO.File]::Write*`/`Move`/`Delete`, `[IO.Directory]`, `>` and `*>>` onto shellter's files, hooks dir or
@@ -85,11 +94,12 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
   A `Copy-Item` into `~/.claude` is judged by the file it writes, as bash `cp` is.
   Injection text into CLAUDE.md denies for every write shape (`New-Item -Value`, `Tee-Object`,
   `[IO.File]::AppendAllText`, a `>` inside the value).
-- **Write/Edit of a `.git/hooks` file with download-exec content denies** (bash already did).
+- **Write/Edit of a `.git/hooks` file with download-exec content denies** (bash already did). A
+  `package.json` is scanned in every string value, so a `husky.hooks` command counts as `scripts` do.
 - **False denies removed**: Glob lists names and reads nothing, so it never denies; `cat ~/.gitconfig`
   names the right reason.
 
-3255 tests in test-hooks.js (2657 at 0.11.0).
+3318 tests in test-hooks.js (2657 at 0.11.0).
 
 ## [0.11.0] - 2026-11-18
 

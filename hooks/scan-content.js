@@ -799,8 +799,10 @@ function installerLine(line) {
 function cmdDefHigh(target, body) {
   let text = body;
   if (/(?:^|[\\/])package\.json$/i.test(target)) {
-    // Parsed: only the decoded scripts run. Unparseable: scanned as written.
-    try { const j = JSON.parse(body); text = Object.values((j && j.scripts) || {}).map(String).join('\n'); } catch (_) { /* scanned as written */ }
+    // Parsed: every decoded string value (`scripts`, and hook configs like `husky.hooks` run too).
+    // Unparseable: scanned as written.
+    const leaves = (v) => (typeof v === 'string' ? [v] : v && typeof v === 'object' ? Object.values(v).flatMap(leaves) : []);
+    try { text = leaves(JSON.parse(body)).join('\n'); } catch (_) { /* scanned as written */ }
   }
   const phys = text.split('\n');
   return scanShell(text).some((f) => {
@@ -823,7 +825,7 @@ const CRED_PATH_SRC = [
   '\\.mobiledev' + SEP + 'authtoken' + END,
   '\\.emulator_console_auth_token' + END,
   '\\.conda' + SEP + 'aau_token' + END,
-  '(?<![\\w-])client_secret[\\w.-]*\\.json' + END,
+  '(?<![\\w-])client_secret(?:_[\\w-]+\\.apps\\.googleusercontent\\.com)?\\.json' + END,   // Google OAuth download
   SEP + '\\.dailyclones-runner(?:' + SEP + '|' + END + ')',
   SEP + 'Trust Tokens(?:-journal)?' + END,
   SEP + '(?:Default|Profile \\d+|Guest Profile)' + SEP + '(?:Network' + SEP + ')?(?:Cookies|Login Data|Web Data)(?:-journal)?' + END,
@@ -841,7 +843,10 @@ const SECRET_SHAPES = [
   /\bxox[bpars]-[A-Za-z0-9-]{20,}/, /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /\bATATT3[A-Za-z0-9_=-]{20,}/,
 ];
-const RC_SECRET = /^\s*(?:export\s+)?[A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*\s*=\s*\S/m;
+// An rc line setting a credential name (not `X_TOKEN_FILE`) to a literal: not empty, not `$OTHER`.
+// `[ \t]`, not `\s`, after `^`: under /m a `\s*` re-scans every following newline (quadratic).
+const RC_ASSIGN = /^[ \t]*(?:export[ \t]+)?([A-Z_][A-Z0-9_]*)[ \t]*=[ \t]*(?!["']?\$|""|''|\s|$)/gm;
+const rcSecret = (t) => [...t.matchAll(RC_ASSIGN)].some((m) => /TOKEN|SECRET|PASSW(?:OR)?D|API_?KEY|PRIVATE_KEY|CREDENTIAL/.test(m[1]) && !/_(?:FILE|PATH|DIR|URL|TYPE|NAME|ID)$/.test(m[1]));
 const RC_NAME = /^\.(?:bashrc|zshrc|profile|bash_profile|bash_aliases|bash_login|zprofile|zshenv|zlogin|kshrc|cshrc)$/i;
 const inside = (child, parent) => { const r = require('path').relative(parent, child); return !!parent && !r.startsWith('..') && !require('path').isAbsolute(r); };
 function credHeuristic(abs, home, projectRoot) {
@@ -860,7 +865,7 @@ function sniffSecret(abs, rc) {
     const buf = Buffer.alloc(Math.min(st.size, 65536));
     fd = fs.openSync(abs, 'r');
     const t = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0)).toString('utf8');
-    return SECRET_SHAPES.some((re) => re.test(t)) || (rc && RC_SECRET.test(t));
+    return SECRET_SHAPES.some((re) => re.test(t)) || (rc && rcSecret(t));
   } catch (_) { return false; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch (_) { /* closed */ } }
 }
 // 'deny' | 'ask' | null for a read of `abs`.
