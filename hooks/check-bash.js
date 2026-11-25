@@ -1106,7 +1106,7 @@ const SECRET_TOKENS = '(?:' + [
   '[\\\\/]credentials(?![\\w./])', 'credentials\\.(?:json|ya?ml|toml|ini|txt|xml|env|conf|cfg|properties|store)\\b', '\\.git-credentials\\b',
   '\\.ssh\\b', '\\.gnupg\\b', '\\.aws\\b', '\\.gcloud\\b', '\\.azure\\b',
   '\\.docker[\\\\/]config', '\\.gitconfig\\b',
-  '\\.kube[\\\\/]config', '\\.config[\\\\/]gh[\\\\/]hosts', '[\\\\/]proc[\\\\/](?:[^\\s\\\\/]*[\\\\/]){1,3}environ\\b',
+  '\\.kube[\\\\/]config', '\\.config[\\\\/]gh[\\\\/]hosts', '[\\\\/]proc[\\\\/](?:\\.{0,2}[\\\\/])*(?:(?!\\.\\.?[\\\\/])[^\\s\\\\/]+[\\\\/](?:\\.{0,2}[\\\\/])*){1,3}environ\\b',   // `.`, `..` and empty segments skipped
   // Unix credential stores: password hashes and the sudoers policy. Anchored to
   // `/etc/` so the bare word "shadow" (box-shadow, shadow DOM, a game asset) never
   // matches; `master.passwd` is the BSD/macOS shadow file. `/etc/passwd` is NOT here
@@ -1831,46 +1831,78 @@ function tokenizedSensitiveRead(seg) {
   return null;
 }
 // The Read tool's credential heuristic for a shell reader's literal path (`cat ~/.zshrc`, `cat ~/.config/app/token`).
+const credSeen = new Map();
 function credReadVerdict(t) {
   const home = safeHomedir();
   const p = t.replace(/^\$\{?HOME\}?(?=[\\/])/, '~');
   if (!home || !p || /[$`*?[\]{}]/.test(p)) return null;
-  try { return scan.credVerdict(hostPath(p, projectDir), home, projectDir); } catch (_) { return null; }
+  if (!credSeen.has(p)) { let v = null; try { v = scan.credVerdict(hostPath(p, projectDir), home, projectDir); } catch (_) { /* null */ } credSeen.set(p, v); }
+  return credSeen.get(p);
 }
 
 // A secret-shaped environment variable: an upper-case name with a credential word as a `_` part (`GH_TOKEN_2`,
 // `SECRET_KEY_BASE`, `DB_PASS`, `OPENAI_API_KEY_DEV`) or ending in KEY / AUTH / PASSWORD (`STRIPE_KEY`, `PGPASSWORD`).
 // Not a name for a key's type, file, path, id or size (`TOKEN_TYPE`, `KEY_FILE`, `MAX_TOKENS`, `NEXT_PAGE_TOKEN`),
 // `AWS_REGION`, `PWD`, or a lower-case shell variable (`$key`, `$token`).
-const SECRET_PART = /(?:^|_)(?:TOKENS?|SECRETS?|PASSWORD|PASSWD|PASS|API_?KEY|PRIVATE_KEY|CREDENTIALS?|PAT|KEY_BASE)(?:_|$)|_PWD(?:_|$)|_(?:KEY|AUTH)$|PASSW(?:OR)?D$/;
-const BENIGN_VAR = /_(?:TYPE|FILE|PATH|DIR|URL|NAME|ID|LENGTH|LIMIT)$|(?:^|_)(?:TOTAL|INPUT|OUTPUT|USED|PROMPT|COMPLETION|CONTEXT)_TOKENS$|(?:^|_)(?:PAGE_TOKEN|MAX_TOKENS|TOKEN_COUNT)(?:_|$)|(?:^|_)(?:CACHE|SORT|PRIMARY|PARTITION|FOREIGN|MAP|HASH|ROUTING|IDEMPOTENCY|LOOKUP|GROUP|SHARD|DEDUP)_KEY$/;
-// Run-together names (`GITHUBTOKEN`, `JWTSECRET`, `PRIVATEKEY`) count too; a name holding SECRET is never benign.
-const SECRET_WORD = /SECRET|TOKEN(?!IZ)|PASSW(?:OR)?D|APIKEY|CREDENTIAL|PRIVATE_?KEY/;
-const secretVarName = (n) => /^[A-Z][A-Z0-9_]*$/.test(n) && (n === 'AWS_ACCESS_KEY_ID' ||
-  ((SECRET_PART.test(n) || SECRET_WORD.test(n)) && (!BENIGN_VAR.test(n) || /SECRET/.test(n))));
+const { secretVarName } = scan;
 // `$X`, `${X}`, `${X:-..}`, PowerShell `$env:X` / `${env:X}` (any case: Windows names are), and a bare
 // `env:X` (`Get-Item env:X`). Not `${#X}` or `${X:+..}`, which print a length or a fixed word.
 // A PowerShell `$x` is a script variable, not the environment; a bare `env:X` is PowerShell syntax only.
 const VAR_REF = /\$(\{)?(env:)?([A-Za-z_]\w*)(?!\w)(?!(?<=\{\w+):\+)|(?<![\w$])env:\\?([A-Za-z_]\w*)(?!\w)/gi;
-const secretVarRef = (t, bound) => [...t.matchAll(VAR_REF)].find((m) => {
+// `strict` (the approve gate): a PowerShell script variable with a secret name counts too -- a session may hold it.
+const secretVarRef = (t, bound, strict) => [...t.matchAll(VAR_REF)].find((m) => {
   const posh = m[4] || m[2];
-  if (isPoshTool ? !posh : m[4]) return false;
+  if (isPoshTool ? !posh && !strict : m[4]) return false;
   const n = posh ? (m[4] || m[3]).toUpperCase() : m[3];
   return secretVarName(n) && !(bound && bound.has(n));
 });
 // Names the command itself sets to a literal before any use (`PASS=0; ...; echo "$PASS"`, `for TOKEN in a b`):
-// they hold no inherited secret.
+// they hold no inherited secret. Only top-level statements that always run, read in order up to the first
+// compound or conditional one; any other assignment to the name, or a builtin that can set it, voids it.
 let boundVars = new Set();
+const LIT_VAL = "(?:\\$\\(\\([\\w\\s+*\\/%-]*\\)\\)|'[^']*'|\"[^\"$`\\\\]*\"|[^\\s;&|()$`'\"\\\\<>{}]*)";
+const PURE_ASSIGN = new RegExp('^(?:[A-Za-z_]\\w*=' + LIT_VAL + '\\s+)*[A-Za-z_]\\w*=' + LIT_VAL + '$');
+const ASSIGN_G = new RegExp('([A-Za-z_]\\w*)=(' + LIT_VAL + ')(?=\\s|$)', 'g');
 function literalBound(t) {
-  const at = new Map();
-  for (const m of t.matchAll(/(?:^|[;&|(\s])([A-Za-z_]\w*)=(\$\(\([\w\s+*\/%-]*\)\)|'[^']*'|"[^"$`]*"|[^\s;&|()$`'"]*)(?=[\s;&|)]|$)/g)) {
-    const ids = (m[2].match(/^\$\(\(([\s\S]*)\)\)$/) || ['', ''])[1].match(/[A-Za-z_]\w*/g) || [];
-    if (secretVarName(m[1]) && ids.every((n) => n === m[1] || !secretVarName(n)) && !at.has(m[1])) at.set(m[1], m.index);
+  const out = new Set();
+  if (/(?:^|[\s;&|(])(?:source|\.|eval|read|declare|typeset|local|readonly|export|mapfile|readarray|getopts|let|unset|printf\s+-v)(?=\s|$)/.test(t)) return out;
+  const stmts = [];
+  let cur = '', q = '', complex = false, start = 0;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (q) { if (c === q) q = ''; else if (q === '"' && /[$\x60\\]/.test(c) && !(c === '$' && /[\w{(]/.test(t[i + 1] || ''))) complex = true; cur += c; continue; }
+    if (c === "'" || c === '"') { q = c; cur += c; continue; }
+    if (c === ';' || c === '\n') { stmts.push([cur.trim(), complex, start]); cur = ''; complex = false; start = i + 1; continue; }
+    if (t.startsWith('$((', i)) { const j = t.indexOf('))', i); if (j < 0) return out; cur += t.slice(i, j + 2); i = j + 1; continue; }
+    if (/[&|(){}<>\x60\\]/.test(c)) complex = true;
+    cur += c;
   }
-  for (const m of t.matchAll(/\bfor\s+([A-Za-z_]\w*)\s+in\s+([^;\n]*)/g)) if (secretVarName(m[1]) && !/[$`]/.test(m[2]) && !at.has(m[1])) at.set(m[1], m.index);
-  const s = new Set();
-  for (const [n, i] of at) { const u = t.search(new RegExp('\\$\\{?' + n + '(?!\\w)')); if (u < 0 || u > i) s.add(n); }
-  return s;
+  if (q) return out;
+  stmts.push([cur.trim(), complex, start]);
+  // One pass each: where every name is first read, and how many times anything assigns it.
+  const firstUse = new Map(), assigns = new Map(), own = new Map();
+  for (const m of t.matchAll(/\$\{?([A-Za-z_]\w*)/g)) if (!firstUse.has(m[1])) firstUse.set(m[1], m.index);
+  for (const m of t.matchAll(/(?<![\w$.{-])([A-Za-z_]\w*)\+?=|\bfor\s+([A-Za-z_]\w*)\b/g)) { const n = m[1] || m[2]; assigns.set(n, (assigns.get(n) || 0) + 1); }
+  const used = (n, at) => firstUse.has(n) && firstUse.get(n) < at;
+  for (const [st, cx, at] of stmts) {
+    if (!st) continue;
+    if (!cx && PURE_ASSIGN.test(st)) {
+      for (const m of st.matchAll(ASSIGN_G)) {
+        const n = m[1];
+        if (!secretVarName(n)) continue;
+        const ids = (m[2].match(/^\$\(\(([\s\S]*)\)\)$/) || ['', ''])[1].match(/[A-Za-z_]\w*/g) || [];
+        const ok = !used(n, at) && ids.every((x) => out.has(x) || !secretVarName(x));
+        if (ok) { out.add(n); own.set(n, (own.get(n) || 0) + 1); } else out.delete(n);
+      }
+      continue;
+    }
+    const f = /^for\s+([A-Za-z_]\w*)\s+in\s+([^\s$\x60][^$\x60]*)$/.exec(st);
+    if (!cx && f && secretVarName(f[1]) && !used(f[1], at)) { out.add(f[1]); own.set(f[1], (own.get(f[1]) || 0) + 1); }
+    if (cx || f || /^(?:if|then|elif|else|fi|while|until|do|done|case|esac|function|select|!|\[\[)(?=\s|$)/.test(st)) break;
+  }
+  // Any other assignment to the name (`true && X=$Y`, `for X in $(..)`) voids it.
+  for (const n of [...out]) if (assigns.get(n) !== own.get(n)) out.delete(n);
+  return out;
 }
 // Text the shell expands: single-quoted spans outside double quotes, an escaped `\$` (PowerShell: backtick)
 // and quoted-delimiter heredoc bodies are dropped. The script of `sh -c '..'` / `eval '..'` is kept.
@@ -1896,17 +1928,19 @@ function unexpanded(t) {
   return out;
 }
 // The approve gate: a secret-shaped variable outside a test operand (`[ -n "$KEY" ]`, `test -z "$KEY"`
-// compare it, never print it), or a read of the whole environment.
+// compare it, never print it), or a read of the whole environment. Local bindings only lift the deny: a
+// command that names a secret variable is never auto-approved.
 function secretInText(raw) {
   // Only a quoted `-n` / `-z` operand of a test at command position: `[ $TOKEN -eq 1 ]` prints the value in
   // its error, `echo do test $TOKEN` is an echo, a `;[` inside quotes is an argument, and xtrace prints it.
   const u = unexpanded(raw);
-  if (/\bset\s+(?:-\w*x|-o\s+xtrace)|\b(?:ba|z|k|da)?sh\s+-\w*x/.test(raw)) return !!secretVarRef(u, boundVars);
+  if (/\bset\s+(?:-\w*x|-o\s+xtrace)|\b(?:ba|z|k|da)?sh\s+-\w*x/.test(raw)) return !!secretVarRef(u, null, true);
   const dq = new Uint8Array(u.length);
   for (let i = 0, q = 0; i < u.length; i++) { dq[i] = q; if (u[i] === '"') q ^= 1; }
   const t = u.replace(/(?:^|[;&|(\n])[ \t]*(?:(?:if|then|elif|while|until|do|else|!|\{)[ \t]+)*(?:\[\[?|test)\s[^;&|\n]*/g,
     (m, off) => dq[off] || /\$\(|`|>/.test(m) ? m : m.replace(/(^|\s)-[nz]\s+"\$\{?\w+\}?"/g, '$1'));
-  return !!secretVarRef(t, boundVars);
+  return !!secretVarRef(t, null, true) ||
+    /\b(?:process|meta|Deno|Bun)\.env(?:\?\.|\.(?!(?:example|sample|template|dist|defaults?)\b)[A-Za-z_]|\s*[()\],;+['"|&=!<>?[])/i.test(raw);
 }
 const ENV_DUMP = /\bENVIRON\b|\$ENV\b|\benv\s*\(|\b[jy]q\b[^|;&]*(?<![.\w$-])(?<!--(?:arg|argjson|slurpfile|rawfile)\s+(?:\S+\s+)?)env\b/;
 // `Get-ChildItem Env:`, `gci env:G*`, `[Environment]::GetEnvironmentVariable(..)`, or a lister given a
@@ -1977,16 +2011,37 @@ function dumpStage(st) {
   while (at < toks.length && (/^[A-Za-z_]\w*=/.test(toks[at]) || STAGE_PREFIX.test(toks[at]))) at++;
   return { cmd: base(toks[at] || '').replace(/^\\/, ''), args: toks.slice(at + 1), text: st };
 }
-// A stage that keeps only names, a count or an exit status (`grep -q`, `grep -c`, `cut -d= -f1`, `select Name`).
-const namesOnly = (w) => (/^(?:grep|egrep|fgrep|rg)$/.test(w.cmd) && w.args.some((a) => /^-[A-Za-z]*[qcl]|^--(?:quiet|silent|count|files-with-matches)$/.test(a))) ||
-  (w.cmd === 'cut' && /\s-f\s*1(?!\S)/.test(w.text) && /\s-d\s*['"]?=/.test(w.text)) ||
-  /^\s*(?:Select-Object|select)\s+(?:-(?:ExpandProperty|Property)\s+)?['"]?Name['"]?\s*$/i.test(w.text);
+// A stage that keeps only a count or an exit status (`grep -q PAT`, `grep -c PAT`), or, after an env dump, only
+// the names (`cut -d= -f1`, `select Name`). Exact flag sets only: `-e`, `-f`, `-o`, `--complement` keep values.
+// ponytail: `cut -d= -f1` still prints a continuation line of a multi-line value; deny it if that matters.
+function namesOnly(w, env) {
+  if (/^(?:grep|egrep|fgrep|rg)$/.test(w.cmd)) {
+    const flags = w.args.filter((a) => a.startsWith('-')), rest = w.args.filter((a) => !a.startsWith('-'));
+    return rest.length === 1 && flags.every((a) => /^-[ivwEFqcl]+$|^--(?:quiet|silent|count|files-with-matches|ignore-case|invert-match|word-regexp)$/.test(a)) &&
+      flags.some((a) => /^-[a-z]*[qcl]|^--(?:quiet|silent|count|files-with-matches)$/i.test(a));
+  }
+  if (!env) return false;
+  if (w.cmd === 'cut') {
+    let d = false, f = false;
+    for (let i = 0; i < w.args.length; i++) {
+      const a = w.args[i];
+      if (/^(?:-d|--delimiter=)=$/.test(a)) d = true;
+      else if (/^(?:-d|--delimiter)$/.test(a) && w.args[i + 1] === '=') { d = true; i++; }
+      else if (/^(?:-f|--fields=)1$/.test(a)) f = true;
+      else if (/^(?:-f|--fields)$/.test(a) && w.args[i + 1] === '1') { f = true; i++; }
+      else return false;
+    }
+    return d && f;
+  }
+  return /^\s*(?:Select-Object|select)\s+(?:-(?:ExpandProperty|Property)\s+)?['"]?Name['"]?\s*$/i.test(w.text);
+}
 // Every later stage only passes text on; the last one is not redirected into a file. A `tee` to a process
-// substitution or the terminal (`tee >(cat >&2) | wc -c`) prints whatever follows it.
-function reachesTranscript(stages, k, toFileOk) {
+// substitution or the terminal (`tee >(cat >&2) | wc -c`) and `Out-Host` print whatever reaches them.
+function reachesTranscript(stages, k, toFileOk, env) {
   for (let j = k + 1; j < stages.length; j++) {
-    if (stages[j].cmd === 'tee' && /[>]\(|\/dev\/(?:std|tty|fd\/)/.test(stages[j].text)) return true;
-    if (!PASS_THROUGH.has(stages[j].cmd) || namesOnly(stages[j])) return false;
+    if (stages[j].cmd === 'tee' && /[>]\(|\/dev\/(?:std|tty|fd\/)|\/proc\/\S*\/fd\//.test(stages[j].text)) return true;
+    if (/^(?:Out-Host|oh)$/i.test(stages[j].cmd)) return true;
+    if (!PASS_THROUGH.has(stages[j].cmd) || namesOnly(stages[j], env)) return false;
   }
   return toFileOk || !/(?:^|[^<>&\d])\d?>>?\s*(?!&|\/dev\/(?:stdout|stderr|tty|fd\/))\S/.test(stages[stages.length - 1].text.replace(/'[^']*'|"[^"]*"/g, ''));
 }
@@ -2022,7 +2077,7 @@ function envDump(seg) {
   if (isPoshTool && /GetEnvironmentVariables\s*\(|\bcmd(?:\.exe)?\s+\/c\s+set\s*(?:$|[|;&])/i.test(seg)) return 'Printing the whole environment blocked -- it holds the user tokens. Read one non-secret variable instead.';
   const stages = splitPipeStages(stripUnquotedComment(seg)).map(dumpStage);
   for (let k = 0; k < stages.length; k++) {
-    if (envDumpStage(stages[k]) && reachesTranscript(stages, k, true)) {
+    if (envDumpStage(stages[k]) && reachesTranscript(stages, k, true, true)) {
       return 'Printing the whole environment blocked -- it holds the user tokens. Read one non-secret variable with printenv NAME.';
     }
   }
@@ -2045,31 +2100,55 @@ function secretVarPrinted(seg) {
 // `node -e 'console.log(process.env)'`, `python -c 'print(os.environ)'`, or a print of one secret-named entry.
 // `$1` the interpreter, then its eval flag later in the same command (one linear pass per piece).
 const interpWithFlag = (s, prog, flag) => s.split(/[|;&]/).some((p) => { const i = p.search(prog); return i >= 0 && flag.test(p.slice(i)); });
-// A presence test prints true/false, not the value: `!!process.env.X`, `bool(os.getenv('X'))`, `X ? 'set' : ''`.
-const presenceOnly = (pre, post) => /(?:!|\bBoolean\s*\(|\bbool\s*\(|\blen\s*\()\s*$/.test(pre) ||
-  /^\s*(?:\?|[!=]==?|\.length\b|is\s+(?:not\s+)?None\b|\bin\b)/.test(post);
+// Once the script prints anything, every secret-named reference denies unless that reference is itself only a
+// presence test (`!!process.env.X`, `Boolean(..)`, `X === 'a'`, `X ? 'a' : 'b'`, `bool(..)`, `.. is None`).
+const JS_REF = /process\.env(?:\.([A-Za-z_]\w*)|\[\s*['"]([A-Za-z_]\w*)['"]\s*\])|Bun\.env(?:\.([A-Za-z_]\w*)|\[\s*['"]([A-Za-z_]\w*)['"]\s*\])|Deno\.env\.get\(\s*['"]([A-Za-z_]\w*)['"]\s*\)/g;
+const PY_REF = /os\.environ\s*\[\s*['"]([A-Za-z_]\w*)['"]\s*\]|os\.(?:environ\.get|getenv)\s*\(\s*['"]([A-Za-z_]\w*)['"][^)]{0,40}\)/g;
+const JS_PRESENT = [[/(?:!|\bBoolean\s*\()\s*$/, /^\s*(?:[),;'"]|&&|\|\||$)/],
+  [/(?:^|[^.\w])$/, /^\s*(?:[!=]==?\s*(?:'[^']*'|"[^"]*"|undefined|null|\d+)|\?\s*(?:'[^']*'|"[^"]*")\s*:\s*(?:'[^']*'|"[^"]*"))/]];
+const PY_PRESENT = [[/\bbool\s*\(\s*$/, /^\s*\)/], [/\bnot\s+$/, /^/], [/\bif\s+$/, /^\s*else\b/],
+  [/(?:^|[^.\w])$/, /^\s*(?:is\s+(?:not\s+)?None\b|[!=]=\s*(?:'[^']*'|"[^"]*"))/]];
+function secretRefPrinted(s, re, present) {
+  for (const m of s.matchAll(re)) {
+    if (!secretVarName(m.slice(1).find(Boolean))) continue;
+    const pre = s.slice(Math.max(0, m.index - 24), m.index), post = s.slice(m.index + m[0].length, m.index + m[0].length + 64);
+    if (!present.some(([a, b]) => a.test(pre) && b.test(post))) return true;
+  }
+  return false;
+}
+// The PowerShell tool running `bash -c '..'`: the inner script is bash, where `$X` is the environment.
+function poshNestedSh(seg) {
+  if (!isPoshTool) return null;
+  for (const m of seg.matchAll(/\b(?:ba|z|da|k)?sh(?:\.exe)?\s+(?:-\w+\s+)*-\w*c\s+(?:'([^']*)'|"([^"]*)")/gi)) {
+    isPoshTool = false;
+    try {
+      for (const s of splitChainSegments(m[1] ?? m[2])) {
+        const r = envDump(s) || secretVarPrinted(s) || interpEnvDump(s);
+        if (r) return r;
+      }
+    } finally { isPoshTool = true; }
+  }
+  return null;
+}
 function interpEnvDump(seg) {
   const s = stripUnquotedComment(seg);
   const SECRET = 'Printing a secret environment variable from an inline script blocked.';
-  if (interpWithFlag(s, /\b(?:node|deno|bun)\b/, /\s-(?:e|p|-eval|-print)\b/)) {
-    if (/\s-(?:p|-print)\s+['"]?process\.env['"]?(?:\s|$)/.test(s) ||
-        /(?:console\.\w+|JSON\.stringify|process\.std(?:out|err)\.write|util\.inspect|Object\.(?:entries|values))\s*\(\s*process\.env\s*[),]/.test(s)) return 'Printing the environment from an inline script blocked.';
-    for (const m of s.matchAll(/(?:console\.\w+|process\.std(?:out|err)\.write)\s*\(([^)]{0,200}?)process\.env(?:\.([A-Za-z_]\w*)|\[\s*['"]([A-Za-z_]\w*)['"]\s*\])(.{0,16})/g)) {
-      if (secretVarName(m[2] || m[3]) && !presenceOnly(m[1], m[4])) return SECRET;
-    }
+  if (interpWithFlag(s, /\b(?:node|deno|bun)\b/, /\s(?:-(?:[ep]{1,2}|-eval|-print)|eval)\b/)) {
+    const pflag = /\s-(?:p|pe|ep|-print)\b/.test(s);
+    if (/\s-(?:p|pe|ep|-print)\s+['"]?(?:process|Bun)\.env['"]?(?:\s|$)/.test(s) ||
+        /(?:console\.\w+|JSON\.stringify|process\.std(?:out|err)\.write|util\.inspect|Object\.(?:entries|values))\s*\(\s*(?:(?:process|Bun)\.env|Deno\.env\.toObject\(\s*\))\s*[),]/.test(s)) return 'Printing the environment from an inline script blocked.';
+    if ((pflag || /console\.\w+\s*\(|process\.std(?:out|err)\.write\s*\(/.test(s)) && secretRefPrinted(s, JS_REF, JS_PRESENT)) return SECRET;
   }
   if (interpWithFlag(s, /\bpython[\d.]*\b/, /\s-c\b/)) {
     if (/print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)/.test(s)) return 'Printing the environment from an inline script blocked.';
-    for (const m of s.matchAll(/(?:print|sys\.std(?:out|err)\.write)\s*\(([^)]{0,200}?)(?:os\.environ\s*\[\s*['"]([A-Za-z_]\w*)['"]\s*\]|os\.(?:environ\.get|getenv)\s*\(\s*['"]([A-Za-z_]\w*)['"][^)]{0,40}\))(.{0,16})/g)) {
-      if (secretVarName(m[2] || m[3]) && !presenceOnly(m[1], m[4])) return SECRET;
-    }
+    if (/\bprint\s*\(|sys\.std(?:out|err)\.write\s*\(/.test(s) && secretRefPrinted(s, PY_REF, PY_PRESENT)) return SECRET;
   }
   return null;
 }
 
 const DENY_PATTERNS = [
   [tokenizedSensitiveRead, null],
-  [envDump, null], [secretVarPrinted, null], [interpEnvDump, null],
+  [envDump, null], [secretVarPrinted, null], [interpEnvDump, null], [poshNestedSh, null],
   [namedSecretPipelineRead, null],
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
@@ -5511,14 +5590,17 @@ if (MAIN) watchdog.input((data) => {
     try { realCwd = fs.realpathSync(cwd); } catch (_) { /* keep cwd */ }
     const realIn = (from, p) => { try { return inside(realCwd, fs.realpathSync(path.resolve(from, p))); } catch (_) { return inside(path.resolve(cwd), path.resolve(from, p)); } };
     // A `cd` into a literal project subdirectory (`cd backend && openssl x509 -in tests/fixtures/cert.pem`) keeps
-    // the key in the project; a link, popd, a computed or outside target does not.
-    let dir = cwd, cdOk = !/(?:^|[\s;&|({`])(?:popd|ln|New-Item|ni|mklink|subst|mount|bindfs)(?=\s|$)/i.test(rawCmd);
-    for (const m of rawCmd.matchAll(/(?:^|[\s;&|({`])(?:cd|pushd|Set-Location|sl|chdir|Push-Location)(?=\s|$|[;&|)])(?:\s+(?:-LiteralPath\s+|-Path\s+)?(['"]?)([^\s'";&|()`]*)\1)?/gi)) {
-      const t = m[2] || '';
-      if (!t || /[$~*?%]|^-|^[\\/]|^[A-Za-z]:|(?:^|[\\/])\.\.(?:[\\/]|$)/.test(t) || !realIn(dir, t)) { cdOk = false; break; }
+    // the key in the project; a link, popd, CDPATH, a quoted, escaped, computed or outside target does not. Every
+    // directory the command visits must keep every key inside; past 8 directory changes it denies.
+    let dir = cwd, n = 0, cdOk = !/(?:^|[\s;&|({`])(?:popd|ln|New-Item|ni|mklink|subst|mount|bindfs)(?=\s|$)|\bCDPATH\b/i.test(rawCmd);
+    const dirs = [cwd];
+    for (const m of rawCmd.matchAll(/(?:^|[\s;&|({`])\\?(?:cd|pushd|Set-Location|sl|chdir|Push-Location)(?=\s|$|[;&|)])(?:\s+(?:-LiteralPath\s+|-Path\s+)?([^\s;&|()]*))?/gi)) {
+      const t = m[1] || '';
+      if (!cdOk || ++n > 8 || !/^[\w.\/-]+$/.test(t) || /^-|^\/|(?:^|\/)\.\.(?:\/|$)/.test(t) || !realIn(dir, t)) { cdOk = false; break; }
       dir = path.resolve(dir, t);
+      dirs.push(dir);
     }
-    if (!cdOk || !fixtureKeys.every((k) => realIn(cwd, k) && realIn(dir, k))) {
+    if (!cdOk || !fixtureKeys.every((k) => dirs.every((d) => realIn(d, k)))) {
       deny('Reading sensitive file via shell blocked', fixtureKeys[0]);
     }
   }

@@ -846,7 +846,13 @@ const SECRET_SHAPES = [
 // An rc line setting a credential name (not `X_TOKEN_FILE`) to a literal: not empty, not `$OTHER`.
 // `[ \t]`, not `\s`, after `^`: under /m a `\s*` re-scans every following newline (quadratic).
 const RC_ASSIGN = /^[ \t]*(?:export[ \t]+)?([A-Z_][A-Z0-9_]*)[ \t]*=[ \t]*(?!["']?\$|""|''|\s|$)/gm;
-const rcSecret = (t) => [...t.matchAll(RC_ASSIGN)].some((m) => /TOKEN|SECRET|PASSW(?:OR)?D|API_?KEY|PRIVATE_KEY|CREDENTIAL/.test(m[1]) && !/_(?:FILE|PATH|DIR|URL|TYPE|NAME|ID)$/.test(m[1]));
+const SECRET_PART = /(?:^|_)(?:TOKENS?|SECRETS?|PASSWORD|PASSWD|PASS|API_?KEY|PRIVATE_KEY|CREDENTIALS?|PAT|KEY_BASE)(?:_|$)|_PWD(?:_|$)|_(?:KEY|AUTH)$|PASSW(?:OR)?D$/;
+const BENIGN_VAR = /_(?:TYPE|FILE|PATH|DIR|URL|NAME|ID|LENGTH|LIMIT)$|(?:^|_)(?:TOTAL|INPUT|OUTPUT|USED|PROMPT|COMPLETION|CONTEXT)_TOKENS$|(?:^|_)(?:PAGE_TOKEN|MAX_TOKENS|TOKEN_COUNT)(?:_|$)|^MAX_w*_TOKENS$|_THINKING_TOKENS$|(?:^|_)(?:CACHE|SORT|PRIMARY|PARTITION|FOREIGN|MAP|HASH|ROUTING|IDEMPOTENCY|LOOKUP|GROUP|SHARD|DEDUP)_KEY$/;
+// Run-together names (`GITHUBTOKEN`, `JWTSECRET`, `PRIVATEKEY`) count too; a name holding SECRET is never benign.
+const SECRET_WORD = /SECRET|TOKEN(?!IZ)|PASSW(?:OR)?D|APIKEY|CREDENTIAL|PRIVATE_?KEY/;
+const secretVarName = (n) => /^[A-Z][A-Z0-9_]*$/.test(n) && (n === 'AWS_ACCESS_KEY_ID' ||
+  ((SECRET_PART.test(n) || SECRET_WORD.test(n)) && (!BENIGN_VAR.test(n) || /SECRET/.test(n))));
+const rcSecret = (t) => [...t.matchAll(RC_ASSIGN)].some((m) => secretVarName(m[1]));
 const RC_NAME = /^\.(?:bashrc|zshrc|profile|bash_profile|bash_aliases|bash_login|zprofile|zshenv|zlogin|kshrc|cshrc)$/i;
 const inside = (child, parent) => { const r = require('path').relative(parent, child); return !!parent && !r.startsWith('..') && !require('path').isAbsolute(r); };
 function credHeuristic(abs, home, projectRoot) {
@@ -879,5 +885,5 @@ function credVerdict(abs, home, projectRoot) {
 module.exports = {
   SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
   scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces, globHitsSecret, globComponentRe, cmdDefHigh,
-  CRED_PATH_SRC, CRED_PATH_RE, credHeuristic, sniffSecret, credVerdict,
+  CRED_PATH_SRC, CRED_PATH_RE, credHeuristic, sniffSecret, credVerdict, secretVarName,
 };

