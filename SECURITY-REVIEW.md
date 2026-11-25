@@ -353,7 +353,10 @@ found five attack classes auto-approved by 0.11.0 and 0.10.0, three parity holes
 | B a secret upload or reverse shell in a command-definition file (shell write, Write/Edit) | allow | deny |
 | B unreadable content (`cp`, `curl -o`, `wget`, `git apply`) into a command-definition file, then a runner | allow | fallthrough |
 | C `--script-shell`, `go -exec`, `cargo --config`, `pytest -p`, `node -r`, `make SHELL=`, a config or `cd` in a temp dir | allow | fallthrough |
-| D `env`, `printenv`, `export -p`, `ps e`, `echo $TOKEN`, `Get-ChildItem Env:` | allow | fallthrough |
+| D `env`, `printenv`, `export -p`, `set`, `declare -x`, `echo $TOKEN`, `Get-ChildItem Env:` to the transcript | allow | deny |
+| D `ps e`, awk `ENVIRON`, jq `env`, `npm run env` | allow | fallthrough |
+| Linux: `cat`/`jq` of `~/.claude.json`, `~/.codex/auth.json`, Atlassian/Bitbucket CLI configs; `/proc/*/task/*/environ` | allow | deny |
+| Linux: Read of a credential-looking name under home, outside the project | allow | ask (deny if it holds a token) |
 | E `>> ~/.bash_aliases`, `~/.bash_login`, `~/.bash_logout` | allow | ask |
 | PowerShell writes to shellter's files, trust store, settings (incl. `Copy-Item -Destination`, `>`, `Set-Location`) | fallthrough | deny / ask (as bash) |
 | PowerShell injection text into CLAUDE.md (positional, named, piped, `>`) | fallthrough | deny |

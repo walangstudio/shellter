@@ -812,7 +812,67 @@ function cmdDefHigh(target, body) {
   });
 }
 
+// Credential stores both hooks treat as secrets (Read and `cat` alike). Regex sources with an either-slash
+// separator so the same text matches a path and raw command text; each ends at a name boundary.
+const SEP = '[\\\\/]', END = '(?![\\w.-])';
+const CRED_PATH_SRC = [
+  '\\.(?:bitbucket|atlassian)-rest-cli-config\\.json' + END,
+  '\\.codex' + SEP + 'auth\\.json' + END,
+  '(?<![\\w-])\\.claude\\.json(?:\\.backup)?' + END,
+  '\\.config' + SEP + 'figma' + SEP + 'token' + END,
+  '\\.mobiledev' + SEP + 'authtoken' + END,
+  '\\.emulator_console_auth_token' + END,
+  '\\.conda' + SEP + 'aau_token' + END,
+  '(?<![\\w-])client_secret[\\w.-]*\\.json' + END,
+  SEP + '\\.dailyclones-runner(?:' + SEP + '|' + END + ')',
+  SEP + 'Trust Tokens(?:-journal)?' + END,
+  SEP + '(?:Default|Profile \\d+|Guest Profile)' + SEP + '(?:Network' + SEP + ')?(?:Cookies|Login Data|Web Data)(?:-journal)?' + END,
+];
+const CRED_PATH_RE = new RegExp('(?:' + CRED_PATH_SRC.join('|') + ')', 'i');
+
+// A file NAME that looks like a credential store, under the user's home and outside the project: asked,
+// and denied when its first 64 KB hold a real token shape. Package caches and source files never count.
+const CRED_NAME = /(?:^|[._ -])tokens?(?:$|[._ -])|^auth\.json$|credential|^client_secret[^\/]*\.json$|-cli-config\.json$|^(?:Cookies|Login Data|Trust Tokens)$|\.enc$/i;
+const CRED_NAME_NOT = /tokeniz|special_tokens|added_tokens|design-tokens/i;
+const CRED_SKIP_DIR = /[\\/](?:node_modules|site-packages|\.cargo|\.rustup|\.nvm|\.pyenv|pkg[\\/]mod)[\\/]/i;
+const SOURCE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|kt|kts|swift|scala|cs|css|scss|less|vue|svelte|html|md)$/i;
+const SECRET_SHAPES = [
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/, /\bgh[pousr]_[A-Za-z0-9]{36,}/, /\bgithub_pat_[A-Za-z0-9_]{60,}/,
+  /\bxox[bpars]-[A-Za-z0-9-]{20,}/, /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\bATATT3[A-Za-z0-9_=-]{20,}/,
+];
+const RC_SECRET = /^\s*(?:export\s+)?[A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIAL)[A-Z0-9_]*\s*=\s*\S/m;
+const RC_NAME = /^\.(?:bashrc|zshrc|profile|bash_profile|bash_aliases|bash_login|zprofile|zshenv|zlogin|kshrc|cshrc)$/i;
+const inside = (child, parent) => { const r = require('path').relative(parent, child); return !!parent && !r.startsWith('..') && !require('path').isAbsolute(r); };
+function credHeuristic(abs, home, projectRoot) {
+  if (!abs || !home || !inside(abs, home) || inside(abs, projectRoot) || CRED_SKIP_DIR.test(abs)) return false;
+  const name = abs.replace(/^.*[\\/]/, '');
+  return CRED_NAME.test(name) && !CRED_NAME_NOT.test(name) && !SOURCE_EXT.test(name);
+}
+// One bounded read: a regular file only (a FIFO or device would block), first 64 KB, any error -> false.
+function sniffSecret(abs, rc) {
+  if (/^(?:\\\\|\/\/)|^\/(?:proc|sys|dev)\//.test(abs)) return false;
+  const fs = require('fs');
+  let fd;
+  try {
+    const st = fs.statSync(abs);
+    if (!st.isFile() || st.size === 0) return false;
+    const buf = Buffer.alloc(Math.min(st.size, 65536));
+    fd = fs.openSync(abs, 'r');
+    const t = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0)).toString('utf8');
+    return SECRET_SHAPES.some((re) => re.test(t)) || (rc && RC_SECRET.test(t));
+  } catch (_) { return false; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch (_) { /* closed */ } }
+}
+// 'deny' | 'ask' | null for a read of `abs`.
+function credVerdict(abs, home, projectRoot) {
+  if (!abs || !home || !inside(abs, home)) return null;
+  if (RC_NAME.test(abs.replace(/^.*[\\/]/, ''))) return sniffSecret(abs, true) ? 'deny' : null;
+  if (!credHeuristic(abs, home, projectRoot)) return null;
+  return sniffSecret(abs, false) ? 'deny' : 'ask';
+}
+
 module.exports = {
   SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
   scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces, globHitsSecret, globComponentRe, cmdDefHigh,
+  CRED_PATH_SRC, CRED_PATH_RE, credHeuristic, sniffSecret, credVerdict,
 };

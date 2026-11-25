@@ -86,6 +86,7 @@ function testFile(description, toolName, toolInput, expected) {
 
 // Build dangerous strings from parts so this file itself doesn't trigger hooks
 function join() { return Array.from(arguments).join(''); }
+const PRINTS = /^(?:env|printenv(?: \w+| \| grep -i token)?|export -p|declare -p|bash -c 'echo \$\w+'|echo (?:do |! |\{ )?(?:test )?"?'?(?:it's )?\$\w+(?: and it's)?'?"?)$/;
 
 console.log('=== check-bash.js tests ===\n');
 
@@ -1595,7 +1596,7 @@ testBash('v0.7.1 pass: sed with only a script arg is not denied', join('sed .en'
 testBash('v0.7.1 pass: grep with only a pattern arg', join('grep ~/.ssh/id_r', 'sa'), 'allow');
 testBash('v0.7.1 deny: two positionals means the second is a file', join('sed 1p .en', 'v'), 'deny');
 // `env` alone dumps the environment; `env <cmd>` runs a command and must not be auto-approved.
-testBash('bare env prompts (0.11.1: it prints secrets)', 'env', 'fallthrough');
+testBash('bare env denies (0.11.1: it prints secrets)', 'env', 'deny');
 testBash('v0.7.1 fallthrough: env running a command is not auto-approved', 'env -u PATH ./setup.sh', 'fallthrough');
 // ...and jq -e/-r bundles are still not pattern flags.
 testBash('v0.7.1 pass: jq -er filter selecting .key', join("jq -er '.credentials.k", "ey' out.json"), 'allow');
@@ -2502,7 +2503,7 @@ console.log('\n--- 0.11.0 step 2: path canonicalisation (F-C2, F-M1, F-M6) ---')
   R('list twin: environment.ts falls through', 'src/environment.ts', 'fallthrough');
   R('list twin: /proc/cpuinfo falls through', '/proc/cpuinfo', 'fallthrough');
   R('history: .bash_history asks', '/home/x/.bash_history', 'ask');
-  R('history: .claude.json asks', S('C:', 'Users', 'x', '.claude.json'), 'ask');
+  R('credential store: .claude.json denies', S('C:', 'Users', 'x', '.claude.json'), 'deny');
   { const r = runHook(FILES_HOOK, { tool_name: 'Read', tool_input: { file_path: '/home/x/.zsh_history' }, permission_mode: 'bypassPermissions' });
     check('history: ask is silent in bypass', r.decision, 'fallthrough'); }
   // instruction surface: the canonical and the resolved path count
@@ -3985,13 +3986,13 @@ console.log('\n--- 0.11.0 final review (bash B1-B7, files B1-B3) ---');
     'cd "$(git rev-parse --show-toplevel)" && npm test', 'for d in a b; do (cd $d && npm test); done']) {
     testBash('E2E C twin: ' + c + ' allows', c, 'allow');
   }
-  // D: environment dumps do not approve.
+  // D: environment dumps do not approve; a print into the transcript denies.
   for (const c of ['env', 'printenv', 'printenv | grep -i token', 'echo $GITHUB_TOKEN', 'echo $GITHUB_TOKEN > t.txt', 'export -p', 'declare -p']) {
-    testBash('E2E D: ' + c + ' does not approve', c, 'fallthrough');
+    testBash('E2E D: ' + c + ' does not approve', c, PRINTS.test(c) ? 'deny' : 'fallthrough');
   }
-  testPosh('E2E D: Get-ChildItem Env: does not approve', "Get-ChildItem Env: | Where-Object Name -match 'TOKEN'", 'fallthrough');
-  testPosh('E2E D: echo $env:GITHUB_TOKEN does not approve', 'echo $env:GITHUB_TOKEN', 'fallthrough');
-  for (const c of ['ps eww', 'ps auxe', 'ps -E', 'echo $GITHUB_PAT']) testBash('E2E D: ' + c + ' does not approve', c, 'fallthrough');
+  testPosh('E2E D: Get-ChildItem Env: denies', "Get-ChildItem Env: | Where-Object Name -match 'TOKEN'", 'deny');
+  testPosh('E2E D: echo $env:GITHUB_TOKEN denies', 'echo $env:GITHUB_TOKEN', 'deny');
+  for (const c of ['ps eww', 'ps auxe', 'ps -E', 'echo $GITHUB_PAT']) testBash('E2E D: ' + c + ' does not approve', c, PRINTS.test(c) ? 'deny' : 'fallthrough');
   for (const c of ['ps aux', 'ps -ef', 'ps -o pid,etime']) testBash('E2E D twin: ' + c + ' allows', c, 'allow');
   testBash('E2E D twin: echo $HOME allows', 'echo $HOME', 'allow');
   testPosh('E2E D twin: echo $env:PATH allows', 'echo $env:PATH', 'allow');
@@ -4067,10 +4068,10 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
   // A4 / D1: the approve gate reads quotes like the shell and skips test operands and escaped names.
   for (const c of ['echo "\'' + GT + '\'"', 'echo "it\'s ' + GT + ' and it\'s"', "bash -c 'echo " + GT + "'", 'awk \'BEGIN{for(k in ENVIRON)print k"="ENVIRON[k]}\'',
     'jq -n env', "jq -n '$ENV.GITHUB_TOKEN'", "yq -n 'env(GITHUB_TOKEN)'", 'printenv GITHUB_TOKEN', 'ps eww', 'ps -E']) {
-    testBash('A4/A5: ' + c + ' does not approve', c, 'fallthrough');
+    testBash('A4/A5: ' + c + ' does not approve', c, PRINTS.test(c.replace(GT, '$GITHUB_TOKEN')) ? 'deny' : 'fallthrough');
   }
   for (const c of ["Write-Output \"'$env:GITHUB_TOKEN'\"", 'gci env:G*', 'Get-ChildItem Env:GITHUB*', "Get-ChildItem ('en'+'v:')", "[Environment]::GetEnvironmentVariable('X')", 'gci $x', 'gci $env:G*']) {
-    testPosh('A4/A5: ' + c + ' does not approve', c, 'fallthrough');
+    testPosh('A4/A5: ' + c + ' does not approve', c, /^Write-Output/.test(c) ? 'deny' : 'fallthrough');
   }
   testPosh('A5 twin: Get-ChildItem $env:TEMP lists a directory and allows', 'Get-ChildItem $env:TEMP', 'allow');
   testPosh('A5 twin: Get-ChildItem $_.FullName inside % { } allows', "Get-ChildItem test -Directory | % { (Get-ChildItem $_.FullName -Force | Measure-Object).Count }", 'allow');
@@ -4190,7 +4191,7 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
   // Code review of the fix round (CR1-CR10).
   for (const c of ['echo $DB_PASSWORD', 'echo $PGPASSWORD', 'echo $SSH_PRIVATE_KEY', 'echo $DB_CREDENTIALS', 'printenv DB_PASSWORD',
     'echo do test ' + GT, 'echo ! test ' + GT, 'echo { test ' + GT, '[ ' + GT + ' -eq 1 ]', 'ps aux e', 'ps ax e']) {
-    testBash('CR1-4: ' + c + ' does not approve', c, 'fallthrough');
+    testBash('CR1-4: ' + c + ' does not approve', c, PRINTS.test(c.replace(GT, '$GITHUB_TOKEN')) ? 'deny' : 'fallthrough');
   }
   testBash('CR1: a password variable to the network denies', CU + ' -d "$DB_PASSWORD" ' + AT + '/c', 'deny');
   testBash('CR4 twin: ps aux allows', 'ps aux', 'allow');
@@ -4253,7 +4254,7 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
   testBashCwd('fix4 #7 twin: cd good && npm test allows', 'cd good && npm test', rproj, 'allow');
   // #3: credential words as any `_` part; type, file, size and pagination names are not secrets.
   for (const n of ['SECRET_KEY_BASE', 'MAPBOX_APIKEY', 'DB_PASS', 'CLIENT_SECRET_VALUE', 'SECRETS', 'PRIVATE_KEY_PEM', 'GH_TOKEN_2', 'OPENAI_API_KEY_DEV', 'NPM_TOKENS', 'API_KEY_PROD']) {
-    testBash('fix4 #3: echo $' + n + ' does not approve', 'echo $' + n, 'fallthrough');
+    testBash('fix4 #3: echo $' + n + ' denies', 'echo $' + n, 'deny');
     testBash('fix4 #3: $' + n + ' in a curl body denies', CU + ' -d "$' + n + '" ' + AT, 'deny');
   }
   testBash('fix4 #3: $NPM_TOKENS in a URL denies', CU + ' ' + AT + '/$NPM_TOKENS', 'deny');
@@ -4282,6 +4283,59 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
   testPosh('fix4 #8: Get-ChildItem $x does not approve', 'Get-ChildItem $x', 'fallthrough');
   testBash('fix4 #9 twin: jq --arg env prod allows', "jq --arg env prod '.[$env]' config.json", 'allow');
   testBash('fix4 #9: jq -n env does not approve', "jq -n 'env'", 'fallthrough');
+  // 0.11.1 Linux credential-leak requirements: env dumps and printed secrets deny, Bash readers match Read
+  // on credential stores, credential-looking names under home ask (deny when they hold a token).
+  {
+    const lh = fs.mkdtempSync(path.join(os.tmpdir(), 'shellter-lnx-')), lp = path.join(lh, 'proj');
+    fs.mkdirSync(path.join(lh, '.config', 'someapp'), { recursive: true }); fs.mkdirSync(lp);
+    fs.writeFileSync(path.join(lh, '.config', 'someapp', 'api-token'), 'plain');
+    fs.mkdirSync(path.join(lh, '.config', 'leaky')); fs.writeFileSync(path.join(lh, '.config', 'leaky', 'api-token'), join('gh', 'p_') + 'a'.repeat(36));
+    fs.writeFileSync(path.join(lh, '.zshenv'), 'export PATH=$PATH:/x\n');
+    fs.mkdirSync(path.join(lh, 'rc2')); fs.writeFileSync(path.join(lh, 'rc2', '.zshenv'), 'export FOO_API_TOKEN=abc\n');
+    const lenv = { HOME: lh, USERPROFILE: lh };
+    const L = (want, tool, x) => {
+      const r = runHook(tool === 'Read' ? FILES_HOOK : BASH_HOOK, { tool_name: tool, cwd: lp, tool_input: tool === 'Read' ? { file_path: x } : { command: x } }, lenv).decision;
+      const ok = want === 'notdeny' ? r !== 'deny' : want === 'notallow' ? r !== 'allow' : r === want;
+      check('linux ' + want + ': ' + tool + ' ' + x.replace(lh, '~').slice(0, 90), ok ? want : r, want);
+    };
+    // The doc's test list.
+    for (const c of ['printenv', 'env', 'export -p', 'cat /proc/self/environ', 'echo "$ATLASSIAN_API_TOKEN"', 'cat ~/.config/gh/hosts.yml',
+      'cat ~/.bitbucket-rest-cli-config.json', 'jq . ~/.atlassian-rest-cli-config.json', 'cat ~/.codex/auth.json', 'cat ~/.claude.json', 'set', 'declare -x',
+      "python3 -c \"print(open('" + lh.replace(/\\/g, '/') + "/.codex/auth.json').read())\""]) L('deny', 'Bash', c);
+    for (const p of ['.codex/auth.json', '.claude.json', '.cache/pw-agenthq/Default/Cookies']) L('deny', 'Read', path.join(lh, p));
+    L('ask', 'Read', path.join(lh, '.config', 'someapp', 'api-token'));
+    for (const c of ['env NODE_ENV=test npm test', 'cat ./src/styles/tokens.css']) L('allow', 'Bash', c);
+    for (const c of ["env NODE_ENV=test node -e 'console.log(process.env.NODE_ENV)'", 'compgen -v']) L('notdeny', 'Bash', c);
+    // Benign twins.
+    for (const c of ['env -u FOO npm test', 'printenv PATH', 'echo $HOME', 'echo $MAX_TOKENS', 'echo ${GITHUB_TOKEN:+set}', 'echo ${#GITHUB_TOKEN}',
+      '[ -n "$OPENAI_API_KEY" ] && echo set', 'test -z "$GITHUB_TOKEN" && echo "no token"', 'for key in a b; do echo "$key"; done',
+      'echo "$NEXT_PAGE_TOKEN"', 'echo "$TOKEN_TYPE"', "echo '$GITHUB_TOKEN'", 'echo "use env to dump"', 'git commit -m "set env"',
+      'grep -rn printenv src/', 'rg credentials src/', 'grep -rn Cookies src/']) L('allow', 'Bash', c);
+    for (const c of ['set -euo pipefail', 'set -- a b', 'export FOO=1', 'declare -A m', 'declare -f fn', 'declare -p PATH', 'env | wc -l',
+      'echo "$GITHUB_TOKEN" | docker login ghcr.io -u x --password-stdin', 'printf %s "$NPM_TOKEN" | gh secret set NPM_TOKEN',
+      'echo $GITHUB_TOKEN > t.txt', 'git commit -m "docs: mention ~/.claude.json"', 'echo ~/.codex/auth.json', 'ls ~/.codex',
+      'cat src/credentials/oauth.ts', 'cat secrets/README.md', "gci env:G*", "jq -n 'env'", 'ps eww']) L('notdeny', 'Bash', c);
+    L('notallow', 'Bash', 'npm run env');
+    // Attacks.
+    for (const c of ['/usr/bin/env', 'command env', 'sudo env', 'env -0', 'env FOO=1', 'env | cat', 'env | grep -i token', 'env > /tmp/e',
+      'printenv ATLASSIAN_API_TOKEN', 'printenv | sort', 'set | head', 'export', 'declare -p', 'typeset -x', 'bash -c env', 'echo "$(env)"', 'eval env',
+      'cat /proc/$PPID/environ', 'cat /proc/self/task/1/environ', 'echo ${CLOUDFLARE_API_TOKEN}', 'printf "%s" "$RESEND_API_KEY"',
+      'echo "x$FORLATER_ADMIN_PASSWORD" >&2', 'cat <<< "$GITHUB_TOKEN"', 'echo $GITHUB_TOKEN | base64', "bash -c 'echo $GITHUB_TOKEN'",
+      'echo ${GITHUB_TOKEN:0:8}', "node -e 'console.log(process.env)'", "node -p 'JSON.stringify(process.env)'",
+      "node -e 'console.log(process.env.GITHUB_TOKEN)'", "python3 -c 'import os; print(os.environ)'"]) L('deny', 'Bash', c);
+    for (const c of ['Get-ChildItem Env:', 'gci env:', 'dir env:', 'Write-Output $env:GITHUB_TOKEN', 'echo $env:GITHUB_TOKEN', 'Get-ChildItem Env: | Format-List']) L('deny', 'PowerShell', c);
+    // Credential-looking names under home: ask, deny with a token inside, never in the project, a cache or source.
+    L('deny', 'Read', path.join(lh, '.config', 'leaky', 'api-token'));
+    L('deny', 'Read', path.join(lh, 'rc2', '.zshenv'));
+    for (const p of [path.join(lh, '.zshenv'), path.join(lp, 'fixtures', 'token.json'), path.join(lh, '.cache', 'huggingface', 'hub', 'x', 'tokenizer.json'),
+      path.join(lh, 'proj2', 'node_modules', 'x', 'token.js'), path.join(lh, 'other', 'src', 'auth', 'token.ts'), path.join(lh, 'secrets', 'README.md'),
+      path.join(lp, 'secrets', 'README.md'), path.join(lp, 'docs', 'cookies.md'), path.join(lp, 'src', 'Default', 'Cookies.tsx')]) L('notdeny', 'Read', p);
+    // `process.env.X` in code is the runtime's environment; a FILE named process.env / meta.env is a .env file.
+    for (const c of ['cat process.env', 'cat meta.env', 'cp Bun.env /tmp/x', 'cat Deno.env', 'cat process.env.local', 'cat import.meta.env',
+      'tar czf /tmp/x.tgz process.env', 'cat PROCESS.env', 'x=process.env; cat $x']) L('deny', 'Bash', c);
+    for (const c of ['node -e "console.log(process.env.TEMP)"', "node -e 'console.log(process.env[\"NODE_ENV\"])'"]) L('notdeny', 'Bash', c);
+    fs.rmSync(lh, { recursive: true, force: true });
+  }
   // Code review of fix round 4 (I1-I3).
   // I1: an installer line is exactly one curl/wget with quiet/follow flags and one installer URL.
   for (const l of [
@@ -4296,7 +4350,7 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
   testFile('fix5 I1 twin: rustup with --proto =https falls through', 'Write', { file_path: 'Makefile', content: 'all:\n\t' + CU + " --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs " + SH + '\n' }, 'fallthrough');
   // I2: credential words run together (no `_`) are secrets; SECRET is never a benign tail.
   for (const n of ['GITHUBTOKEN', 'JWTSECRET', 'SECRETKEY', 'NPMTOKEN', 'ACCESSTOKEN', 'PRIVATEKEY', 'STRIPE_SECRET_KEY_ID']) {
-    testBash('fix5 I2: echo $' + n + ' does not approve', 'echo $' + n, 'fallthrough');
+    testBash('fix5 I2: echo $' + n + ' denies', 'echo $' + n, 'deny');
     testBash('fix5 I2: $' + n + ' in a curl body denies', CU + ' -d "$' + n + '" ' + AT, 'deny');
   }
   for (const n of ['TOKENIZERS_PARALLELISM', 'PRIVATE_REGISTRY_URL']) testBash('fix5 I2 twin: echo $' + n + ' allows', 'echo $' + n, 'allow');

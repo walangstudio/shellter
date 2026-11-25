@@ -49,10 +49,31 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
   JSON `--config`, any runner argument in a temp dir or Downloads (`pytest /tmp/x`, `-vettool=/tmp/x`),
   and a `cd` (`cd --` too) into a temp dir, `/dev/shm` or Downloads. The project's own config files,
   output paths in `/tmp` and sibling checkouts still approve.
-- **Environment dumps prompt**: `env`, bare `printenv`, `export -p`, `ps e`, `echo $SECRET_NAME`, awk
-  `ENVIRON`, jq `env`/`$ENV`, yq `env()`, PowerShell `Get-ChildItem Env:`, `env:G*`, a computed path,
-  `GetEnvironmentVariable`. `printenv PATH`, `ps -C node`, a test operand (`[ -n "$KEY" ]`),
-  `${KEY:+set}` and an escaped `\$TOKEN` still approve. `npm config get` of an auth or token key prompts.
+- **Printing the environment or a secret into the transcript denies**: `env`, `printenv` (bare or a
+  secret name), `export`/`export -p`, bare `set`, `declare -x`/`-p`, `typeset -x`, behind `sudo`,
+  `command`, `bash -c`, `eval` or `$(..)`, and piped only through readers (`env | grep -i token`,
+  `env > /tmp/e`); `echo`/`printf`/`<<<` of a secret-named variable reaching the screen;
+  `node -e 'console.log(process.env)'`, `python3 -c 'print(os.environ)'` and their one-secret forms;
+  PowerShell `Get-ChildItem Env:`, `echo $env:GITHUB_TOKEN`. A count (`env | wc -l`), a pipe into a
+  consumer (`echo "$T" | docker login --password-stdin`), a write to a file, `set -euo pipefail`,
+  `declare -A` and `compgen -v` do not deny. Other dumps prompt: `ps e`, awk `ENVIRON`, jq `env`/`$ENV`,
+  yq `env()`, `env:G*`, a computed path, `GetEnvironmentVariable`, `npm run env`. `printenv PATH`,
+  `ps -C node`, a test operand (`[ -n "$KEY" ]`), `${KEY:+set}` and an escaped `\$TOKEN` still approve.
+  `npm config get` of an auth or token key prompts. `env NODE_ENV=test npm test` approves as
+  `NODE_ENV=test npm test` does.
+- **Credential stores deny from the shell as from Read**: `~/.claude.json` (was a prompt),
+  `~/.codex/auth.json`, `~/.bitbucket-rest-cli-config.json`, `~/.atlassian-rest-cli-config.json`,
+  `~/.config/figma/token`, `~/.mobiledev/authtoken`, `~/.emulator_console_auth_token`,
+  `~/.conda/aau_token`, `client_secret*.json`, `credentials.json`, a `.dailyclones-runner` dir, browser
+  profile `Cookies`/`Login Data`/`Web Data`/`Trust Tokens`, and `/proc/*/environ` at any depth
+  (`/proc/self/task/1/environ`). `cat`, `jq`, `python3 -c open(..)` all deny. `process.env.X`,
+  `import.meta.env` are not a `.env` file. Mentioning a path (`echo`, `ls`, a commit message) never
+  denies, nor does a README or `.md` in a `secrets/` dir.
+- **A credential-looking file under home and outside the project prompts on Read/Grep** (`api-token`,
+  `auth.json`, `*credential*`, `*.enc`) and denies when its first 64 KB hold a token shape (GitHub,
+  AWS, Slack, JWT, Atlassian, a private key). An rc file (`.zshenv`, `.bashrc`, ..) denies only when it
+  exports a secret-named variable. Project files, package caches (`node_modules`, `site-packages`),
+  source files and tokenizer files never count.
 - **A `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`, `__fixtures__/` or `testdata/` dir**
   is not denied but prompts when a stage reads it (a listing or `git add` keeps its result); after a `cd`
   or `ln` in the command, or through a symlink out of the project, a read denies.
@@ -68,7 +89,7 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
 - **False denies removed**: Glob lists names and reads nothing, so it never denies; `cat ~/.gitconfig`
   names the right reason.
 
-3140 tests in test-hooks.js (2657 at 0.11.0).
+3255 tests in test-hooks.js (2657 at 0.11.0).
 
 ## [0.11.0] - 2026-11-18
 

@@ -189,7 +189,7 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(?:env\s+)?(?:[\w.~\\/-]{0,128}[\\/])?(curl
 const SENSITIVE_EXTENSIONS = /\.(?:env(?!\.(?:example|sample|template|dist|defaults?)\b)|pem|key|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
 // .gitconfig deliberately excluded: tokens normally live in .git-credentials.
-const SENSITIVE_FILES = /(^|\/)(\.git-credentials|_netrc|proc\/[^\/]+\/environ|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
+const SENSITIVE_FILES = /(^|\/)(\.git-credentials|_netrc|proc\/(?:[^\/]+\/)+environ|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
 const ENV_FILE = /(^|\/)\.env(?:rc|[_-][A-Za-z0-9_-]+)?(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
 const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 // A source-code file inside a dir named credentials/secrets is code, not a secret
@@ -206,6 +206,8 @@ const CMD_DEF = /(?:^|[\\/])(?:package\.json|makefile|GNUmakefile|[^\\/]*\.mk|bu
 // Only inside the project (`/etc/ssl/private/tests/server.key` is not fixture data).
 const TEST_KEY = /^(?:[^\\/]+[\\/])*(?:test|tests|fixtures|__fixtures__|testdata)[\\/](?:[^\\/]+[\\/])*[^\\/]+\.(?:pem|key)$/i;
 let projectRoot = process.cwd();
+let credHome = '';
+try { credHome = require('os').homedir(); } catch (_) { /* no home: the name heuristic is off */ }
 const testKey = (p) => {
   const r = path.relative(projectRoot, path.resolve(projectRoot, p));
   if (r.startsWith('..') || path.isAbsolute(r) || !TEST_KEY.test(r)) return false;
@@ -226,7 +228,7 @@ const SHELLTER_PLUGIN_CACHE = /(^|\/)\.claude\/plugins\/(?:cache|marketplaces)\/
 const CLAUDE_SETTINGS = /(^|\/)\.claude\/settings(?:\.local)?\.json$/i;
 // The user's own shell history and Claude config: plausibly holds a pasted token, but
 // reading it is also routine. Ask, never deny.
-const PERSONAL_HISTORY = /(^|\/)(?:\.(?:bash|zsh)_history|\.claude\.json)$/i;
+const PERSONAL_HISTORY = /(^|\/)\.(?:bash|zsh)_history$/i;
 // macOS Keychain databases.
 const MACOS_KEYCHAIN = /(^|\/)(Library\/Keychains\/|login\.keychain(-db)?$|System\.keychain$)/i;
 // Windows credential / hive files. The bare hive names (SAM/SYSTEM/SECURITY) require a
@@ -321,12 +323,14 @@ function pathMatchesAnySensitive(p) {
   if (SENSITIVE_DIRS.test(p)) return 'sensitive directory/file';
   if (SENSITIVE_FILES.test(p)) return 'sensitive credential file';
   if (ENV_FILE.test(p)) return '.env file';
-  if (SECRETS_DIR.test(p) && !CODE_FILE_EXT.test(p)) return 'secrets/credentials directory';
+  // A README, Markdown doc, LICENSE or .gitkeep in a secrets/ dir documents it; it is not a credential.
+  if (SECRETS_DIR.test(p) && !CODE_FILE_EXT.test(p) && !/(?:^|\/)(?:README[^\/]*|LICENSE[^\/]*|\.gitkeep|[^\/]+\.md)$/i.test(p)) return 'secrets/credentials directory';
   if (WALLET_PATTERN.test(p)) return 'wallet / crypto key file';
   if (BROWSER_DATA_PATTERN.test(p)) return 'browser cookie/login database';
   if (MACOS_KEYCHAIN.test(p)) return 'macOS Keychain database';
   if (WINDOWS_SECRETS.test(p)) return 'Windows credential / registry hive';
   if (UNIX_SHADOW.test(p)) return 'Unix password-hash / sudoers file';
+  if (scan.CRED_PATH_RE.test(p) || /(?:^|\/)credentials\.json$/i.test(p)) return 'credential file';
   return null;
 }
 
@@ -511,6 +515,12 @@ watchdog.input((data) => {
     }
     if (WRITE_TOOLS.has(tool) && CLAUDE_SETTINGS.test(p)) {
       pendingAsk = pendingAsk || { reason: 'Editing Claude Code settings (allow rules, hooks)', snippet: p };
+    }
+    // A credential-looking name under home and outside the project: asked, denied when it holds a token.
+    if ((tool === 'Read' || tool === 'Grep') && credHome) {
+      const v = scan.credVerdict(path.resolve(projectRoot, p), credHome, path.resolve(projectRoot));
+      if (v === 'deny') deny('Credential file blocked: its content holds a secret', p);
+      if (v === 'ask') pendingAsk = pendingAsk || { reason: 'File name looks like a credential store', snippet: p };
     }
     if (PERSONAL_HISTORY.test(p)) {
       pendingAsk = pendingAsk || { reason: 'Shell history / Claude config may hold tokens', snippet: p };

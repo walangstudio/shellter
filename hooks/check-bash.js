@@ -1092,7 +1092,9 @@ function ask(reason, snippet) {
 // Directory tokens use `\b` (not a trailing slash) so archiving a whole `~/.ssh`
 // dir is caught, not just reading one file inside it.
 const SECRET_TOKENS = '(?:' + [
-  '\\.env\\b(?!\\.(?:example|sample|template|dist|defaults?)\\b)',
+  // `process.env.NODE_ENV`, `import.meta.env` and `Deno.env` are the runtime's variables, not a .env file.
+  // Only in code shape (`process.env.X)`, `process.env[`): a file named `process.env` is still a .env file.
+  '(?:(?<!\\b(?:process|meta|Deno|Bun))|(?!\\.env(?:\\.\\w+)?\\s*[)\\],;+[]))\\.env\\b(?!\\.(?:example|sample|template|dist|defaults?)\\b)',
   // A key a test suite ships (`test/fixtures/fake_key.pem`, a relative path with no `..`) is fixture data.
   '(?<!(?:^|[\\s\'"=])(?![~\\\\/]|[A-Za-z]:|[^\\s\'"]*\\.\\.)(?:[^\\s\'"]*[\\\\/])?(?:test|tests|fixtures|__fixtures__|testdata)[\\\\/][^\\s\'"]*)\\.(?:pem|key)\\b',
   '\\.secret\\b', '\\.p12\\b', '\\.pfx\\b',
@@ -1103,12 +1105,13 @@ const SECRET_TOKENS = '(?:' + [
   '[\\\\/]credentials(?![\\w./])', 'credentials\\.(?:json|ya?ml|toml|ini|txt|xml|env|conf|cfg|properties|store)\\b', '\\.git-credentials\\b',
   '\\.ssh\\b', '\\.gnupg\\b', '\\.aws\\b', '\\.gcloud\\b', '\\.azure\\b',
   '\\.docker[\\\\/]config', '\\.gitconfig\\b',
-  '\\.kube[\\\\/]config', '\\.config[\\\\/]gh[\\\\/]hosts', '[\\\\/]proc[\\\\/][^\\\\/\\s]+[\\\\/]environ',
+  '\\.kube[\\\\/]config', '\\.config[\\\\/]gh[\\\\/]hosts', '[\\\\/]proc[\\\\/]\\S*?[\\\\/]environ\\b',
   // Unix credential stores: password hashes and the sudoers policy. Anchored to
   // `/etc/` so the bare word "shadow" (box-shadow, shadow DOM, a game asset) never
   // matches; `master.passwd` is the BSD/macOS shadow file. `/etc/passwd` is NOT here
   // -- it is world-readable and holds no secret.
   '[\\\\/]etc[\\\\/](?:g?shadow|sudoers|master\\.passwd)\\b',
+  ...scan.CRED_PATH_SRC,   // the same credential stores the file tools deny (scan-content.js)
 ].join('|') + ')';
 
 // Persistence / credential WRITE targets. Writing INTO these (redirect, tee,
@@ -1913,8 +1916,104 @@ function secretVarToNet(v) {
   return null;
 }
 
+// ---- printing the environment or a secret variable into the transcript --------------------------
+// These judge a whole pipeline: `env | wc -l` prints a count, so a lone stage (the per-stage recursion
+// of checkSegmentDeny) is never judged on its own.
+let inPipeStage = false;
+const PASS_THROUGH = new Set([...READ_VERB_SET, 'tee', 'Format-List', 'fl', 'Format-Table', 'ft', 'Sort-Object', 'sort',
+  'Where-Object', 'where', '?', 'Select-Object', 'select', 'Out-String', 'Out-Host', 'oh', 'more']);
+const STAGE_PREFIX = /^(?:sudo|doas|command|builtin|exec|nohup|time|nice|stdbuf|-\S+)$/;
+function dumpStage(st) {
+  const toks = [];
+  const raw = tokenizeArgs(st);
+  for (let k = 0; k < raw.length; k++) {
+    const r = /^\d*(?:>>?|<|&>>?)(.*)$/.exec(raw[k]);
+    if (r) { if (r[1] === '') k++; continue; }   // a redirect and, when it stands alone, its target
+    toks.push(raw[k]);
+  }
+  let at = 0;
+  while (at < toks.length && (/^[A-Za-z_]\w*=/.test(toks[at]) || STAGE_PREFIX.test(toks[at]))) at++;
+  return { cmd: base(toks[at] || '').replace(/^\\/, ''), args: toks.slice(at + 1), text: st };
+}
+// Every later stage only passes text on; the last one is not redirected into a file.
+function reachesTranscript(stages, k, toFileOk) {
+  for (let j = k + 1; j < stages.length; j++) if (!PASS_THROUGH.has(stages[j].cmd)) return false;
+  return toFileOk || !/(?:^|[^<>&\d])\d?>>?\s*(?!&|\/dev\/(?:stdout|stderr|tty|fd\/))\S/.test(stages[stages.length - 1].text.replace(/'[^']*'|"[^"]*"/g, ''));
+}
+function envDumpStage(w) {
+  const a = w.args;
+  if (isPoshTool) {
+    return /^(?:Get-ChildItem|gci|ls|dir|Get-Item|gi)$/i.test(w.cmd) && a.filter((t) => !/^-(?:Path|LiteralPath|Force)$/i.test(t)).length === 1 &&
+      /^env:\\?$/i.test(a.filter((t) => !/^-/.test(t))[0] || '');
+  }
+  switch (w.cmd) {
+    case 'env': {
+      let k = 0;
+      while (k < a.length) {
+        if (/^(?:-0|--null)$/.test(a[k]) || /^--unset=/.test(a[k]) || /^[A-Za-z_]\w*=/.test(a[k])) { k++; continue; }
+        if (/^(?:-u|--unset)$/.test(a[k])) { k += 2; continue; }
+        break;
+      }
+      return k >= a.length;
+    }
+    case 'printenv': { const n = a.filter((t) => !/^-/.test(t)); return !n.length || n.some(secretVarName); }
+    case 'set': return !a.length;
+    case 'export': { const n = a.filter((t) => t !== '-p'); return !n.length || (a.includes('-p') && n.some(secretVarName)); }
+    case 'declare': case 'typeset': {
+      const f = a.filter((t) => /^-/.test(t)), n = a.filter((t) => !/^-/.test(t));
+      if (f.some((t) => !/^-[pxgrl]+$/.test(t))) return false;
+      return !n.length ? true : f.some((t) => t.includes('p')) && n.some(secretVarName);
+    }
+  }
+  return false;
+}
+function envDump(seg) {
+  if (inPipeStage) return null;
+  if (isPoshTool && /GetEnvironmentVariables\s*\(|\bcmd(?:\.exe)?\s+\/c\s+set\s*(?:$|[|;&])/i.test(seg)) return 'Printing the whole environment blocked -- it holds the user tokens. Read one non-secret variable instead.';
+  const stages = splitPipeStages(stripUnquotedComment(seg)).map(dumpStage);
+  for (let k = 0; k < stages.length; k++) {
+    if (envDumpStage(stages[k]) && reachesTranscript(stages, k, true)) {
+      return 'Printing the whole environment blocked -- it holds the user tokens. Read one non-secret variable with printenv NAME.';
+    }
+  }
+  return null;
+}
+const PRINTERS = /^(?:echo|printf|print|Write-Output|Write-Host|write)$/i;
+function secretVarPrinted(seg) {
+  if (inPipeStage) return null;
+  const stages = splitPipeStages(stripUnquotedComment(seg)).map(dumpStage);
+  for (let k = 0; k < stages.length; k++) {
+    const w = stages[k];
+    const src = (PRINTERS.test(w.cmd) && secretVarRef(unexpanded(w.text.replace(/^\s*\S+/, '')))) ||
+      (/<<<\s*/.test(w.text) && secretVarRef(unexpanded(w.text.slice(w.text.indexOf('<<<') + 3))));
+    if (src && reachesTranscript(stages, k, false)) {
+      return 'Printing a secret environment variable blocked -- it would land in the transcript. Check it with [ -n "$X" ] or ${X:+set}.';
+    }
+  }
+  return null;
+}
+// `node -e 'console.log(process.env)'`, `python -c 'print(os.environ)'`, or a print of one secret-named entry.
+function interpEnvDump(seg) {
+  const s = stripUnquotedComment(seg);
+  if (/\b(?:node|deno|bun)\b[^|;&]*\s-(?:e|p|-eval|-print)\b/.test(s)) {
+    if (/\s-(?:p|-print)\s+['"]?process\.env['"]?(?:\s|$)/.test(s) ||
+        /(?:console\.\w+|JSON\.stringify|process\.std(?:out|err)\.write|util\.inspect|Object\.(?:entries|values))\s*\(\s*process\.env\s*[),]/.test(s)) return 'Printing the environment from an inline script blocked.';
+    for (const m of s.matchAll(/console\.\w+\s*\([^)]*process\.env(?:\.([A-Za-z_]\w*)|\[\s*['"]([A-Za-z_]\w*)['"]\s*\])/g)) {
+      if (secretVarName(m[1] || m[2])) return 'Printing a secret environment variable from an inline script blocked.';
+    }
+  }
+  if (/\bpython[\d.]*\b[^|;&]*\s-c\b/.test(s)) {
+    if (/print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)/.test(s)) return 'Printing the environment from an inline script blocked.';
+    for (const m of s.matchAll(/print\s*\([^)]*?(?:os\.environ\s*\[\s*['"]([A-Za-z_]\w*)['"]\s*\]|os\.(?:environ\.get|getenv)\s*\(\s*['"]([A-Za-z_]\w*)['"])/g)) {
+      if (secretVarName(m[1] || m[2])) return 'Printing a secret environment variable from an inline script blocked.';
+    }
+  }
+  return null;
+}
+
 const DENY_PATTERNS = [
   [tokenizedSensitiveRead, null],
+  [envDump, null], [secretVarPrinted, null], [interpEnvDump, null],
   [namedSecretPipelineRead, null],
   // Encoded payload execution
   [/(base64|b64)\s*(--)?d(ecode)?\s*.*\|\s*(?:(?:[^\s]*\/)?(bash|sh|zsh|dash|ash|ksh|fish|python[23]?|perl|ruby|node|deno|bun|php|lua|tclsh)|eval)\b/i,
@@ -2293,6 +2392,10 @@ const POSH_DENY_PATTERNS = [
     'Copying a sensitive file (target-flag form) blocked -- possible exfiltration'],
   [new RegExp('\\[(?:System\\.)?IO\\.File\\]::(?:Copy|Move|Replace)\\s*\\([^)]*' + SECRET_TOKENS, 'i'),
     'Copying a sensitive file via .NET blocked -- possible exfiltration'],
+  // An inline interpreter writing the trust store (`node -e "fs.writeFileSync(process.env.HOME+'/.claude/shellter-trust.json')"`).
+  [new RegExp('\\b(?:python[0-9.]*|node|deno|bun|ruby|perl|php)\\b[^|]*(?:-[A-Za-z]{0,3}[ceprE][A-Za-z]{0,3}\\b|--eval\\b|\\beval\\s)[^|]*' +
+    '(?:write|append|copy|rename|move|unlink|symlink|open)[^|]*\\.claude[\\\\/]+shellter-trust\\.json', 'i'),
+    'Writing the shellter trust store blocked -- trust a script with `node shellter-trust.js add <path>`'],
   // Inline interpreter referencing a sensitive file (python -c / node -e / php -r /
   // deno eval / perl -ne ...). Flag set covers each interpreter's eval form. Spans
   // use `[^|]*` (not `[^;|]*`) because the `;` lives inside the quoted code string
@@ -2662,7 +2765,7 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
   if (depth === undefined) depth = 0;
   if (mode === undefined) mode = 'hard';
   if (depth > 6) { noteGap('nesting-depth'); return; }
-  const key = mode + '\0' + depth + '\0' + (extraVariant || '') + '\0' + seg;
+  const key = mode + '\0' + depth + '\0' + (inPipeStage ? 1 : 0) + '\0' + (extraVariant || '') + '\0' + seg;
   if (segChecked.has(key)) return;
   segChecked.add(key);
 
@@ -2754,7 +2857,11 @@ function checkSegmentDeny(seg, depth, mode, extraVariant) {
 
   // Every pipe stage is a command of its own (`ls | xargs sh -c '...'`).
   const stages = splitPipeStages(seg);
-  if (stages.length > 1) for (const st of stages) checkSegmentDeny(st, depth + 1, mode);
+  if (stages.length > 1) {
+    const prev = inPipeStage;
+    inPipeStage = true;
+    try { for (const st of stages) checkSegmentDeny(st, depth + 1, mode); } finally { inPipeStage = prev; }
+  }
 }
 
 // A segment carrying a heredoc writes its body: every redirect target and `tee` file must be a
@@ -4414,6 +4521,24 @@ function approveArgv(words, vals, depth, approvedScripts) {
     }
     if (at >= toks.length) return false;
     if (/^[A-Za-z_]\w*=/.test(toks[at])) return false;      // `time X=v cmd`: not modelled
+    return approveArgv(sub0(words, at), vals, depth + 1, approvedScripts);
+  }
+  // `npm run env` prints the whole environment npm builds for scripts.
+  if (/^(?:npm|pnpm|yarn)$/.test(w0) && toks.some((t, k) => k > 0 && /^(?:run|run-script)$/.test(toks[k - 1]) && t === 'env')) return false;
+  // `env NODE_ENV=test npm test`, `env -u FOO cmd`: the same test a plain `NODE_ENV=test npm test` gets.
+  if (w0 === 'env') {
+    const envs = [];
+    let at = 1;
+    while (at < toks.length) {
+      const t = toks[at];
+      if ((t === '-u' || t === '--unset') && words[at + 1] && words[at + 1].lit) { at += 2; continue; }
+      if (/^--unset=\w+$/.test(t)) { at++; continue; }
+      const m = /^([A-Za-z_]\w*)=(.*)$/.exec(t);
+      if (m && words[at].lit) { envs.push({ name: m[1], raw: m[2] }); at++; continue; }
+      break;
+    }
+    if (at >= toks.length || toks[at].startsWith('-')) return false;
+    if (!envOk(envs, base(toks[at]))) return false;
     return approveArgv(sub0(words, at), vals, depth + 1, approvedScripts);
   }
   if (w0 === 'trap') {
