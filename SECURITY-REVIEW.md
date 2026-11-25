@@ -336,7 +336,7 @@ prompting; the hooks `package.json` deny not normalised. All fixed and pinned.
   check gives up on alias resolution and the untracked `settings.local.json` is not honoured (its scripts ask).
 - **`merge-settings.js` replaces an existing `~/.claude/hooks/package.json`** with `{"type":"commonjs"}`.
 - **Glob `.npm*`, `.np*`, `**/.net*` deny** (literal prefix of `.npmrc` / `.netrc`, intended). Since 0.11.1
-  a Glob name pattern falls through; only a walked secret directory denies.
+  Glob falls through: it lists names and reads nothing.
 - **A Write of this repository's own `CHANGELOG.md` denies**: the entry quotes an encoded-exec call form.
 - **CI has not run the two new gates on hosted runners**; `test-perf.js` has a 3 s wall-clock bound.
 
@@ -349,7 +349,8 @@ found five attack classes auto-approved by 0.11.0 and 0.10.0, three parity holes
 | --- | --- | --- |
 | A secret-shaped variable in a curl/wget URL, body, `-F`, `-A`, or piped to nc/curl | allow | deny |
 | A secret-shaped variable in a header or `-u` value | allow | fallthrough (decision: how tokens are meant to be sent) |
-| B written content with a secret upload or download-exec (heredoc/echo/printf/`sed -i`, Write/Edit of `package.json`, Makefile, ...) | allow | deny |
+| B written content with a secret upload, reverse shell or download-exec, then run in the same command | allow | deny |
+| B a secret upload or reverse shell in a command-definition file (shell write, Write/Edit) | allow | deny |
 | B unreadable content (`cp`, `curl -o`, `wget`, `git apply`) into a command-definition file, then a runner | allow | fallthrough |
 | C `--script-shell`, `go -exec`, `cargo --config`, `pytest -p`, `node -r`, `make SHELL=`, a config or `cd` in a temp dir | allow | fallthrough |
 | D `env`, `printenv`, `export -p`, `ps e`, `echo $TOKEN`, `Get-ChildItem Env:` | allow | fallthrough |
@@ -357,13 +358,58 @@ found five attack classes auto-approved by 0.11.0 and 0.10.0, three parity holes
 | PowerShell writes to shellter's files, trust store, settings (incl. `Copy-Item -Destination`, `>`, `Set-Location`) | fallthrough | deny / ask (as bash) |
 | PowerShell injection text into CLAUDE.md (positional, named, piped, `>`) | fallthrough | deny |
 | Write/Edit `.git/hooks/*` with download-exec content | fallthrough | deny |
-| Glob `**/.env*` (names only) | deny | fallthrough |
-| Read/cat a `.pem`/`.key` under a project test or fixtures dir | deny | fallthrough / allow |
+| Glob (names only, any pattern or directory) | deny | fallthrough |
+| Read/cat a `.pem`/`.key` under a project test or fixtures dir | deny | fallthrough (deny after `cd`/`ln` or through a symlink out) |
 
 Out of scope, unchanged: destructive and tamper commands that fall through in bypass mode.
 Accepted limit: source code that reads `.env` and posts it (JS `readFileSync` + `fetch`, Python, Go, Rust)
 is not detected in a Write or a shell write; a runner after it still approves. A two-call split
 (Write, then `npm test`) was never covered by the same-command rule, so the content scan is the control.
+
+### Adversarial review of the 0.11.1 fixes (2026-11-23)
+
+A second pass over `ed72d3a..f7911a0` (`hooks/`) found regressions and misses in the fixes above. All fixed and
+pinned in test-hooks.js (attack probe and benign twin each).
+
+| Finding | f7911a0 | fixed |
+| --- | --- | --- |
+| A1 `curl -O` of `CLAUDE.md`, `.mcp.json`, `PACKAGE.JSON`, a dotfile, into `.github/workflows` or `~/.claude` | allow | fallthrough |
+| A2 download + unpack + git; an unpack into `.git` / `.claude`; a downloaded archive into the project root | allow | fallthrough |
+| A3 fixture-key exemption after `cd` / `ln` or through a symlink out of the project | allow | deny; a fixture key never approves |
+| A4 secret gate blind to `'` inside double quotes and to `sh -c '..'` | allow | fallthrough |
+| A5 `gci env:G*`, a computed env path, awk `ENVIRON`, jq `env`, yq `env()` | allow | fallthrough |
+| A6 a recipe hidden behind printf / `echo -e` escapes, then run | allow | deny |
+| A7 foreign content into a test or tool config, case variants, loops and traps, then a runner | allow | fallthrough |
+| A8 a literal Makefile / package.json that publishes or pushes, then a runner | allow | fallthrough |
+| A9 `cd --`, `/dev/shm`, runner arguments in a temp dir, more code-loading flags, `npm_config_*` | allow | fallthrough |
+| A10 PowerShell wildcard `cd` into `~/.claude`, then a delete | allow | deny |
+| B1 `curl -du=$TOKEN`, `wget -H`, a `'` in a quoted URL, `stdbuf`, PowerShell `& curl.exe` | fallthrough | deny |
+| B2 PowerShell abbreviated / colon-bound parameters, wildcards, script blocks, pipes, `New-Item -Name`, `Expand-Archive`, `[IO.File]` | fallthrough | deny / ask |
+| B3 PowerShell CLAUDE.md injection via `New-Item`, `Tee-Object`, `% { }`, `[IO.File]`, a `>` in the value | fallthrough / ask | deny |
+| B4 Write `Package.json` / `MAKEFILE` / `composer.json` / `.husky/*` with a secret upload | fallthrough | deny |
+| C1 `$MAX_TOKENS`, `$NEXT_PAGE_TOKEN`, `$TOKEN_TYPE`, `$KEY_FILE`, `$key`, cookie / bearer / cert values | deny | fallthrough (allow for a loop variable) |
+| C2 an installer line written to a README, Dockerfile, docs, a setup script, a Makefile | deny | allow / fallthrough |
+| D1 loop variables, test operands, `${X:+set}`, an escaped `\$TOKEN` | fallthrough | allow |
+| D2 `for d in packages/*; do (cd "$d" && ..)`, `cd "$CLAUDE_PROJECT_DIR"` | fallthrough | allow |
+| D3 `ps -C node`, `ps -u postgres` | fallthrough | allow |
+| D4 `printenv PATH`; Glob of a secret directory | fallthrough; deny | allow; fallthrough |
+
+A code review of those fixes found more, also fixed and pinned:
+
+| Finding | fixed |
+| --- | --- |
+| `$DB_PASSWORD`, `$PGPASSWORD`, `$SSH_PRIVATE_KEY`, `$X_CREDENTIALS` dropped from the secret names | prompt (print) / deny (send) |
+| `echo do test $TOKEN`, `[ $TOKEN -eq 1 ]` read as a test operand; `ps aux e` | fallthrough |
+| A lifecycle script matched on raw JSON (`|`); unparseable package.json | JSON-decoded; unparseable is scanned whole |
+| An unpack after `cd "$(..)"` / `cd $D` | fallthrough |
+| `[IO.File]::Move` source, `[IO.Directory]::Delete`, `Set-Location ~; Remove-Item -Recurse .claude` | deny |
+| A literal Makefile recipe that no rule names (`node -e ..`), `$(shell ..)`, `include`, `SHELL :=` | fallthrough: every recipe must approve |
+| `curl -O` into a home dot directory (`~/.config/gh`, `~/.docker`) | fallthrough |
+| `npm config get //registry/:_authToken` | fallthrough |
+
+Left: `cd - && npm test` still prompts (OLDPWD is unknown). A runner after a `cd` to a directory outside the project
+that is not a temp dir or Downloads (`cd /opt/other && make`, `cd ~/Desktop/x && npm test`) still approves: it is
+indistinguishable from the sibling checkouts agents test from a parent folder.
 
 ## Read the verdict labels precisely
 

@@ -3,7 +3,7 @@
 [![version](https://img.shields.io/badge/version-0.11.1-blue)](CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#installation)
-[![tests](https://img.shields.io/badge/tests-2807%20passing-brightgreen)](test-hooks.js)
+[![tests](https://img.shields.io/badge/tests-3140%20passing-brightgreen)](test-hooks.js)
 
 Security hooks that keep AI coding agents from running dangerous commands or leaking
 secrets. PreToolUse hooks auto-allow safe operations and block dangerous ones on `Bash`,
@@ -32,7 +32,7 @@ Unix parsing, PowerShell gets PS parsing and the PowerShell/cmd rule sets.
 
 **check-sensitive-files.js** — gates `Read`, `Write`, `Edit`, `Glob`, `Grep`.
 - Resolves symlinks first (`ln -s ~/.env /tmp/x; Read /tmp/x` is blocked)
-- Blocks `.env*` (`.example`/`.sample`/`.template` excluded), `.pem`, `.key`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, and their `.bak`/`.old`/`.backup` variants. Public `.crt` certificates are not treated as secrets, nor a `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`, `__fixtures__/` or `testdata/` dir. Glob lists names only, so it denies only when it walks a secret directory (`.ssh/**`)
+- Blocks `.env*` (`.example`/`.sample`/`.template` excluded), `.pem`, `.key`, `.p12`, `.pfx`, `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.kube/`, and their `.bak`/`.old`/`.backup` variants. Public `.crt` certificates are not treated as secrets, nor a `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`, `__fixtures__/` or `testdata/` dir unless it resolves outside the project. Glob lists names only and never denies
 - Blocks credential files: `.gitconfig`, `.git-credentials`, `.npmrc`, `.pypirc`, `.cargo/credentials`, `.docker/config.json`, `.config/gh/hosts.yml`, `.ssh/config`; and non-code files under a `secrets/`/`credentials/` directory (a source file like `credentials/oauth.ts` is treated as code, not a secret)
 - Blocks wallets/keystores, browser-cookie DBs, macOS Keychain, Windows secrets (`*.ppk`, `NTUSER.DAT`, registry hives under a `…\config\` path (`SAM`/`SYSTEM`/`SECURITY` — a repo file named `SECURITY` is not flagged), `AppData\…\Credentials`)
 - Prompt-injection detection in written content is **two-tier** (see [Injection-on-write](#injection-on-write)):

@@ -202,11 +202,16 @@ const CODE_FILE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|
 const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
 // A key or certificate a test suite ships (`test/fixtures/fake_key.pem`) is fixture data.
 // Files whose content is a command a runner runs (kept in step with check-bash.js CMD_DEF).
-const CMD_DEF = /(?:^|[\\/])(?:package\.json|[Mm]akefile|GNUmakefile|[^\\/]*\.mk|build\.rs|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|pytest\.ini|noxfile\.py|\.npmrc|\.yarnrc(?:\.yml)?|Cargo\.toml|config\.toml|Rakefile|[Jj]ustfile|Taskfile\.ya?ml)$/;
+const CMD_DEF = /(?:^|[\\/])(?:package\.json|makefile|GNUmakefile|[^\\/]*\.mk|build\.rs|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|pytest\.ini|noxfile\.py|\.npmrc|\.yarnrc(?:\.yml)?|Cargo\.toml|config\.toml|Rakefile|justfile|Taskfile\.ya?ml|composer\.json|deno\.jsonc?|\.husky[\\/][^\\/]+)$/i;
 // Only inside the project (`/etc/ssl/private/tests/server.key` is not fixture data).
 const TEST_KEY = /^(?:[^\\/]+[\\/])*(?:test|tests|fixtures|__fixtures__|testdata)[\\/](?:[^\\/]+[\\/])*[^\\/]+\.(?:pem|key)$/i;
 let projectRoot = process.cwd();
-const testKey = (p) => { const r = path.relative(projectRoot, path.resolve(projectRoot, p)); return !r.startsWith('..') && !path.isAbsolute(r) && TEST_KEY.test(r); };
+const testKey = (p) => {
+  const r = path.relative(projectRoot, path.resolve(projectRoot, p));
+  if (r.startsWith('..') || path.isAbsolute(r) || !TEST_KEY.test(r)) return false;
+  // A symlink out of the project (`tests/k -> /etc/ssl/private`) is not fixture data.
+  try { const rr = path.relative(fs.realpathSync(projectRoot), fs.realpathSync(path.resolve(projectRoot, p))); return !rr.startsWith('..') && !path.isAbsolute(rr); } catch (_) { return true; }
+};
 
 // Wallet / crypto / browser cookie files.
 const WALLET_PATTERN = /\b(wallet\.dat|keystore\.json|UTC--\d{4}-\d{2}-\d{2}T)\b|(^|\/)\.electrum\/wallets\/|(^|\/)\.bitcoin\/wallet\.dat$/i;
@@ -393,9 +398,9 @@ watchdog.input((data) => {
         deny('Writing to .git/hooks blocked -- possible persistence', filePath);
       }
       // A file whose content is a command a runner runs (package.json scripts, a Makefile recipe): the
-      // shell scan bash applies to written content (secret upload, download-exec).
-      if (CMD_DEF.test(filePath) && scan.hasHigh(scan.scanShell(content))) {
-        deny('Writing a secret upload or download-exec command to a file blocked', filePath);
+      // shell scan bash applies to written content (secret upload, reverse shell, download-exec).
+      if (CMD_DEF.test(filePath) && scan.cmdDefHigh(filePath, content)) {
+        deny('Writing a secret upload, reverse shell or install-time download-exec to a file that defines commands blocked', filePath);
       }
       if (ENCODED_METHOD_EXEC.test(flat)) {
         pendingAsk = pendingAsk || { reason: 'exec/eval method call on decoded data in file content', snippet: filePath };
@@ -456,7 +461,7 @@ watchdog.input((data) => {
       filePath = input?.tool_input?.notebook_path || input?.tool_input?.file_path || '';
       break;
     case 'Glob': {
-      // Glob lists names and reads nothing: only the directories it walks are checked, not the names it matches.
+      // Glob lists names and reads nothing (see below: it never denies); the walked directory is logged.
       const pattern = input?.tool_input?.pattern || '';
       const dir = input?.tool_input?.path || '';
       filePath = [dir, pattern.replace(/(?:^|[\\/])[^\\/]*$/, '')].filter(Boolean).join('/');
@@ -492,6 +497,8 @@ watchdog.input((data) => {
   }
 
   if (!filePath) { if (pendingAsk) ask(pendingAsk.reason, pendingAsk.snippet); process.exit(0); }
+  // Glob lists names and reads nothing: it never denies, whatever directory it walks.
+  if (tool === 'Glob') { audit('fallthrough', '', filePath); process.exit(0); }
 
   for (const p of pathForms(filePath)) {
     const reason = pathMatchesAnySensitive(p);
@@ -507,9 +514,6 @@ watchdog.input((data) => {
     }
     if (PERSONAL_HISTORY.test(p)) {
       pendingAsk = pendingAsk || { reason: 'Shell history / Claude config may hold tokens', snippet: p };
-    }
-    if (tool === 'Glob' && (SENSITIVE_GLOB.test(p) || globNamesSecret(p + '/'))) {   // p is the walked directory
-      deny('Glob over a sensitive directory blocked', p);
     }
   }
 

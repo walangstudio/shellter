@@ -28,7 +28,7 @@ const cases: [string, string, any, boolean][] = [
   ["grep for secret value",   "grep",  { pattern: "password=admin", path: "/home" },     true],
   ["grep normal",             "grep",  { pattern: "function foo", path: "src/" },         false],
   ["find *.env glob (names only)", "find", { pattern: "*.env", path: "" },                 false],
-  ["find in ~/.ssh",         "find",  { pattern: "*", path: "/home/x/.ssh" },          true],
+  ["find in ~/.ssh (names only)", "find", { pattern: "*", path: "/home/x/.ssh" },       false],
   ["find normal glob",        "find",  { pattern: "*.ts", path: "src" },                 false],
   ["unknown/custom tool",     "mcp_x", { foo: 1 },                                       false],
 ];

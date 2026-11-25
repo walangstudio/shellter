@@ -767,7 +767,52 @@ function highest(findings) {
   return best;
 }
 
+// A file that defines commands (package.json scripts, a Makefile recipe, a husky hook): a HIGH shell finding
+// there denies. The exception is a download-exec line whose every URL is an https installer on a well-known
+// host (rustup, uv, bun, nodesource, pnpm, nvm, docker), with no more downloads than such URLs. A
+// package.json is also scanned JSON-decoded (`\u007c` is `|`).
+const DOWNLOAD_EXEC = /^(?:download-piped-to-shell|process-substitution-download-exec|powershell-iex-download|powershell-webclient-download)$/;
+const INSTALLER_URL = /^https:\/\/(?:(?:sh\.rustup\.rs|astral\.sh|bun\.sh|deb\.nodesource\.com|rpm\.nodesource\.com|get\.pnpm\.io|get\.docker\.com)(?:\/[\w.\/-]*)?|raw\.githubusercontent\.com\/nvm-sh\/[\w.\/-]*)$/i;
+// Every fetch command on the line must be curl/wget with only quiet/follow/fail flags and exactly one
+// installer URL: a second target, a config file, a proxy or any variable makes it an ordinary download-exec.
+const INSTALLER_FLAG = /^(?:-[fsSLq]+|-[fsSLq]*O-|--(?:fail|silent|show-error|location|quiet|tlsv1\.[23]|proto)|=https)$/;
+function installerLine(line) {
+  if (/[$`]|download(?:string|file|data)|\b(?:fetch|iwr|irm|invoke-webrequest|invoke-restmethod)\b/i.test(line)) return false;
+  let fetches = 0;
+  for (const part of line.split(/\|\|?|;|&&?/)) {
+    const t = part.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/^['"]+|['"]+$/g, ''));
+    if (!t.length || !/^(?:curl|wget)$/i.test(t[0].replace(/^.*[\\/]/, ''))) {
+      if (/\b(?:curl|wget)\b/i.test(part)) return false;
+      continue;
+    }
+    fetches++;
+    let urls = 0;
+    for (const w of t.slice(1)) {
+      if (INSTALLER_FLAG.test(w)) continue;
+      if (!INSTALLER_URL.test(w) || w.includes('..')) return false;
+      urls++;
+    }
+    if (urls !== 1) return false;
+  }
+  return fetches > 0;
+}
+function cmdDefHigh(target, body) {
+  let text = body;
+  if (/(?:^|[\\/])package\.json$/i.test(target)) {
+    // Parsed: only the decoded scripts run. Unparseable: scanned as written.
+    try { const j = JSON.parse(body); text = Object.values((j && j.scripts) || {}).map(String).join('\n'); } catch (_) { /* scanned as written */ }
+  }
+  const phys = text.split('\n');
+  return scanShell(text).some((f) => {
+    if (f.severity !== SEVERITY.HIGH) return false;
+    if (!DOWNLOAD_EXEC.test(f.signal) || !f.line) return true;
+    let line = '';
+    for (let i = f.line - 1; i < phys.length; i++) { line += phys[i] + ' '; if (!phys[i].endsWith('\\')) break; }
+    return !installerLine(line);
+  });
+}
+
 module.exports = {
   SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
-  scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces, globHitsSecret, globComponentRe,
+  scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces, globHitsSecret, globComponentRe, cmdDefHigh,
 };

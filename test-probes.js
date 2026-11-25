@@ -5,6 +5,7 @@
 // 0.11.1 re-pins (E2E eval): a secret-shaped variable in a curl URL denies; a variable in a curl header
 // prompts (never approves); env / printenv / `export -p` / `gci env:` dumps prompt; npx after a write into node_modules/.bin
 // prompts. A literal heredoc conftest.py is scanned, so pytest after it still approves.
+// 0.11.1 review re-pins: `npm_config_*`, jq `env`/`$ENV` and awk `ENVIRON` prompt; `printenv PATH` approves.
 'use strict';
 module.exports = [
   ["a1","bHMgLWxh","B","allow"],
@@ -131,7 +132,7 @@ module.exports = [
   ["a1","SlFfTElCUkFSWV9QQVRIPXgganEgLiBm","B","fallthrough"],
   ["a1","Q0FSR09fQlVJTERfUlVTVENfV1JBUFBFUj0uL3ggY2FyZ28gYnVpbGQ=","B","allow"],
   ["a1","UlVTVENfV1JBUFBFUj0uL3ggY2FyZ28gYnVpbGQ=","B","allow"],
-  ["a1","bnBtX2NvbmZpZ19zY3JpcHRfc2hlbGw9Li94IG5wbSB0ZXN0","B","allow"],
+  ["a1","bnBtX2NvbmZpZ19zY3JpcHRfc2hlbGw9Li94IG5wbSB0ZXN0","B","fallthrough"],
   ["a1","R09GTEFHUz0tdG9vbGV4ZWM9Li94IGdvIGJ1aWxk","B","allow"],
   ["a1","Q0M9Li94IG1ha2U=","B","allow"],
   ["a1","TUFLRUZMQUdTPSctLWV2YWw9eCcgbWFrZQ==","B","allow"],
@@ -494,8 +495,8 @@ module.exports = [
   ["a3","eXEgZXZhbCB4","B","allow"],
   ["a3","eXEgLWkgeCBm","B","allow"],
   ["a3","anEgLW4gJ2lucHV0JyBm","B","allow"],
-  ["a3","anEgLW4gJyRFTlYn","B","allow"],
-  ["a3","anEgLW4gJ2Vudic=","B","allow"],
+  ["a3","anEgLW4gJyRFTlYn","B","fallthrough"],
+  ["a3","anEgLW4gJ2Vudic=","B","fallthrough"],
   ["a3","anEgLiBmIC0tcmF3ZmlsZSBhIH4vLnNzaC9pZF9yc2E=","B","deny"],
   ["a3","dGVlIHguc2g=","B","allow"],
   ["a3","dGVlIH4vLmJhc2hyYw==","B","ask"],
@@ -659,7 +660,7 @@ module.exports = [
   ["a4","YXdrICd7IHByaW50IFwKIHwgInNoIiB9JyBm","B","fallthrough"],
   ["a4","YXdrICdCRUdJTnsgcHJpbnRmICJ4IiA+ICIvdG1wL3kiIH0n","B","fallthrough"],
   ["a4","YXdrICdCRUdJTnsgcHJpbnQgIngiID4gIicgKyAnfi8uYmFzaHJjIn0n","B","fallthrough"],
-  ["a4","YXdrICdCRUdJTnsgcHJpbnQgRU5WSVJPTlsiSE9NRSJdIH0n","B","allow"],
+  ["a4","YXdrICdCRUdJTnsgcHJpbnQgRU5WSVJPTlsiSE9NRSJdIH0n","B","fallthrough"],
   ["a4","YXdrICd7IE9SUz0ifCI7IHByaW50IH0nIGY=","B","allow"],
   ["a4","YXdrICdCRUdJTnsgcHJpbnQgImF8YiIgfSc=","B","allow"],
   ["a4","YXdrICd7IHByaW50ICQxLCAifCIsICQyIH0nIGY=","B","allow"],
@@ -1451,8 +1452,8 @@ module.exports = [
   ["a7","WERHX0NPTkZJR19IT01FPXggZ2l0IGxvZw==","B","fallthrough"],
   ["a7","Q1VSTF9IT01FPXggY3VybCB1","B","fallthrough"],
   ["a7","V0dFVFJDPXggd2dldCB1","B","fallthrough"],
-  ["a7","TlBNX0NPTkZJR19VU0VSQ09ORklHPXggbnBtIHRlc3Q=","B","allow"],
-  ["a7","bnBtX2NvbmZpZ19nbG9iYWxjb25maWc9eCBucG0gY2k=","B","allow"],
+  ["a7","TlBNX0NPTkZJR19VU0VSQ09ORklHPXggbnBtIHRlc3Q=","B","fallthrough"],
+  ["a7","bnBtX2NvbmZpZ19nbG9iYWxjb25maWc9eCBucG0gY2k=","B","fallthrough"],
   ["a7","RE9DS0VSX0hPU1Q9dGNwOi8vZXZpbC50ZXN0IGRvY2tlciBwcw==","B","fallthrough"],
   ["a7","RE9DS0VSX0NPTkZJRz14IGRvY2tlciBwcw==","B","fallthrough"],
   ["a7","S1VCRUNPTkZJRz14IGt1YmVjdGwgZ2V0IHBv","B","fallthrough"],
@@ -1847,7 +1848,7 @@ module.exports = [
   ["f1","Y29tbWFuZCAtdiBub2Rl","B","allow"],
   ["f1","dHlwZSBub2Rl","B","allow"],
   ["f1","ZW52IHwgZ3JlcCBOT0RF","B","fallthrough"],
-  ["f1","cHJpbnRlbnYgUEFUSA==","B","fallthrough"],
+  ["f1","cHJpbnRlbnYgUEFUSA==","B","allow"],
   ["f1","ZGF0ZSArJXM=","B","allow"],
   ["f1","c2xlZXAgMiAmJiBlY2hvIGRvbmU=","B","allow"],
   ["f1","Zm9yIGYgaW4gKi5qczsgZG8gZWNobyAiJGYiOyBkb25l","B","allow"],
