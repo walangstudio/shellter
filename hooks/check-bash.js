@@ -1846,9 +1846,10 @@ function credReadVerdict(t) {
 // `AWS_REGION`, `PWD`, or a lower-case shell variable (`$key`, `$token`).
 const { secretVarName } = scan;
 // `$X`, `${X}`, `${X:-..}`, PowerShell `$env:X` / `${env:X}` (any case: Windows names are), and a bare
-// `env:X` (`Get-Item env:X`). Not `${#X}` or `${X:+..}`, which print a length or a fixed word.
+// `env:X` (`Get-Item env:X`), and `${!X}` (bash prints X's value in its error). Not `${#X}`, `${!X*}` or
+// `${X:+..}`, which print a length, names or a fixed word.
 // A PowerShell `$x` is a script variable, not the environment; a bare `env:X` is PowerShell syntax only.
-const VAR_REF = /\$(\{)?(env:)?([A-Za-z_]\w*)(?!\w)(?!(?<=\{\w+):\+)|(?<![\w$])env:\\?([A-Za-z_]\w*)(?!\w)/gi;
+const VAR_REF = /\$(\{!?)?(env:)?([A-Za-z_]\w*)(?!\w)(?!(?<=\{\w+):\+)(?!(?<=\{!\w+)[*@])|(?<![\w$])env:\\?([A-Za-z_]\w*)(?!\w)/gi;
 // `strict` (the approve gate): a PowerShell script variable with a secret name counts too -- a session may hold it.
 const secretVarRef = (t, bound, strict) => [...t.matchAll(VAR_REF)].find((m) => {
   const posh = m[4] || m[2];
@@ -1865,7 +1866,9 @@ const PURE_ASSIGN = new RegExp('^(?:[A-Za-z_]\\w*=' + LIT_VAL + '\\s+)*[A-Za-z_]
 const ASSIGN_G = new RegExp('([A-Za-z_]\\w*)=(' + LIT_VAL + ')(?=\\s|$)', 'g');
 function literalBound(t) {
   const out = new Set();
-  if (/(?:^|[\s;&|(\\])(?:source|\.|eval|read|declare|typeset|local|readonly|export|mapfile|readarray|getopts|let|unset|printf\s+-v)(?=\s|$)/.test(t) || /#|\$['"]/.test(t)) return out;
+  // Quotes and escapes removed: `'read'`, `re""ad` and `\read` are the same builtin; a brace expansion can spell one.
+  if (/(?:^|[\s;&|(])(?:source|\.|eval|read|declare|typeset|local|readonly|export|mapfile|readarray|getopts|let|unset|printf\s+-v)(?=\s|$)/.test(t.replace(/['"\\]/g, '')) ||
+    /#|\$['"]|\{[^{}]*,/.test(t)) return out;
   const stmts = [];
   let cur = '', q = '', complex = false, start = 0;
   for (let i = 0; i < t.length; i++) {
@@ -1946,7 +1949,7 @@ function secretInText(raw) {
   const t = u.replace(/(?:^|[;&|(\n])[ \t]*(?:(?:if|then|elif|while|until|do|else|!|\{)[ \t]+)*(?:\[\[?|test)\s[^;&|\n]*/g,
     (m, off) => dq[off] || /\$\(|`|>/.test(m) ? m : m.replace(/(^|\s)-[nz]\s+"\$\{?\w+\}?"/g, '$1'));
   // A credential word in any upper-case name, even one the deny side lets through (`${X:+set}`, `$CACHE_KEY`).
-  if (/\$\{?[A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|PASS|KEY|AUTH|CRED)/.test(t)) return true;
+  if (/\$(?:\{[!#]?)?[A-Z_][A-Z0-9_]*(?:TOKEN|SECRET|PASS|KEY|AUTH|CRED)/.test(t)) return true;
   // `process.env` is code only when an interpreter runs or it is a bare word (a file `process.env.ci`); a
   // quoted mention in grep, sed or a commit message is text.
   const envRef = /\b(?:process|meta|Deno|Bun)\.env(?:\?\.|\.(?!(?:example|sample|template|dist|defaults?)\b)[A-Za-z_]|\s*[()\],;+['"|&=!<>?[])/i;
@@ -2023,8 +2026,8 @@ function dumpStage(st) {
   return { cmd: base(toks[at] || '').replace(/^\\/, ''), args: toks.slice(at + 1), text: st };
 }
 // A stage that keeps only a count or an exit status (`grep -q PAT`, `grep -c PAT`), or, after an env dump, only
-// the names (`cut -d= -f1`, `select Name`). Exact flag sets only: `-e`, `-f`, `-o`, `--complement` keep values.
-// ponytail: `cut -d= -f1` still prints a continuation line of a multi-line value; deny it if that matters.
+// the names (`select Name`). Exact flag sets only: `-e`, `-f`, `-o` keep values. Not `cut -d= -f1`: it prints the
+// continuation lines of a multi-line value (a PEM key); `compgen -e` lists names.
 function namesOnly(w, env) {
   if (/^(?:grep|egrep|fgrep|rg)$/.test(w.cmd)) {
     const flags = w.args.filter((a) => a.startsWith('-')), rest = w.args.filter((a) => !a.startsWith('-'));
@@ -2032,18 +2035,6 @@ function namesOnly(w, env) {
       flags.some((a) => /^-[a-z]*[qcl]|^--(?:quiet|silent|count|files-with-matches)$/i.test(a));
   }
   if (!env) return false;
-  if (w.cmd === 'cut') {
-    let d = false, f = false;
-    for (let i = 0; i < w.args.length; i++) {
-      const a = w.args[i];
-      if (/^(?:-d|--delimiter=)=$/.test(a)) d = true;
-      else if (/^(?:-d|--delimiter)$/.test(a) && w.args[i + 1] === '=') { d = true; i++; }
-      else if (/^(?:-f|--fields=)1$/.test(a)) f = true;
-      else if (/^(?:-f|--fields)$/.test(a) && w.args[i + 1] === '1') { f = true; i++; }
-      else return false;
-    }
-    return d && f;
-  }
   return /^\s*(?:Select-Object|select)\s+(?:-(?:ExpandProperty|Property)\s+)?['"]?Name['"]?\s*$/i.test(w.text);
 }
 // Every later stage only passes text on; the last one is not redirected into a file. A `tee` to a process
@@ -2091,7 +2082,7 @@ function envDump(seg) {
     // `printenv NAME` prints bare values: `cut -d= -f1` keeps them whole.
     const names = !(stages[k].cmd === 'printenv' && stages[k].args.some((t) => !/^-/.test(t)));
     if (envDumpStage(stages[k]) && reachesTranscript(stages, k, true, names)) {
-      return 'Printing the whole environment blocked -- it holds the user tokens. Read one non-secret variable with printenv NAME.';
+      return 'Printing the whole environment blocked -- it holds the user tokens. Read one non-secret variable with printenv NAME; list names with compgen -e.';
     }
   }
   return null;
@@ -2124,6 +2115,31 @@ const JS_PRESENT = [[/(?:!|(?<![.\w])Boolean\s*\()\s*$/, /^\s*(?:[),;'"]|&&|\|\|
   [/(?:^|[^.\w])$/, new RegExp(String.raw`^\s*(?:[!=]==?\s*${TERN}|\?\s*${TERN}\s*:\s*${TERN})`)]];
 const PY_PRESENT = [[/\b(?:bool|len)\s*\(\s*$/, /^\s*\)/], [/\bnot\s+$/, /^/], [/\bif\s+$/, /^\s*else\b/],
   [/(?:^|[^.\w])$/, /^\s*(?:is\s+(?:not\s+)?None\b|[!=]=\s*(?:'[^']*'|"[^"]*"))/]];
+// Does a string, template, regex or comment start at `s[i]`? A `/` is a regex or `//` comment only where an
+// operand is expected (`a // 2` is Python floor division).
+const tokAt = (s, i) => /['"`]/.test(s[i]) || (s[i] === '/' && (s[i + 1] === '*' || /(?:^|[(,=:[!&|?{};+\-*%<>~^])\s*$/.test(s.slice(Math.max(0, i - 16), i))));
+// The index of the last character of the token at `s[i]`; template `${..}` code is scanned the same way.
+function skipTok(s, i) {
+  const c = s[i];
+  if (c === '/' && s[i + 1] === '*') { const e = s.indexOf('*/', i + 2); return e < 0 ? s.length : e + 1; }
+  if (c === '/' && s[i + 1] === '/') { const e = s.indexOf('\n', i); return e < 0 ? s.length : e; }
+  let cls = false;
+  for (i++; i < s.length; i++) {
+    const x = s[i];
+    if (x === '\\') i++;
+    else if (c === '/') { if (x === '[') cls = true; else if (x === ']') cls = false; else if ((x === '/' && !cls) || x === '\n') return i; }
+    else if (x === c) return i;
+    else if (c === '`' && x === '$' && s[i + 1] === '{') {
+      let d = 1;
+      for (i += 2; i < s.length && d; i++) {
+        if (tokAt(s, i)) i = skipTok(s, i);
+        else d += s[i] === '{' ? 1 : s[i] === '}' ? -1 : 0;
+      }
+      i--;
+    }
+  }
+  return s.length;
+}
 // The argument spans of each print call; a call nested in an earlier span is skipped, so the walk stays linear.
 function printSpans(s, call) {
   const spans = [];
@@ -2131,7 +2147,14 @@ function printSpans(s, call) {
   for (const m of s.matchAll(call)) {
     if (m.index < end) continue;
     let i = m.index + m[0].length;
-    if (m[0].endsWith('(')) for (let d = 1; i < s.length && d; i++) d += s[i] === '(' ? 1 : s[i] === ')' ? -1 : 0;
+    // A paren inside a string, template, regex or comment, or after an escape, does not count.
+    if (m[0].endsWith('(')) {
+      for (let d = 1; i < s.length && d; i++) {
+        if (s[i] === '\\') i++;
+        else if (tokAt(s, i)) i = skipTok(s, i);
+        else d += s[i] === '(' ? 1 : s[i] === ')' ? -1 : 0;
+      }
+    }
     else { const e = s.slice(i).search(/[;\n}]/); i = e < 0 ? s.length : i + e; }
     spans.push([m.index, end = i]);
   }
@@ -5624,7 +5647,7 @@ if (MAIN) watchdog.input((data) => {
   if (fixtureKeys.length) {
     let realCwd = cwd;
     try { realCwd = fs.realpathSync(cwd); } catch (_) { /* keep cwd */ }
-    const realIn = (from, p) => { try { return inside(realCwd, fs.realpathSync(path.resolve(from, p))); } catch (_) { return inside(path.resolve(cwd), path.resolve(from, p)); } };
+    const realIn = (from, p) => { if (isPosh) p = poshSep(p); try { return inside(realCwd, fs.realpathSync(path.resolve(from, p))); } catch (_) { return inside(path.resolve(cwd), path.resolve(from, p)); } };
     // A `cd` into a literal project subdirectory (`cd backend && openssl x509 -in tests/fixtures/cert.pem`) keeps
     // the key in the project; a link, popd, CDPATH, a quoted, escaped, computed or outside target does not. Every
     // directory the command visits must keep every key inside; past 8 directory changes it denies.
@@ -5634,7 +5657,7 @@ if (MAIN) watchdog.input((data) => {
       const t = m[1] || '';
       // PowerShell paths may use `\` (`Set-Location backend\api`); in bash it is an escape.
       if (!cdOk || ++n > 8 || !(isPosh ? /^[\w.\\/-]+$/ : /^[\w.\/-]+$/).test(t) || /^[-\\/]|(?:^|[\\/])\.\.(?:[\\/]|$)/.test(t) || !realIn(dir, t)) { cdOk = false; break; }
-      dir = path.resolve(dir, t);
+      dir = path.resolve(dir, isPosh ? poshSep(t) : t);
       dirs.push(dir);
     }
     if (!cdOk || !fixtureKeys.every((k) => dirs.every((d) => realIn(d, k)))) {

@@ -4313,8 +4313,8 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
     for (const c of ['env NODE_ENV=test npm test', 'cat ./src/styles/tokens.css']) L('allow', 'Bash', c);
     for (const c of ["env NODE_ENV=test node -e 'console.log(process.env.NODE_ENV)'", 'compgen -v']) L('notdeny', 'Bash', c);
     // Benign twins.
-    for (const c of ['echo $MAX_TOKENS', 'echo ${GITHUB_TOKEN:+set}', 'echo "$NEXT_PAGE_TOKEN"']) { L('notdeny', 'Bash', c); L('notallow', 'Bash', c); }
-    for (const c of ['env -u FOO npm test', 'printenv PATH', 'echo $HOME', 'echo ${#GITHUB_TOKEN}',
+    for (const c of ['echo $MAX_TOKENS', 'echo ${GITHUB_TOKEN:+set}', 'echo "$NEXT_PAGE_TOKEN"', 'echo ${#GITHUB_TOKEN}', 'echo "${!GITHUB*}"']) { L('notdeny', 'Bash', c); L('notallow', 'Bash', c); }
+    for (const c of ['env -u FOO npm test', 'printenv PATH', 'echo $HOME',
       '[ -n "$OPENAI_API_KEY" ] && echo set', 'test -z "$GITHUB_TOKEN" && echo "no token"', 'for key in a b; do echo "$key"; done',
       'echo "$TOKEN_TYPE"', "echo '$GITHUB_TOKEN'", 'echo "use env to dump"', 'git commit -m "set env"',
       'grep -rn printenv src/', 'rg credentials src/', 'grep -rn Cookies src/']) L('allow', 'Bash', c);
@@ -4365,7 +4365,7 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
     for (const c of ['cd . && rg -n "tests/fixtures/key.pem" README.md', 'cd backend && openssl x509 -in tests/fixtures/cert.pem -noout -text',
       'cd server && pytest tests/test_tls.py --cert tests/fixtures/server.key', 'node -p "process.env.NODE_ENV"', 'node -e "const p = process.env.PORT || 3000; console.log(p)"',
       "node -e \"process.env.NODE_ENV === 'test' && console.log(1)\"", "deno eval \"console.log(Deno.env.get('HOME'))\"", 'node -e "console.log(!!process.env.GITHUB_TOKEN)"',
-      "python3 -c \"import os; print(bool(os.getenv('OPENAI_API_KEY')))\"", 'env | cut -d= -f1', 'env | grep -q CI && echo ci', 'env | grep -c .']) L('notdeny', 'Bash', c);
+      "python3 -c \"import os; print(bool(os.getenv('OPENAI_API_KEY')))\"", 'compgen -e', 'env | grep -q CI && echo ci', 'env | grep -c .']) L('notdeny', 'Bash', c);
     L('allow', 'PowerShell', 'Write-Host "set `$env:GITHUB_TOKEN first"');
     // A secret-named script variable or a `process.env` mention lifts the deny but is never auto-approved.
     for (const c of ['Write-Host "Passed: $PASS"', 'Write-Host $GITHUB_TOKEN']) { L('notdeny', 'PowerShell', c); L('notallow', 'PowerShell', c); }
@@ -4388,7 +4388,7 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
       'cd .\\. && cat tests/fixtures/key.pem', 'cd ."." && cat tests/fixtures/key.pem', 'cd ./"../.." && cat tests/fixtures/key.pem',
       'CDPATH=/ ; cd etc && cat ssl/private/tests/server.key', '\\cd .. && cat tests/fixtures/key.pem']) L('deny', 'Bash', c);
     for (const c of ["bash -c 'echo $GITHUB_TOKEN'", 'Get-ChildItem Env: | Out-Host | Select-Object Name']) L('deny', 'PowerShell', c);
-    for (const c of ['env | cut --delimiter== --fields=1', "env | cut -d '=' -f '1'", 'node -p "!!process.env.GITHUB_TOKEN"', 'cat /proc/self/status',
+    for (const c of ['node -p "!!process.env.GITHUB_TOKEN"', 'cat /proc/self/status',
       "python3 -c \"import os; print('set' if os.environ.get('API_KEY') else 'unset')\"", 'cd backend && openssl x509 -in tests/fixtures/cert.pem -noout -text']) L('notdeny', 'Bash', c);
     fs.mkdirSync(path.join(lh, 'rc5')); fs.writeFileSync(path.join(lh, 'rc5', '.bashrc'), 'export TOKENIZERS_PARALLELISM=false\n');
     fs.mkdirSync(path.join(lh, 'rc6')); fs.writeFileSync(path.join(lh, 'rc6', '.zshrc'), 'export MAX_THINKING_TOKENS=10000\n');
@@ -4402,13 +4402,25 @@ console.log('\n--- 0.11.1 review: E2E review findings A1-A10, B1-B4, C1-C2, D1-D
       'node -e "console.log(process.env?.GITHUB_TOKEN)"', 'node -p "process.env?.GITHUB_TOKEN"', 'node -e "throw process.env.GITHUB_TOKEN"',
       "python3 -c \"import os; print(os.getenv('GITHUB_TOKEN', '" + 'a'.repeat(45) + "'))\"", "node -e \"console.log('a', process.env.API_KEY)\""]) L('deny', 'Bash', c);
     L('deny', 'PowerShell', "& \"C:\\Program Files\\Git\\bin\\bash.exe\" -c 'echo $GITHUB_TOKEN'");
-    for (const c of ['PASS=0; FAIL=0; PASS=$((PASS+1)); echo "$PASS passed, $FAIL failed"', 'for TOKEN in a b; do echo "$TOKEN"; done', 'env | cut -d= -f1',
+    for (const c of ['PASS=0; FAIL=0; PASS=$((PASS+1)); echo "$PASS passed, $FAIL failed"', 'for TOKEN in a b; do echo "$TOKEN"; done',
       "node -e 'console.log(Boolean(process.env.GITHUB_TOKEN))'", "node -e 'const token=process.env.GITHUB_TOKEN; console.log(!!token)'",
       "python3 -c \"import os; t=os.environ['GITHUB_TOKEN']; print(bool(t))\"", "python3 -c \"import os; print(os.getenv('GITHUB_TOKEN') is None)\"",
       "node -e \"console.log(process.env.API_KEY ? 'set' : 'unset')\"", 'node -e "console.log(process.env.API_KEY ? 1 : 0)"', 'node -e "console.log(typeof process.env.API_KEY)"',
       "node -e \"const k = process.env.API_KEY; if (!k) { console.log('missing'); }\"", "python3 -c \"import os; k = os.environ['API_KEY']; print(len(k))\"",
       'node -e "console.log(process.env.GITHUB_TOKEN.length)"', 'echo $MAX_NEW_TOKENS']) L('notdeny', 'Bash', c);
     L('notdeny', 'PowerShell', 'Set-Location backend\\api; Get-Content tests\\fixtures\\key.pem');
+    // 0.11.1 sign-off (Fable, Astra): indirect expansion, parens in strings, quoted builtins, multi-line values.
+    for (const c of ['echo "${!GITHUB_TOKEN}"', "node -e 'console.log(\")\", process.env.GITHUB_TOKEN)'", "python3 -c 'import os; print(\"a)\", os.environ[\"GITHUB_TOKEN\"])'",
+      "node -e 'console.log(\")\" + process.env.GITHUB_TOKEN)'", "node -e 'console.log(/\\)/, process.env.GITHUB_TOKEN)'", "node -e 'console.log(/* ) */ process.env.GITHUB_TOKEN)'",
+      'GITHUB_TOKEN=x; \'read\' GITHUB_TOKEN <<< "$value"; echo "$GITHUB_TOKEN"', 'GITHUB_TOKEN=x; re""ad GITHUB_TOKEN <<< "$value"; echo "$GITHUB_TOKEN"',
+      'GITHUB_TOKEN=x; r\\ead GITHUB_TOKEN <<< "$value"; echo "$GITHUB_TOKEN"', 'GITHUB_TOKEN=x; {read,GITHUB_TOKEN} < f; echo "$GITHUB_TOKEN"',
+      'GITHUB_TOKEN=x; "source" ./f; echo "$GITHUB_TOKEN"', 'GITHUB_TOKEN=x; "printf" -v GITHUB_TOKEN %s "$v"; echo "$GITHUB_TOKEN"',
+      'env | cut -d= -f1', 'env | cut --delimiter== --fields=1', "env | cut -d '=' -f '1'"]) L('deny', 'Bash', c);
+    for (const c of ["node -e 'console.log(`(${`)`}`, process.env.GITHUB_TOKEN)'", "node -e 'console.log(/[)]/, process.env.GITHUB_TOKEN)'",
+      "python3 -c 'import os; print(7 // 2, os.environ[\"GITHUB_TOKEN\"])'"]) L('deny', 'Bash', c);
+    for (const c of ["node -e 'console.log(\"(\"); const token=process.env.GITHUB_TOKEN; console.log(!!token)'",
+      "node -e 'console.log(/\"/); const token=process.env.GITHUB_TOKEN; console.log(!!token)'",
+      "python3 -c 'print(7 // 2); t=__import__(\"os\").environ[\"GITHUB_TOKEN\"]; print(bool(t))'"]) L('notdeny', 'Bash', c);
     // Never auto-approved, even when not denied.
     for (const c of ['echo "${SECRET_KEY:+set}"', 'echo "tokens used: $TOTAL_TOKENS"', 'echo "cache key: $CACHE_KEY"', 'cat process.env.ci']) { L('notdeny', 'Bash', c); L('notallow', 'Bash', c); }
     // A quoted `process.env` mention in a non-interpreter command is text.

@@ -7,7 +7,7 @@ rules, new approves, new platforms.
 Nothing was versioned before now, so 0.1.0 is the state the hooks were already in
 when we started counting. Everything in this session is 0.2.0.
 
-## [0.11.1] - 2026-11-20
+## [0.11.1] - 2026-11-27
 
 Fixes from an end-to-end eval of 0.11.0 (562 benign operations, 283 attack probes, 4 real Claude Code
 sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
@@ -55,14 +55,15 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
   `env > /tmp/e`); `echo`/`printf`/`<<<` of a secret-named variable reaching the screen;
   `node -e 'console.log(process.env)'`, `python3 -c 'print(os.environ)'` and their one-secret forms
   (`process.stdout.write`, `sys.stdout.write` too);
-  PowerShell `Get-ChildItem Env:`, `echo $env:GITHUB_TOKEN`. A count, names or a quiet test (`env | wc -l`, `env | cut -d= -f1`, `env | grep -q CI`,
+  PowerShell `Get-ChildItem Env:`, `echo $env:GITHUB_TOKEN`. A count, names or a quiet test (`env | wc -l`, `compgen -e`, `env | grep -q CI`,
   `gci env: | select Name`), a presence test (`!!process.env.X`, `bool(os.getenv(..))`), a variable the
   command sets itself (`PASS=0; echo $PASS`, `for TOKEN in a b`), a PowerShell script variable, a pipe into a
   consumer (`echo "$T" | docker login --password-stdin`), a write to a file, `set -euo pipefail`,
   `declare -A` and `compgen -v` do not deny. Other dumps prompt: `ps e`, awk `ENVIRON`, jq `env`/`$ENV`,
   yq `env()`, `env:G*`, a computed path, `GetEnvironmentVariable`, `npm run env`. `printenv PATH`,
   `ps -C node`, a test operand (`[ -n "$KEY" ]`; not under `set -x` or inside a quoted argument)
-  and an escaped `\$TOKEN` still approve; `${KEY:+set}` and `$CACHE_KEY` prompt. A `tee` to the terminal or a process substitution
+  and an escaped `\$TOKEN` still approve; `${KEY:+set}`, `${#KEY}` and `$CACHE_KEY` prompt. `env | cut -d= -f1` denies (it prints
+  the continuation lines of a multi-line value) and so does `${!KEY}` (bash prints the value in its error). A `tee` to the terminal or a process substitution
   prints what it is given. `ps axen`/`ps ewwo`, `npm run -s env`, `pnpm exec env`, `bun run env` and
   PowerShell `npm run env` prompt.
   These exemptions lift the deny only and never auto-approve, and stay narrow: a self-set variable counts
@@ -110,7 +111,7 @@ sessions). Every attack class below was auto-approved by 0.11.0 and 0.10.0.
 - **False denies removed**: Glob lists names and reads nothing, so it never denies; `cat ~/.gitconfig`
   names the right reason.
 
-3421 tests in test-hooks.js (2657 at 0.11.0).
+3442 tests in test-hooks.js (2657 at 0.11.0).
 
 ## [0.11.0] - 2026-11-18
 
