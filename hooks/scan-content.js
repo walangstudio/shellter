@@ -20,11 +20,16 @@ const RANK = { high: 3, medium: 2, low: 1 };
 const TAG_RE = /[\u{E0000}-\u{E007F}]/gu;                    // tag block (ASCII smuggling)
 const BIDI_RE = /[‪-‮⁦-⁩]/g;            // bidi overrides (Trojan Source)
 const ZW_RE = /[​-‍⁠﻿]/g;               // zero-width
+// Default-ignorable code points (soft hyphen, LRM/RLM, invisible operators, Hangul fillers, ...),
+// combining marks and the braille blank. Stripped for matching only (they split a keyword); not a
+// finding. The counted classes above are removed first.
+const STRIP_ONLY_RE = /[\p{Default_Ignorable_Code_Point}\p{Mn}\u2800\u115F\u1160\u3164\uFFF9-\uFFFB]/gu;
 const VS_RE = /[︀-️]|[\u{E0100}-\u{E01EF}]/gu;    // variation selectors
 
 // A variation selector is suspicious when it does NOT sit on an emoji-like base
 // (legit use is a single VS16/skin-tone on an emoji). Smuggling appends runs of
 // selectors, uses the VS17-256 supplement (E0100+), or attaches them to ASCII.
+const EMOJI_PRESENTATION_BASE = new Set([0xa9, 0xae, 0x203c, 0x2049, 0x2122, 0x2139, 0x3030, 0x303d, 0x3297, 0x3299]);
 function countSuspiciousVS(s) {
   const cp = Array.from(s);
   let n = 0;
@@ -34,11 +39,13 @@ function countSuspiciousVS(s) {
     if (!isVS) continue;
     if (c >= 0xe0100) { n++; continue; }            // supplement: no legit text use
     const prev = i > 0 ? cp[i - 1].codePointAt(0) : 0;
+    const next = i + 1 < cp.length ? cp[i + 1].codePointAt(0) : 0;
     const prevIsEmojiBase =
       (prev >= 0x1f000) ||                            // emoji & pictographs
       (prev >= 0x2190 && prev <= 0x2bff) ||           // arrows / misc symbols / dingbats
-      (prev >= 0xfe00 && prev <= 0xfe0f);             // already a selector (skin-tone run on emoji)
-    const next = i + 1 < cp.length ? cp[i + 1].codePointAt(0) : 0;
+      (prev >= 0xfe00 && prev <= 0xfe0f) ||           // already a selector (skin-tone run on emoji)
+      EMOJI_PRESENTATION_BASE.has(prev) ||            // (c) (R) TM info sign ...
+      (next === 0x20e3 && (prev === 0x23 || prev === 0x2a || (prev >= 0x30 && prev <= 0x39)));   // keycap 1-9 # *
     const nextIsVS = next >= 0xfe00 && next <= 0xfe0f;
     if (!prevIsEmojiBase || nextIsVS) n++;            // ASCII base, or a run -> bitstream
   }
@@ -58,7 +65,7 @@ function normalizeForScan(s, maxRounds = 5) {
     counts.tag += (clean.match(TAG_RE) || []).length;
     counts.bidi += (clean.match(BIDI_RE) || []).length;
     counts.zeroWidth += (clean.match(ZW_RE) || []).length;
-    clean = clean.replace(TAG_RE, '').replace(BIDI_RE, '').replace(ZW_RE, '').replace(VS_RE, '');
+    clean = clean.replace(TAG_RE, '').replace(BIDI_RE, '').replace(ZW_RE, '').replace(VS_RE, '').replace(STRIP_ONLY_RE, '');
     if (clean === before) break;
   }
   return { clean, rounds, counts };
@@ -102,13 +109,14 @@ function locate(text, index) {
 // produced, and only with the tokens round 1 did not spend.
 function decodeLayers(text, opts) {
   opts = opts || {};
-  const budget = opts.maxTokens || 8;
+  const budget = opts.maxTokens || 64;
+  const done = (t, exhausted) => (opts.report ? { text: t, exhausted } : t);
   const first = decodeOneLayer(text, Object.assign({}, opts, { maxTokens: budget, _report: true }));
-  if (!first.text) return '';
+  if (!first.text) return done('', first.exhausted);
   const left = budget - first.used;
-  if (left <= 0) return first.text;
+  if (left <= 0) return done(first.text, first.exhausted);
   const second = decodeOneLayer(first.text, Object.assign({}, opts, { maxTokens: left, _report: true }));
-  return second.text ? first.text + '\n' + second.text : first.text;
+  return done(second.text ? first.text + '\n' + second.text : first.text, first.exhausted || second.exhausted);
 }
 
 // Decode the highest-value encoded tokens once (NO recursion -- a DoS guard).
@@ -117,44 +125,55 @@ function decodeLayers(text, opts) {
 // worth decoding.
 function decodeOneLayer(text, opts) {
   opts = opts || {};
-  const maxTokens = opts.maxTokens || 8;
+  const maxTokens = opts.maxTokens || 64;
+  const MAX_DECODED = 256 * 1024;
+  let decodedLen = 0, exhausted = false;
   const minLen = opts.minLen || 24;
   const maxLen = opts.maxLen || 8192;
   const minEntropy = opts.minEntropy || 3.5;
   const out = [];
-  let used = 0;
+  let used = 0, attempts = 0;
 
+  // The budget counts tokens that decode to text; a path or SHA list is not "encoded tokens".
+  // Raw attempts are capped separately as the DoS bound.
   const b64 = /[A-Za-z0-9+/]{24,}={0,2}/g;
   let m;
-  while ((m = b64.exec(text)) && used < maxTokens) {
+  while ((m = b64.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED && attempts < 512) {
     const tok = m[0];
     if (tok.length < minLen || tok.length > maxLen) continue;
     if (shannonEntropy(tok) < minEntropy) continue;
+    attempts++;
     try {
       const buf = Buffer.from(tok, 'base64');
       if (!buf.length) continue;
       const u8 = buf.toString('utf8');
-      if (printableRatio(u8) > 0.8) out.push(u8);
+      let hit = false;
+      if (printableRatio(u8) > 0.8) { out.push(u8); decodedLen += u8.length; hit = realText(u8); }
       const nulls = countNulls(buf);
       if (nulls > buf.length / 4) {
         const u16 = buf.toString('utf16le');
-        if (printableRatio(u16) > 0.8) out.push(u16);
+        if (printableRatio(u16) > 0.8) { out.push(u16); decodedLen += u16.length; hit = hit || realText(u16); }
       }
-      used++;
+      if (hit) used++;
     } catch { /* not base64 */ }
   }
 
+  if (m) exhausted = true;   // a candidate token was left undecoded
   const hex = /\b(?:[0-9a-fA-F]{2}){16,}\b/g;
-  while ((m = hex.exec(text)) && used < maxTokens) {
+  while ((m = hex.exec(text)) && used < maxTokens && decodedLen < MAX_DECODED && attempts++ < 512) {
     try {
       const u8 = Buffer.from(m[0], 'hex').toString('utf8');
-      if (printableRatio(u8) > 0.8) { out.push(u8); used++; }
+      if (printableRatio(u8) > 0.8) { out.push(u8); if (realText(u8)) used++; decodedLen += u8.length; }
     } catch { /* not hex */ }
   }
+  if (m) exhausted = true;
   // `_report` is for decodeLayers, which needs the spend to size round 2. Every other
   // caller keeps the original string return.
-  return opts._report ? { text: out.join('\n'), used } : out.join('\n');
+  return opts._report ? { text: out.join('\n'), used, exhausted } : out.join('\n');
 }
+
+// Decoded bytes that read as text, not U+FFFD noise: only these spend the decode budget.
+function realText(s) { return (s.match(/�/g) || []).length < s.length * 0.05; }
 
 function printableRatio(s) {
   if (!s.length) return 0;
@@ -263,19 +282,34 @@ const POLICY_PUPPETRY = [
 
 // Override-phrase family. Built with \s+ so the source isn't itself a clean
 // override sentence.
-const OVERRIDE_RE = /\b(?:ignore|disregard|forget|discard|cancel)\s+(?:all\s+|the\s+|any\s+|your\s+)?(?:previous|prior|earlier|above|current|the\s+system)\s+(?:instructions?|prompts?|rules?|commands?|guidelines?)\b|\bstop\s+following\s+(?:your\s+|the\s+)?(?:instructions?|rules?)\b|\byou\s+are\s+now\s+(?:a|an|the|in)\b|\bnew\s+(?:instructions?|system\s+prompt)\b/i;
-// Jailbreak / role-hijack phrase family. Class B (destination-gated): legitimate in security
+const OVERRIDE_RE = /\b(?:ignore|disregard|forget|discard|cancel)\s+(?:all\s+|the\s+|any\s+|your\s+)?(?:previous|prior|earlier|above|current|the\s+system)\s+(?:instructions?|prompts?|rules?|commands?|guidelines?)\b|\bstop\s+following\s+(?:your\s+|the\s+)?(?:instructions?|rules?)\b|\byou\s+are\s+now\s+(?:a|an|the)\b|\b(?:follow|obey|here\s+are|these\s+are)\s+(?:the\s+|your\s+|these\s+)?new\s+instructions?\b|\bnew\s+system\s+prompt\b/i;
+// Jailbreak / role-hijack phrase family. Class B1 (destination-gated): legitimate in security
 // write-ups and prompt datasets, but on an agent-instruction file it is a hijack. Built with
 // \s+ so this source file is not itself a clean instance.
-const ROLE_HIJACK_RE = /\byou\s+have\s+been\s+(?:jailbroken|liberated|freed)\b|\bdeveloper\s+mode\s+(?:on|enabled|activated)\b|\bDAN\s+mode\b|\bdo\s+anything\s+now\b|\bact\s+as\s+if\s+you\s+(?:are|were)\b|\bpretend\s+(?:that\s+)?you\s+(?:are|'re)\b|\bassume\s+the\s+role\s+of\b|\bfrom\s+now\s+on,?\s+you\s+(?:are|will|must)\b|\boverride\s+(?:the\s+)?system\s+prompt\b/i;
+const ROLE_HIJACK_RE = /\byou\s+have\s+been\s+(?:jailbroken|liberated|freed)\b|\bdeveloper\s+mode\s+(?:on|enabled|activated)\b|\bDAN\s+mode\b|\bdo\s+anything\s+now\b|\boverride\s+(?:the\s+)?system\s+prompt\b/i;
+// Persona phrases. Class B2 (LOW, advisory everywhere): routine wording in agent and command
+// definitions ("act as if you are the on-call engineer").
+const PERSONA_RE = /\bact\s+as\s+if\s+you\s+(?:are|were)\b|\bpretend\s+(?:that\s+)?you\s+(?:are|'re)\b|\bassume\s+the\s+role\s+of\b|\bfrom\s+now\s+on,?\s+you\s+(?:are|will|must)\b/i;
 const EXFIL_TARGET_RE = /(?:~\/?\.ssh|id_rsa|id_ed25519|\.env\b|\bcredentials?\b|mcp\.json|~\/?\.aws|\.git-credentials|private[_-]?key)/i;
 
-const MCP_IMPORTANT_RE = /<IMPORTANT>[\s\S]{0,400}(?:do\s+not\s+(?:mention|tell|reveal)|read\s|send\s|curl|wget|execute|\.env\b|credentials?|~\/?\.)/i;
-// Tempered `(?:(?!-->)[\s\S])` runs so the body can't cross a `-->`: the keyword must
-// live inside ONE comment. Stops a decorative divider from pairing with a keyword in
-// unrelated content (or a separate comment) up to 400 chars away, while every real
-// single-comment payload still fires. Bounded {0,400} both sides -> no runaway backtrack.
-const HTML_COMMENT_ACTION_RE = /<!--(?:(?!-->)[\s\S]){0,400}(?:curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|token|webhook|http)(?:(?!-->)[\s\S]){0,400}-->/i;
+// Tool poisoning fires on concealment, or on a transfer verb aimed at a secret. "<IMPORTANT>
+// read the file before editing" is ordinary documentation.
+const MCP_TARGET = '(?:id_rsa|\\.ssh\\/|\\.aws\\/|\\.env\\b|mcp\\.json|\\.git-credentials|private[\\s_-]?key)';
+const MCP_IMPORTANT_RE = new RegExp('<IMPORTANT>[\\s\\S]{0,400}(?:do\\s+not\\s+(?:mention|tell|reveal)|\\b(?:read|send|cat|upload|post|copy|curl|wget|include|pass)\\b[\\s\\S]{0,120}' + MCP_TARGET + '|\\b(?:execute|run)\\s+(?:curl|wget)\\b)', 'i');
+// An HTML comment carrying an action keyword. Walked with indexOf, one comment at a time (the
+// keyword must live inside ONE comment of at most ~800 chars): the old tempered regex cost
+// ~16 ms/KB on `<!--` padding, which pushed adapter hook calls past their timeout.
+const HTML_COMMENT_KEYWORD_RE = /curl|wget|base64|exec|eval|\.env\b|id_rsa|credentials?|webhook/i;
+function findActionComment(s) {
+  let e = -1;
+  for (let i = s.indexOf('<!--'); i !== -1; ) {
+    if (e < i + 4) e = s.indexOf('-->', i + 4);   // reuse the closer while it is still ahead
+    if (e === -1) return null;
+    if (e - i - 4 <= 820 && HTML_COMMENT_KEYWORD_RE.test(s.slice(i + 4, e))) return { index: i, text: s.slice(i, e + 3) };
+    i = s.indexOf('<!--', i + 4);
+  }
+  return null;
+}
 
 // Confusable Cyrillic/Greek letters that spoof ASCII Latin, mapped to the letter they
 // imitate. Single source of truth: CONFUSABLE (for the mixed-script detector) is
@@ -450,6 +484,29 @@ function scanShell(text, opts) {
   return findings;
 }
 
+// Is text[at] quoted rather than said: inside `inline code` or a ``` fence, on a `>` blockquote
+// line, or right after an opening quote character?
+// Linear per scan: newlines, backticks and fence lines are indexed once per text, then each call is
+// a few binary searches (slicing the text per call was quadratic on long input).
+let mentionIx = null;
+const countBelow = (a, x) => { let lo = 0, hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m] < x) lo = m + 1; else hi = m; } return lo; };
+function isMention(text, at) {
+  if (!mentionIx || mentionIx.text !== text) {
+    const pos = (re) => Array.from(text.matchAll(re), (m) => m.index);
+    mentionIx = { text, nl: pos(/\n/g), ticks: pos(/`/g), fences: pos(/^[ \t]*```/gm), quote: new Map() };
+  }
+  const ix = mentionIx;
+  const k = countBelow(ix.nl, at);
+  const ls = k ? ix.nl[k - 1] + 1 : 0;
+  if (!ix.quote.has(ls)) ix.quote.set(ls, /^[^\S\n]*>/.test(text.slice(ls, k < ix.nl.length ? ix.nl[k] : text.length)));
+  if (ix.quote.get(ls)) return true;
+  if ((countBelow(ix.ticks, at) - countBelow(ix.ticks, ls)) % 2 === 1) return true;
+  let j = at - 1;
+  while (j >= ls && /\s/.test(text[j])) j--;
+  if (j >= ls && /["'“‘«]/.test(text[j])) return true;
+  return countBelow(ix.fences, ls) % 2 === 1;
+}
+
 function scanInjectionText(findings, text, decodedLayer) {
   const { counts, clean } = normalizeForScan(text);
   // Invisible / steganographic-unicode matchers (tag, bidi-override, variation-selector,
@@ -467,14 +524,17 @@ function scanInjectionText(findings, text, decodedLayer) {
   //           tag/bidi/variation-selector smuggling, policy-puppetry, MCP tool-poisoning,
   //           and an override phrase co-located with an exfil target.
   //   MEDIUM = Class B -- legitimately appears in docs, tests, prompt datasets, and
-  //           AI-app source (role markers, a bare override phrase, a Q&A transcript, an
-  //           HTML-comment action, a homoglyph token). The caller hard-denies these ONLY
+  //           AI-app source (chat-template markers, a bare override phrase, jailbreak
+  //           phrases, a homoglyph token). The caller hard-denies these ONLY
   //           when the write target is an agent-instruction file that an agent auto-ingests
   //           (CLAUDE.md, AGENTS.md, .cursorrules, .mcp.json, ...); elsewhere they fall
   //           through. This is what stops shellter blocking a security write-up, a chatbot
   //           system-prompt string, or an example conversation.
+  //   LOW   = Class B2 -- advisory everywhere, including instruction files: `<system>` tags,
+  //           a Q&A transcript, a keyword-only HTML comment, persona phrasing.
   // Role markers (chatml/llama/`<system>`/`BEGIN SYSTEM PROMPT`) -> Class B.
-  for (const [re, sig] of ROLE_MARKERS) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.MEDIUM); }
+  // `<system>` / `<instructions>` tags are B2 (LOW): routine structure in agent definitions.
+  for (const [re, sig] of ROLE_MARKERS) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, sig === 'xml-system-tag' ? SEVERITY.LOW : SEVERITY.MEDIUM); }
   for (const [re, sig] of POLICY_PUPPETRY) { const m = re.exec(clean); if (m) pushFinding(findings, clean, m.index, 'injection', sig, SEVERITY.HIGH); }
 
   // Override phrases are matched on confusable-folded text so a phrase spoofed with
@@ -485,27 +545,38 @@ function scanInjectionText(findings, text, decodedLayer) {
   // prose into a match; the short role-label matchers are left unfolded (a stray "аі:"
   // would otherwise fold to a fake "AI:" label).
   const folded = foldConfusables(clean);
-  const ov = OVERRIDE_RE.exec(folded);
-  if (ov) {
+  // With an exfil target nearby -> Class A (real attack). A bare override phrase (a security doc,
+  // a test fixture, a chatbot prompt string) -> Class B. A quoted one (inline code, a fenced block,
+  // a blockquote, right after an opening quote) is a mention -> B2. "You are now a/an/the" is
+  // role-prompt boilerplate -> B2.
+  let best = null;
+  const allOv = new RegExp(OVERRIDE_RE.source, 'gi');
+  for (let ov; (ov = allOv.exec(folded));) {
     const window = folded.slice(Math.max(0, ov.index - 200), ov.index + 200);
-    const withExfil = EXFIL_TARGET_RE.test(window);
-    // With an exfil target nearby -> Class A (real attack). A bare override phrase (a
-    // security doc, a test fixture, a chatbot prompt string) -> Class B.
-    pushFinding(findings, folded, ov.index, 'injection', withExfil ? 'override-with-exfil-target' : 'instruction-override', withExfil ? SEVERITY.HIGH : SEVERITY.MEDIUM);
+    const boiler = /^you\s+are\s+now/i.test(ov[0]);
+    const quoted = !boiler && isMention(folded, ov.index);
+    const sev = EXFIL_TARGET_RE.test(window) ? SEVERITY.HIGH : boiler || quoted ? SEVERITY.LOW : SEVERITY.MEDIUM;
+    if (!best || RANK[sev] > RANK[best.sev] || (sev === best.sev && quoted && !best.quoted)) best = { index: ov.index, sev, quoted };
   }
+  // A quoted phrase is reported as its own signal: an agent-instruction file asks on it (a quote
+  // is one character, so it cannot exempt there), everywhere else it is advisory.
+  if (best) pushFinding(findings, folded, best.index, 'injection', best.sev === SEVERITY.HIGH ? 'override-with-exfil-target'
+    : best.sev === SEVERITY.LOW && best.quoted ? 'instruction-override-quoted' : 'instruction-override', best.sev);
 
   // Jailbreak / role-hijack phrases -> Class B (MEDIUM): denied only on an agent-instruction file.
   const rh = ROLE_HIJACK_RE.exec(clean);
   if (rh) pushFinding(findings, clean, rh.index, 'injection', 'role-hijack', SEVERITY.MEDIUM);
+  const ps = PERSONA_RE.exec(clean);
+  if (ps) pushFinding(findings, clean, ps.index, 'injection', 'persona-phrase', SEVERITY.LOW);
 
   const mi = MCP_IMPORTANT_RE.exec(clean); if (mi) pushFinding(findings, clean, mi.index, 'injection', 'mcp-tool-poisoning', SEVERITY.HIGH);
-  const hc = HTML_COMMENT_ACTION_RE.exec(clean);
+  const hc = findActionComment(clean);
   if (hc) {
     // HIGH only when the comment also names an exfil/secret target -- a real data-theft
     // payload (`<!-- curl ...~/.ssh/id_rsa... -->`). A lone keyword (`<!-- see http://... -->`,
-    // `<!-- auth token handling -->`) is Class B and destination-gated by the caller.
-    const hcHigh = EXFIL_TARGET_RE.test(hc[0]);
-    pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', hcHigh ? SEVERITY.HIGH : SEVERITY.MEDIUM);
+    // `<!-- run eval on load -->`) is advisory (B2, LOW).
+    const hcHigh = EXFIL_TARGET_RE.test(hc.text);
+    pushFinding(findings, clean, hc.index, 'injection', 'html-comment-action', hcHigh ? SEVERITY.HIGH : SEVERITY.LOW);
   }
 
   // Homoglyph mixed-script is the one display-spoof matcher that fires on the random
@@ -527,7 +598,7 @@ function scanInjectionText(findings, text, decodedLayer) {
   let rm; ROLE_LINE_RE.lastIndex = 0;
   let firstIdx = -1;
   while ((rm = ROLE_LINE_RE.exec(clean))) { seen.add(rm[1].toLowerCase()); if (firstIdx < 0) firstIdx = rm.index; }
-  if (seen.size >= 2) pushFinding(findings, clean, firstIdx, 'injection', 'fake-transcript-role-labels', SEVERITY.MEDIUM);
+  if (seen.size >= 2) pushFinding(findings, clean, firstIdx, 'injection', 'fake-transcript-role-labels', SEVERITY.LOW);
 }
 
 function scanInjection(text, opts) {
@@ -570,7 +641,9 @@ function scanInjection(text, opts) {
     const nfkc = text.normalize('NFKC');
     if (nfkc !== text) {
       const sub = [];
-      scanInjectionText(sub, nfkc, true);
+      // Selectors are already counted on the raw text. NFKC folds an emoji base (U+2122,
+      // U+2139) to ASCII, so counting them again here flags `TM` + VS16 as smuggling.
+      scanInjectionText(sub, nfkc.replace(VS_RE, ''), true);
       addView(sub, ':nfkc');
     }
   }
@@ -582,13 +655,29 @@ function scanInjection(text, opts) {
     addView(sub, ':marker-stripped');
   }
 
-  if (opts.decode !== false) {
-    const decoded = decodeLayers(text);
-    if (decoded) {
+  // Markdown emphasis inside a keyword (`ignore **previous** instructions`), only when the text
+  // has both an emphasis marker and an override word.
+  if (/[*_~`<\[]/.test(text) && /\b(?:ignore|disregard|forget|previous|prior|instructions?|system)\b/i.test(text)) {
+    const plain = text.replace(/<\/?[A-Za-z][\w-]{0,16}>/g, '').replace(/\[([^\]\n]{1,64})\]\([^)\s]{0,256}\)/g, (m, t) => t)
+      // A marker run touching a word goes, whatever its length; one pass over each run keeps it linear.
+      .replace(/[*_~]+/g, (m, at, s) => (/\w/.test(s[at - 1] || '') || /\w/.test(s[at + m.length] || '') ? '' : m))
+      .replace(/(?<=\w)`+(?=\w)/g, '');   // a code span stays a mention
+    if (plain !== text) {
       const sub = [];
-      scanInjectionText(sub, decoded, true);
+      scanInjectionText(sub, plain, true);
+      addView(sub, ':emphasis');
+    }
+  }
+
+  if (opts.decode !== false) {
+    const d = decodeLayers(text, { report: true });
+    if (d.text) {
+      const sub = [];
+      scanInjectionText(sub, d.text, true);
       addView(sub, ':decoded');
     }
+    // The budget ran out with encoded tokens left unread: a coverage gap, not a finding.
+    if (d.exhausted) findings.push({ category: 'coverage', signal: 'decode-budget-exhausted', line: 0, snippet: '', severity: SEVERITY.LOW });
   }
   return findings;
 }
@@ -597,8 +686,79 @@ function scanInjection(text, opts) {
 // hard-denied only when written to one of these; elsewhere it is legitimate authored
 // content. Single source of truth, shared by check-sensitive-files.js (Write/Edit) and
 // check-bash.js (shell redirect / heredoc write).
-const AGENT_INSTRUCTION_FILE = /(^|[\/\\])(CLAUDE(\.local)?\.md|AGENTS?\.md|GEMINI\.md|\.cursorrules|\.clinerules|\.windsurfrules|\.aider\.conf\.yml|copilot-instructions\.md|\.?mcp\.json)$|(^|[\/\\])\.claude[\/\\]/i;
-function isAgentInstructionFile(p) { return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p); }
+const AGENT_INSTRUCTION_FILE = /(^|[\/\\])(CLAUDE(\.local)?\.md|AGENTS?\.md|GEMINI\.md|SKILL\.md|\.cursorrules|\.clinerules|\.windsurfrules|\.aider\.conf\.yml|copilot-instructions\.md|\.?mcp\.json|opencode\.json)$|(^|[\/\\])(?:\.claude|\.opencode|\.codex|\.gemini|\.pi|\.agents|\.cursor[\/\\]rules|\.windsurf[\/\\]rules|\.github[\/\\]instructions|\.clinerules|\.roo[\/\\]rules|\.kiro[\/\\]steering)[\/\\]/i;
+// An agent worktree (`.claude/worktrees/<name>/`) is a checkout: its own CLAUDE.md counts, its source does not.
+function isAgentInstructionFile(p) {
+  return typeof p === 'string' && AGENT_INSTRUCTION_FILE.test(p.replace(/(^|[\/\\])\.claude[\/\\]worktrees[\/\\][^\/\\]+[\/\\]/gi, '$1'));
+}
+
+// One path component of a glob as an anchored, case-insensitive RegExp (null if unparseable: callers
+// treat that as a match). A leading `*`/`?`/`[` never matches a leading dot, as in bash.
+// Callers test it against short names, so a component whose shortest match is over 64 characters
+// matches none of them: it gets a regex that never matches. A class counts as one character.
+const GLOB_NEVER = /(?!)/;
+function globComponentRe(comp) {
+  comp = comp.replace(/\*+/g, '*');
+  const lastClose = comp.lastIndexOf(']');
+  let re = /^[*?[]/.test(comp) ? '^(?!\\.)' : '^', units = 0;
+  for (let i = 0; i < comp.length; i++) {
+    if (units > 64) return GLOB_NEVER;
+    const c = comp[i];
+    if (c !== '*') units++;
+    if (c === '*') re += '.*';
+    else if (c === '?') re += '.';
+    else if (c === '[') {
+      const e = lastClose < i + 2 ? -1 : comp.indexOf(']', i + 2);
+      if (e < 0) { re += '\\['; continue; }
+      // `[[:alpha:]]`, `[[=e=]]`, `[[.e.]]`: the class runs past the first `]`. Any one character.
+      if (/\[[:=.]/.test(comp.slice(i + 1, e))) {
+        let j = i + 1 + (/[!^]/.test(comp[i + 1]) ? 1 : 0);
+        if (comp[j] === ']') j++;
+        while (j < comp.length && comp[j] !== ']') {
+          const k = comp[j] === '[' && ':=.'.includes(comp[j + 1]) ? comp.indexOf(comp[j + 1] + ']', j + 2) : -1;
+          j = k < 0 ? j + 1 : k + 2;
+        }
+        if (j >= comp.length) { re += '\\['; continue; }
+        re += '.'; i = j; continue;
+      }
+      // A reversed range (`[post-id]`: `t-i`) matches nothing in bash; the rest of the class still counts.
+      let body = comp.slice(i + 1, e), cls = '';
+      const neg = /^[!^]/.test(body);
+      if (neg) body = body.slice(1);
+      const esc = (ch) => ch.replace(/[\\\]^]/g, '\\$&');
+      for (let k = 0; k < body.length; k++) {
+        if (body[k + 1] !== '-' || k + 2 >= body.length) cls += esc(body[k]);
+        else { if (body[k] <= body[k + 2]) cls += esc(body[k]) + '-' + esc(body[k + 2]); k += 2; }
+      }
+      re += cls ? '[' + (neg ? '^' : '') + cls + ']' : neg ? '.' : '(?!)';
+      i = e;
+    } else re += c.replace(/[.*+?^${}()|\\]/g, (m) => '\\' + m);
+  }
+  if (units > 64) return GLOB_NEVER;
+  try { return new RegExp(re + '$', 'i'); } catch { return null; }
+}
+
+// Does a glob (`.en*`, `~/.s?h/id_r*a`, `.[e]nv`) expand to a secret file? Each component is
+// tried against canonical secret names and against ordinary decoys. 'secret' = some component
+// hits a secret and no decoy; 'dot' = a literal-dot component hits both (`.e*`, `.*`: the
+// caller should not auto-approve it); null = no glob or not secret-shaped (`*.md`, `src/*`).
+const GLOB_SECRETS = ['.env', '.env.local', '.netrc', '.npmrc', '.pgpass', '.ssh', '.aws', '.gnupg', '.git-credentials',
+  '.gitconfig', 'id_rsa', 'id_ed25519', 'id_ecdsa', 'credentials', 'x.pem', 'x.key'];
+const GLOB_DECOYS = ['.eslintrc', '.editorconfig', '.gitignore', '.nvmrc', 'README.md', 'index.js', 'notes.txt',
+  'package.json', 'src', 'docs', 'credits.md', 'keys.ts', 'environment.ts'];
+function globHitsSecret(tok) {
+  if (typeof tok !== 'string' || !/[*?[]/.test(tok)) return null;
+  let verdict = null;
+  for (const comp of tok.split(/[\\/]/)) {
+    if (!/[*?[]/.test(comp)) continue;
+    const rx = globComponentRe(comp);
+    if (!rx) return 'secret';
+    if (!GLOB_SECRETS.some((n) => rx.test(n))) continue;
+    if (!GLOB_DECOYS.some((n) => rx.test(n))) return 'secret';
+    if (comp[0] === '.') verdict = 'dot';
+  }
+  return verdict;
+}
 
 function hasHigh(findings) { return findings.some(f => f.severity === SEVERITY.HIGH); }
 function highest(findings) {
@@ -607,7 +767,123 @@ function highest(findings) {
   return best;
 }
 
+// A file that defines commands (package.json scripts, a Makefile recipe, a husky hook): a HIGH shell finding
+// there denies. The exception is a download-exec line whose every URL is an https installer on a well-known
+// host (rustup, uv, bun, nodesource, pnpm, nvm, docker), with no more downloads than such URLs. A
+// package.json is also scanned JSON-decoded (`\u007c` is `|`).
+const DOWNLOAD_EXEC = /^(?:download-piped-to-shell|process-substitution-download-exec|powershell-iex-download|powershell-webclient-download)$/;
+const INSTALLER_URL = /^https:\/\/(?:(?:sh\.rustup\.rs|astral\.sh|bun\.sh|deb\.nodesource\.com|rpm\.nodesource\.com|get\.pnpm\.io|get\.docker\.com)(?:\/[\w.\/-]*)?|raw\.githubusercontent\.com\/nvm-sh\/[\w.\/-]*)$/i;
+// Every fetch command on the line must be curl/wget with only quiet/follow/fail flags and exactly one
+// installer URL: a second target, a config file, a proxy or any variable makes it an ordinary download-exec.
+const INSTALLER_FLAG = /^(?:-[fsSLq]+|-[fsSLq]*O-|--(?:fail|silent|show-error|location|quiet|tlsv1\.[23]|proto)|=https)$/;
+function installerLine(line) {
+  if (/[$`]|download(?:string|file|data)|\b(?:fetch|iwr|irm|invoke-webrequest|invoke-restmethod)\b/i.test(line)) return false;
+  let fetches = 0;
+  for (const part of line.split(/\|\|?|;|&&?/)) {
+    const t = part.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/^['"]+|['"]+$/g, ''));
+    if (!t.length || !/^(?:curl|wget)$/i.test(t[0].replace(/^.*[\\/]/, ''))) {
+      if (/\b(?:curl|wget)\b/i.test(part)) return false;
+      continue;
+    }
+    fetches++;
+    let urls = 0;
+    for (const w of t.slice(1)) {
+      if (INSTALLER_FLAG.test(w)) continue;
+      if (!INSTALLER_URL.test(w) || w.includes('..')) return false;
+      urls++;
+    }
+    if (urls !== 1) return false;
+  }
+  return fetches > 0;
+}
+function cmdDefHigh(target, body) {
+  let text = body;
+  if (/(?:^|[\\/])package\.json$/i.test(target)) {
+    // Parsed: every decoded string value (`scripts`, and hook configs like `husky.hooks` run too).
+    // Unparseable: scanned as written.
+    const leaves = (v) => (typeof v === 'string' ? [v] : v && typeof v === 'object' ? Object.values(v).flatMap(leaves) : []);
+    try { text = leaves(JSON.parse(body)).join('\n'); } catch (_) { /* scanned as written */ }
+  }
+  const phys = text.split('\n');
+  return scanShell(text).some((f) => {
+    if (f.severity !== SEVERITY.HIGH) return false;
+    if (!DOWNLOAD_EXEC.test(f.signal) || !f.line) return true;
+    let line = '';
+    for (let i = f.line - 1; i < phys.length; i++) { line += phys[i] + ' '; if (!phys[i].endsWith('\\')) break; }
+    return !installerLine(line);
+  });
+}
+
+// Credential stores both hooks treat as secrets (Read and `cat` alike). Regex sources with an either-slash
+// separator so the same text matches a path and raw command text; each ends at a name boundary.
+const SEP = '[\\\\/]', END = '(?![\\w.-])';
+const CRED_PATH_SRC = [
+  '\\.(?:bitbucket|atlassian)-rest-cli-config\\.json' + END,
+  '\\.codex' + SEP + 'auth\\.json' + END,
+  '(?<![\\w-])\\.claude\\.json(?:\\.backup)?' + END,
+  '\\.config' + SEP + 'figma' + SEP + 'token' + END,
+  '\\.mobiledev' + SEP + 'authtoken' + END,
+  '\\.emulator_console_auth_token' + END,
+  '\\.conda' + SEP + 'aau_token' + END,
+  '(?<![\\w-])client_secret(?:_[\\w-]+\\.apps\\.googleusercontent\\.com)?\\.json' + END,   // Google OAuth download
+  SEP + '\\.dailyclones-runner(?:' + SEP + '|' + END + ')',
+  SEP + 'Trust Tokens(?:-journal)?' + END,
+  SEP + '(?:Default|Profile \\d+|Guest Profile)' + SEP + '(?:Network' + SEP + ')?(?:Cookies|Login Data|Web Data)(?:-journal)?' + END,
+];
+const CRED_PATH_RE = new RegExp('(?:' + CRED_PATH_SRC.join('|') + ')', 'i');
+
+// A file NAME that looks like a credential store, under the user's home and outside the project: asked,
+// and denied when its first 64 KB hold a real token shape. Package caches and source files never count.
+const CRED_NAME = /(?:^|[._ -])tokens?(?:$|[._ -])|^auth\.json$|credential|^client_secret[^\/]*\.json$|-cli-config\.json$|^(?:Cookies|Login Data|Trust Tokens)$|\.enc$/i;
+const CRED_NAME_NOT = /tokeniz|special_tokens|added_tokens|design-tokens/i;
+const CRED_SKIP_DIR = /[\\/](?:node_modules|site-packages|\.cargo|\.rustup|\.nvm|\.pyenv|pkg[\\/]mod)[\\/]/i;
+const SOURCE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|kt|kts|swift|scala|cs|css|scss|less|vue|svelte|html|md)$/i;
+const SECRET_SHAPES = [
+  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/, /\bgh[pousr]_[A-Za-z0-9]{36,}/, /\bgithub_pat_[A-Za-z0-9_]{60,}/,
+  /\bxox[bpars]-[A-Za-z0-9-]{20,}/, /\beyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}/, /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+  /\bATATT3[A-Za-z0-9_=-]{20,}/,
+];
+// An rc line setting a credential name (not `X_TOKEN_FILE`) to a literal: not empty, not `$OTHER`.
+// `[ \t]`, not `\s`, after `^`: under /m a `\s*` re-scans every following newline (quadratic).
+const RC_ASSIGN = /^[ \t]*(?:export[ \t]+)?([A-Z_][A-Z0-9_]*)[ \t]*=[ \t]*(?!["']?\$|""|''|\s|$)/gm;
+const SECRET_PART = /(?:^|_)(?:TOKENS?|SECRETS?|PASSWORD|PASSWD|PASS|API_?KEY|PRIVATE_KEY|CREDENTIALS?|PAT|KEY_BASE)(?:_|$)|_PWD(?:_|$)|_(?:KEY|AUTH)$|PASSW(?:OR)?D$/;
+const BENIGN_VAR = /_(?:TYPE|FILE|PATH|DIR|URL|NAME|ID|LENGTH|LIMIT)$|(?:^|_)(?:TOTAL|INPUT|OUTPUT|USED|PROMPT|COMPLETION|CONTEXT)_TOKENS$|(?:^|_)(?:PAGE_TOKEN|MAX_TOKENS|TOKEN_COUNT)(?:_|$)|^MAX_\w*_TOKENS$|_THINKING_TOKENS$|(?:^|_)(?:CACHE|SORT|PRIMARY|PARTITION|FOREIGN|MAP|HASH|ROUTING|IDEMPOTENCY|LOOKUP|GROUP|SHARD|DEDUP)_KEY$/;
+// Run-together names (`GITHUBTOKEN`, `JWTSECRET`, `PRIVATEKEY`) count too; a name holding SECRET is never benign.
+const SECRET_WORD = /SECRET|TOKEN(?!IZ)|PASSW(?:OR)?D|APIKEY|CREDENTIAL|PRIVATE_?KEY/;
+const secretVarName = (n) => /^[A-Z][A-Z0-9_]*$/.test(n) && (n === 'AWS_ACCESS_KEY_ID' ||
+  ((SECRET_PART.test(n) || SECRET_WORD.test(n)) && (!BENIGN_VAR.test(n) || /SECRET/.test(n))));
+const rcSecret = (t) => [...t.matchAll(RC_ASSIGN)].some((m) => secretVarName(m[1]));
+const RC_NAME = /^\.(?:bashrc|zshrc|profile|bash_profile|bash_aliases|bash_login|zprofile|zshenv|zlogin|kshrc|cshrc)$/i;
+const inside = (child, parent) => { const r = require('path').relative(parent, child); return !!parent && !r.startsWith('..') && !require('path').isAbsolute(r); };
+function credHeuristic(abs, home, projectRoot) {
+  if (!abs || !home || !inside(abs, home) || inside(abs, projectRoot) || CRED_SKIP_DIR.test(abs)) return false;
+  const name = abs.replace(/^.*[\\/]/, '');
+  return CRED_NAME.test(name) && !CRED_NAME_NOT.test(name) && !SOURCE_EXT.test(name);
+}
+// One bounded read: a regular file only (a FIFO or device would block), first 64 KB, any error -> false.
+function sniffSecret(abs, rc) {
+  if (/^(?:\\\\|\/\/)|^\/(?:proc|sys|dev)\//.test(abs)) return false;
+  const fs = require('fs');
+  let fd;
+  try {
+    const st = fs.statSync(abs);
+    if (!st.isFile() || st.size === 0) return false;
+    const buf = Buffer.alloc(Math.min(st.size, 65536));
+    fd = fs.openSync(abs, 'r');
+    const t = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0)).toString('utf8');
+    return SECRET_SHAPES.some((re) => re.test(t)) || (rc && rcSecret(t));
+  } catch (_) { return false; } finally { if (fd !== undefined) try { fs.closeSync(fd); } catch (_) { /* closed */ } }
+}
+// 'deny' | 'ask' | null for a read of `abs`.
+function credVerdict(abs, home, projectRoot) {
+  if (!abs || !home || !inside(abs, home)) return null;
+  if (RC_NAME.test(abs.replace(/^.*[\\/]/, ''))) return sniffSecret(abs, true) ? 'deny' : null;
+  if (!credHeuristic(abs, home, projectRoot)) return null;
+  return sniffSecret(abs, false) ? 'deny' : 'ask';
+}
+
 module.exports = {
   SEVERITY, normalizeForScan, shannonEntropy, locate, decodeOneLayer,
-  scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces,
+  scanShell, scanInjection, hasHigh, highest, isAgentInstructionFile, expandBraces, globHitsSecret, globComponentRe, cmdDefHigh,
+  CRED_PATH_SRC, CRED_PATH_RE, credHeuristic, sniffSecret, credVerdict, secretVarName,
 };

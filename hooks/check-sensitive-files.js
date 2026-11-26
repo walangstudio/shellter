@@ -6,8 +6,14 @@
 
 'use strict';
 
+// The nearest package.json decides how node loads this file: pin it beside the hooks on the first run
+// (merge-settings.js writes it too), so a module-type ancestor added later cannot switch the hooks off.
+// A hook already under one fails to parse before this line; only the installer heals that.
+try { require('fs').writeFileSync(require('path').join(__dirname, 'package.json'), '{"type":"commonjs"}\n', { flag: 'wx' }); } catch (_) { /* present */ }
+if (!module.parent && require('./watchdog.js').parent(__filename, 'check-sensitive-files')) return;
 const fs = require('fs');
 const path = require('path');
+const watchdog = require('./watchdog.js');
 const scan = require('./scan-content.js');
 
 function audit(decision, reason, snippet) {
@@ -42,8 +48,7 @@ function deny(reason, snippet) {
       permissionDecisionReason: reason + BYPASS_NOTICE,
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 // A dual-use content signal (legitimate in docs/CI, suspicious in a config an agent fabricates)
@@ -62,8 +67,7 @@ function ask(reason, snippet) {
       permissionDecisionReason: reason + ' -- approve only if you intended it',
     },
   });
-  process.stdout.write(output + '\n');
-  process.exit(0);
+  watchdog.finish(output);
 }
 
 // Resolve symlinks for the deepest existing ancestor and re-append the
@@ -88,20 +92,48 @@ function safeRealpath(p) {
   return abs;
 }
 
-// Strip invisible/steganographic characters. Returns separate counts so callers
-// can apply different policies: tag chars and bidi overrides have no legitimate
-// use anywhere; zero-widths are legit in emoji ZWJ sequences but suspicious in
-// source code.
+// One spelling for every path rule: `\` -> `/`, no NTFS stream suffix (`x::$DATA`,
+// `x:stream`), no trailing dots/spaces on a segment (Windows drops them; `.`/`..` stay).
+function canon(p) {
+  return p.replace(/\\/g, '/')
+    .replace(/^((?:[A-Za-z]:)?[^:]*[^\/:]):[^\/:]*(?::\$\w+)?$/, (m, name) => name)
+    .replace(/([^\/.\s])[. ]+(?=\/|$)/g, (m, c) => c);
+}
+// The path as given, its symlink/junction-resolved form, and both canonical spellings.
+function pathForms(p) {
+  if (typeof p !== 'string' || !p) return [];
+  const r = safeRealpath(p);
+  return [...new Set([p, canon(p), r, r && canon(r)])].filter(Boolean);
+}
+
+// Strip invisible/steganographic characters. Tag chars and bidi overrides have no legitimate
+// use anywhere (`danger`); zero-widths are counted separately by suspiciousZW.
 function stripInvisibles(s) {
-  if (typeof s !== 'string') return { clean: s, danger: 0, zwCount: 0 };
+  if (typeof s !== 'string') return { clean: s, danger: 0 };
   const tagCount = (s.match(/[\u{E0000}-\u{E007F}]/gu) || []).length;
   const bidiCount = (s.match(/[‪-‮⁦-⁩]/g) || []).length;
-  const zwCount = (s.match(/[​-‍⁠﻿]/g) || []).length;
   const clean = s
     .replace(/[\u{E0000}-\u{E007F}]/gu, '')
     .replace(/[‪-‮⁦-⁩]/g, '')
     .replace(/[​-‍⁠﻿]/g, '');
-  return { clean, danger: tagCount + bidiCount, zwCount };
+  return { clean, danger: tagCount + bidiCount };
+}
+
+// Zero-width characters that are not part of normal text: a ZWJ joins emoji (both neighbours
+// emoji-ish) and a BOM at offset 0 is an encoding mark; anything else counts.
+const emojiish = (c) => c >= 0x1f000 || (c >= 0x2190 && c <= 0x2bff) || c === 0xfe0f;
+function suspiciousZW(s) {
+  if (!/[​-‍⁠﻿]/.test(s)) return 0;
+  const cp = Array.from(s, (ch) => ch.codePointAt(0));
+  let n = 0;
+  for (let i = 0; i < cp.length; i++) {
+    const c = cp[i];
+    if (!((c >= 0x200b && c <= 0x200d) || c === 0x2060 || c === 0xfeff)) continue;
+    if (c === 0xfeff && i === 0) continue;
+    if (c === 0x200d && i > 0 && emojiish(cp[i - 1]) && emojiish(cp[i + 1] || 0)) continue;
+    n++;
+  }
+  return n;
 }
 
 const SOURCE_LIKE_EXT = /\.(js|ts|jsx|tsx|mjs|cjs|py|rs|go|rb|java|c|cc|cpp|h|hpp|kt|swift|sh|bash|zsh|json|yaml|yml|toml|ini|html|svelte|vue|css|scss|less|sql|php|pl|lua|nim|zig)$/i;
@@ -118,14 +150,21 @@ const SOURCE_LIKE_EXT = /\.(js|ts|jsx|tsx|mjs|cjs|py|rs|go|rb|java|c|cc|cpp|h|hp
 // here: it hard-denied any file containing "you are now a", "act as if", "<system>",
 // "[SYSTEM]", a `User:`/`Assistant:` transcript, or "<!-- ... http ... -->", which blocks
 // ordinary docs, tests, and AI-app source. The disciplined scanner below replaces it.
-const ENCODED_EVAL_PATTERN = /(eval|exec)\s*\(\s*(base64|atob|Buffer\.from)\s*\(/i;
+// A bare eval/exec of a decode denies. A METHOD `.exec(` over a decode asks: `re.exec(atob(x))`
+// (a regex match) and `cp.exec(atob(x))` (a shell) look the same here.
+const DECODE_CALL = '\\s*\\(\\s*(?:base64\\b[\\w.]*|atob|Buffer\\.from)\\s*\\(';
+const ENCODED_EVAL_PATTERN = new RegExp('(?<![.\\w$])(?:eval|exec)' + DECODE_CALL, 'i');
+const ENCODED_METHOD_EXEC = new RegExp('\\.\\s*(?:eval|exec)' + DECODE_CALL, 'i');
 
 // Fake tool-call injection (attacker-controlled file pretending to be an
 // assistant message).
 const TOOL_CALL_INJECTION_PATTERN = /<\/?(function_calls|invoke|tool_use|tool_call)\b|<invoke\s+name=/i;
 
 // Markdown-rendered XSS-style URLs.
-const MARKDOWN_DANGEROUS_URL = /\]\(\s*(javascript|data:text\/html|vbscript):/i;
+// Only where it renders (markdown / HTML, or a file an agent ingests); a sanitizer test in
+// `.js` legitimately carries the string.
+const MARKDOWN_DANGEROUS_URL = /\]\(\s*(?:javascript:|vbscript:|data:text\/html)/i;
+const RENDERED_DOC_EXT = /\.(?:md|mdx|markdown|html?)$/i;
 
 // ANSI escape sequences in source files (terminal-display obfuscation).
 const ANSI_ESCAPE_PATTERN = /\x1b\[[\d;]*[A-Za-z]/;
@@ -150,8 +189,8 @@ const POLYGLOT_PATTERN = /(\$\(|`)\s*(?:env\s+)?(?:[\w.~\\/-]{0,128}[\\/])?(curl
 const SENSITIVE_EXTENSIONS = /\.(?:env(?!\.(?:example|sample|template|dist|defaults?)\b)|pem|key|p12|pfx|ppk|jks|keystore|secret|credentials|pgpass|netrc|npmrc)(\.(bak|old|backup|orig|swp|save))?(\.\d+)?\b/i;
 const SENSITIVE_DIRS = /(^|\/)(\.ssh|\.gnupg|\.aws|\.gcloud|\.azure|\.kube|\.docker\/config|\.config\/(gh|hub|gcloud)|id_rsa|id_ed25519|id_ecdsa|known_hosts|authorized_keys)(\/|$)/i;
 // .gitconfig deliberately excluded: tokens normally live in .git-credentials.
-const SENSITIVE_FILES = /(^|\/)(\.git-credentials|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
-const ENV_FILE = /(^|\/)\.env(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
+const SENSITIVE_FILES = /(^|\/)(\.git-credentials|_netrc|proc\/(?:[^\/]+\/){1,3}environ|\.npmrc|\.yarnrc|\.pnpmrc|\.pypirc|\.cargo\/credentials(\.toml)?|\.gem\/credentials|\.docker\/config\.json|\.config\/git\/credentials|\.ssh\/config|\.aws\/sso\/cache)(\/|$)/i;
+const ENV_FILE = /(^|\/)\.env(?:rc|[_-][A-Za-z0-9_-]+)?(?!\.(?:example|sample|template|dist|defaults?)(?:$|\.))(\.[a-zA-Z0-9_-]+)*(\.(bak|old|backup|orig|save))?$/i;
 const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 // A source-code file inside a dir named credentials/secrets is code, not a secret
 // (`src/credentials/oauth.ts`), so it is exempt from the SECRETS_DIR match. Data files
@@ -161,10 +200,38 @@ const SECRETS_DIR = /(^|\/)(secrets?|credentials?|private[_-]?keys?)(\/|$)/i;
 // real secret material, not code.
 const CODE_FILE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|cc|cpp|h|hpp|kt|kts|swift|scala|clj|ex|exs|css|scss|less|vue|svelte|html)$/i;
 const SENSITIVE_GLOB = /\*\.(env|pem|key|crt|secret)/i;
+// A key or certificate a test suite ships (`test/fixtures/fake_key.pem`) is fixture data.
+// Files whose content is a command a runner runs (kept in step with check-bash.js CMD_DEF).
+const CMD_DEF = /(?:^|[\\/])(?:package\.json|makefile|GNUmakefile|[^\\/]*\.mk|build\.rs|conftest\.py|setup\.py|setup\.cfg|pyproject\.toml|tox\.ini|pytest\.ini|noxfile\.py|\.npmrc|\.yarnrc(?:\.yml)?|Cargo\.toml|config\.toml|Rakefile|justfile|Taskfile\.ya?ml|composer\.json|deno\.jsonc?|\.husky[\\/][^\\/]+)$/i;
+// Only inside the project (`/etc/ssl/private/tests/server.key` is not fixture data).
+const TEST_KEY = /^(?:[^\\/]+[\\/])*(?:test|tests|fixtures|__fixtures__|testdata)[\\/](?:[^\\/]+[\\/])*(?:[^\\/]+\.(?:pem|key)|credentials\.json)$/i;
+let projectRoot = process.cwd();
+let credHome = '';
+try { credHome = require('os').homedir(); } catch (_) { /* no home: the name heuristic is off */ }
+const testKey = (p) => {
+  const abs = path.resolve(projectRoot, p);
+  let r = path.relative(projectRoot, abs);
+  // `p` may already be canonical while the root is not (macOS /private/var, a Windows 8.3 temp name).
+  if (r.startsWith('..') || path.isAbsolute(r)) try { r = path.relative(fs.realpathSync.native(projectRoot), abs); } catch (_) { /* keep r */ }
+  if (r.startsWith('..') || path.isAbsolute(r) || !TEST_KEY.test(r)) return false;
+  // A symlink out of the project (`tests/k -> /etc/ssl/private`) is not fixture data.
+  try { const rr = path.relative(fs.realpathSync.native(projectRoot), fs.realpathSync.native(path.resolve(projectRoot, p))); return !rr.startsWith('..') && !path.isAbsolute(rr); } catch (_) { return true; }
+};
 
 // Wallet / crypto / browser cookie files.
 const WALLET_PATTERN = /\b(wallet\.dat|keystore\.json|UTC--\d{4}-\d{2}-\d{2}T)\b|(^|\/)\.electrum\/wallets\/|(^|\/)\.bitcoin\/wallet\.dat$/i;
-const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|google-chrome|mozilla)[^\/]*\/.*\/(Cookies|Cookies-journal|Login Data|Web Data)$/;
+const BROWSER_DATA_PATTERN = /(Chrome|Chromium|Firefox|firefox|Edge|Safari|google-chrome|mozilla)[^\/]*\/.*\/(Cookies|Cookies-journal|Login Data|Web Data)$/i;
+// shellter's own trust store and installed hooks: a write there is the agent granting itself
+// trust or switching shellter off. The dev repo's `hooks/` (no `.claude` segment) is not matched,
+// and a fixture that merely shares the store's file name is not the store (see isTrustStore).
+const SHELLTER_SELF = /(^|\/)\.claude\/shellter-trust\.json$|\/\.claude\/(?:hooks|plugins)\/.*(?:check-bash|check-sensitive-files|scan-content|watchdog|patch-targets|shellter-(?:trust|scan))\.js$/i;
+// The plugin's installed copy: a write anywhere in it can switch shellter off.
+const SHELLTER_PLUGIN_CACHE = /(^|\/)\.claude\/plugins\/(?:cache|marketplaces)\/(?:[^\/]+\/)*shellter\//i;
+// Allow rules and hooks live here. The user edits it too, so ask, never deny.
+const CLAUDE_SETTINGS = /(^|\/)\.claude\/settings(?:\.local)?\.json$/i;
+// The user's own shell history and Claude config: plausibly holds a pasted token, but
+// reading it is also routine. Ask, never deny.
+const PERSONAL_HISTORY = /(^|\/)\.(?:bash|zsh)_history$/i;
 // macOS Keychain databases.
 const MACOS_KEYCHAIN = /(^|\/)(Library\/Keychains\/|login\.keychain(-db)?$|System\.keychain$)/i;
 // Windows credential / hive files. The bare hive names (SAM/SYSTEM/SECURITY) require a
@@ -190,41 +257,103 @@ const GREP_SECRET_EXTRACTION = [
 // A `keyword = value` extraction (searching for a plaintext credential assignment). This is
 // a routine self-audit inside your own repo, so it is denied ONLY when the search path is a
 // broad off-project location (a home/system root) -- i.e. mass credential harvesting.
-const GREP_KEYWORD_EXTRACTION = /(password|secret|api.?key|token|credential|private.?key)\s*[:=]\s*[^${\s]/i;
-const BROAD_SEARCH_PATH = /^(?:~|\/(?:home|Users|etc|root|var|opt|usr|private|srv|mnt|mount)\b|\/$|[A-Za-z]:[\\\/]Users\b)/i;
+// Regex tokens between the keyword and the separator (`password\s*=\S`, `token.*:`) count as gap.
+const GREP_KEYWORD_EXTRACTION = /(password|secret|api.?key|token|credential|private.?key)(?:\s|\\[sSwW][*+?]?|\.[*+?]|\[\^?[^\]]{0,16}\][*+?]?){0,6}[:=](?:\s|\\[sS][*+?]?){0,4}[^${\s]/i;
+// A token SHAPE written as a regex (`AKIA[0-9A-Z]{16}`, `ghp_[A-Za-z0-9]{36}`, `BEGIN.*PRIVATE KEY`):
+// case-sensitive and followed by regex syntax, so `privateKey` or `beginSection` is not one. This
+// repo's own source is full of those strings, so only a broad search path denies.
+// A token prefix followed by regex syntax (a class, `.`, `\w`, a group): `privateKey` or `token: string` is not one.
+const GREP_TOKEN_SHAPE = /(?:AKIA|gh(?:[pousr]|\[[pousr]+\])_|xox[a-z]?-?|eyJ)(?:\[|\.|\\[wWdDsS]|\()|BEGIN[\s\S]{0,24}PRIVATE KEY/i;
+
+// A broad search path is a place to harvest from, not a project: a filesystem or drive root, a
+// home root (any user's) or an ancestor of it, a dot-directory directly under a home root, or
+// system config. A project below a home directory is not broad.
+const HOME_ROOT = '(?:/(?:home|users)/[^/]+|[a-z]:/users/[^/]+|/root)';
+const BROAD_RE = new RegExp('^(?:/?|[a-z]:/?|/(?:home|users|var|usr|opt|srv|mnt|mount|private)/?|[a-z]:/users/?|' +
+  HOME_ROOT + '(?:/\\.[^/]+)?/?|/(?:private/)?etc(?:/.*)?)$', 'i');
+function isBroadSearchPath(p) {
+  if (typeof p !== 'string' || !p) return false;
+  let home = '';
+  try { home = canon(require('os').homedir()).replace(/\/+$/, '').toLowerCase(); } catch { /* no home */ }
+  const forms = pathForms(p.replace(/^~(?=[\\/]|$)/, home || '~'));
+  return forms.some((f) => {
+    const c = canon(f).replace(/\/{2,}/g, '/').replace(/\/(?:\.\/)+/g, '/').replace(/^\/\/\?\//, '').toLowerCase();
+    if (BROAD_RE.test(c)) return true;
+    const t = c.replace(/\/+$/, '');
+    return !!home && ((home + '/').startsWith(t + '/') || new RegExp('^' + home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/\\.[^/]+$').test(t));
+  });
+}
+
+// A glob names a secret only through a literal secret stem: after brace expansion and `[x]` -> `x`,
+// the last component with its glob runs removed still holds a secret name, or a directory component
+// is literally `.ssh`/`.aws`/`.gnupg`. Guessing from wildcards false-denied `**/*credential*`.
+const SECRET_STEM = /\.env(?!\.(?:example|sample|template|dist|defaults?)\b)|id_rsa|id_ed25519|id_ecdsa|\.netrc|\.npmrc|\.pgpass|\.git-credentials|\.pem$|\.key$/i;
+const SECRET_NAMES = ['.env', 'id_rsa', 'id_ed25519', 'id_ecdsa', '.netrc', '.npmrc', '.pgpass', '.git-credentials'];
+function globNamesSecret(g) {
+  if (typeof g !== 'string' || !/[*?[{]/.test(g)) return false;
+  return [g, ...scan.expandBraces(g)].some((f) => {
+    const parts = f.replace(/\\/g, '/').replace(/\[([^\]\\])\]/g, '$1').split('/');
+    if (parts.slice(0, -1).some((c) => /^\.(?:ssh|aws|gnupg)$/i.test(c))) return true;
+    const last = parts[parts.length - 1];
+    // A literal prefix of a secret name and one `*` (`.en*`, `id_r*`): 3+ characters with a dot, else 4+, and
+    // at least half the name (`.git*` is the git files, not `.git-credentials`).
+    const pm = /^([^*?[\]]+)\*$/.exec(last);
+    if (pm && pm[1].length >= (pm[1][0] === '.' ? 3 : 4) && SECRET_NAMES.some((s) => s.startsWith(pm[1].toLowerCase()) && 2 * pm[1].length >= s.length)) return true;
+    // Without `*`, a `?` or a class stands for one character: `.e?v`, `id_rs?` name the secret itself.
+    if (!last.includes('*')) { const rx = scan.globComponentRe(last); if (!rx || SECRET_NAMES.some((s) => rx.test(s))) return true; }
+    // No `[` after the last `]` can close: split there so the class scan stays linear.
+    const k = last.lastIndexOf(']') + 1;
+    return SECRET_STEM.test(last.slice(0, k).replace(/\[[^\]]*\]|[*?]+/g, '') + last.slice(k).replace(/[*?]+/g, ''));
+  });
+}
+
+const HOOKS_PKG = canon(path.join(__dirname, 'package.json')).toLowerCase();
+// Shellter's install dir is `~/.claude/hooks`; a project's own `.claude/hooks/package.json` is not it.
+const HOME_HOOKS_PKG = new RegExp('^(?:~|(?:/[a-z])?' + HOME_ROOT + ')/\\.claude/hooks/package\\.json$', 'i');
+let homePkg = '';
+try { homePkg = path.posix.join(canon(require('os').homedir()), '.claude/hooks/package.json').toLowerCase(); } catch { /* no home */ }
+const homeHooksPkg = (p) => { const n = path.posix.normalize(canon(p)); return HOME_HOOKS_PKG.test(n) || n.toLowerCase() === homePkg; };
+// The real trust store, resolved: a fixture that shares its file name is not it.
+function isTrustStore(p) {
+  let store = '';
+  try { store = canon(safeRealpath(require('./shellter-trust.js').trustStorePath())).toLowerCase(); } catch { return false; }
+  return !!store && canon(p).toLowerCase() === store;
+}
 
 function pathMatchesAnySensitive(p) {
   if (!p) return null;
-  if (SENSITIVE_EXTENSIONS.test(p)) return 'sensitive extension';
+  if (SENSITIVE_EXTENSIONS.test(p) && !testKey(p)) return 'sensitive extension';
   if (SENSITIVE_DIRS.test(p)) return 'sensitive directory/file';
   if (SENSITIVE_FILES.test(p)) return 'sensitive credential file';
   if (ENV_FILE.test(p)) return '.env file';
-  if (SECRETS_DIR.test(p) && !CODE_FILE_EXT.test(p)) return 'secrets/credentials directory';
+  // A README, Markdown doc, LICENSE or .gitkeep in a secrets/ dir documents it; it is not a credential.
+  if (SECRETS_DIR.test(p) && !CODE_FILE_EXT.test(p) && !/(?:^|\/)(?:README[^\/]*|LICENSE[^\/]*|\.gitkeep|[^\/]+\.md)$/i.test(p)) return 'secrets/credentials directory';
   if (WALLET_PATTERN.test(p)) return 'wallet / crypto key file';
   if (BROWSER_DATA_PATTERN.test(p)) return 'browser cookie/login database';
   if (MACOS_KEYCHAIN.test(p)) return 'macOS Keychain database';
   if (WINDOWS_SECRETS.test(p)) return 'Windows credential / registry hive';
   if (UNIX_SHADOW.test(p)) return 'Unix password-hash / sudoers file';
+  if (scan.CRED_PATH_RE.test(p) || (/(?:^|\/)credentials\.json$/i.test(p) && !testKey(p))) return 'credential file';
   return null;
 }
 
-let data = '';
+const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 let pendingAsk = null;   // a dual-use content signal, emitted only after every deny check
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', chunk => { data += chunk; });
-process.stdin.on('end', () => {
+let writtenText = '';    // the new text of a write tool, for target rules that depend on it
+watchdog.input((data) => {
   let input;
   try {
-    input = JSON.parse(data);
+    input = JSON.parse(data.replace(/^\uFEFF/, ''));
   } catch {
     process.exit(0);
   }
-  quietAsk = /^(?:bypassPermissions|auto)$/.test(input && input.permission_mode);
+  if (typeof input?.cwd === 'string' && input.cwd) projectRoot = input.cwd;
+  quietAsk = typeof input?.permission_mode === 'string' && /^(?:bypassPermissions|auto)$/.test(input.permission_mode);
 
   const tool = input?.tool_name || '';
 
   // ---- content checks for Write / Edit / MultiEdit / NotebookEdit ----
-  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+  if (WRITE_TOOLS.has(tool)) {
     // `x || ''` keeps a non-string truthy value (a number), which then throws in the string
     // scanners -> nonzero exit -> Claude Code runs the tool UNPROTECTED. Only keep strings.
     const str = (v) => (typeof v === 'string' ? v : '');
@@ -236,6 +365,7 @@ process.stdin.on('end', () => {
       const edits = input?.tool_input?.edits;
       content = Array.isArray(edits) ? edits.map(e => str(e && e.new_string)).join('\n') : '';
     }
+    writtenText = content;
     const filePath = tool === 'NotebookEdit'
       ? (input?.tool_input?.notebook_path || input?.tool_input?.file_path || '')
       : (input?.tool_input?.file_path || '');
@@ -246,7 +376,7 @@ process.stdin.on('end', () => {
     // write costs some CPU but never creates a blind spot.
 
     if (content) {
-      const { clean, danger, zwCount } = stripInvisibles(content);
+      const { clean, danger } = stripInvisibles(content);
       const flat = clean.replace(/\n/g, ' ');
 
       const isBinary = /\.(woff2?|ttf|otf|eot|png|jpe?g|gif|webp|ico|pdf|zip|gz|bz2|xz|7z|tar|wasm|exe|dll|so|dylib|bin|node)$/i.test(filePath);
@@ -254,12 +384,12 @@ process.stdin.on('end', () => {
         if (danger > 0) {
           deny('Tag-character / bidi-override Unicode detected -- steganographic prompt injection', filePath);
         }
-        if (zwCount > 0 && SOURCE_LIKE_EXT.test(filePath)) {
+        if (SOURCE_LIKE_EXT.test(filePath) && suspiciousZW(content) > 0) {
           deny('Zero-width characters in source file -- possible steganographic injection', filePath);
         }
       }
 
-      const instructionSurface = scan.isAgentInstructionFile(filePath);
+      const instructionSurface = pathForms(filePath).some(scan.isAgentInstructionFile);
 
       // A fake tool-call tag is legitimate content when documenting an agent framework,
       // so it hard-denies only when written to a file an agent auto-ingests.
@@ -270,13 +400,26 @@ process.stdin.on('end', () => {
       if (ENCODED_EVAL_PATTERN.test(flat)) {
         deny('Encoded eval/exec pattern in file content blocked', filePath);
       }
+      // A git hook runs on the next commit: high-risk shell content there is the bash `> .git/hooks/` deny.
+      if (pathForms(filePath).some((p) => /(?:^|[\\/])\.git[\\/]hooks[\\/]/i.test(p)) && scan.hasHigh(scan.scanShell(content))) {
+        deny('Writing to .git/hooks blocked -- possible persistence', filePath);
+      }
+      // A file whose content is a command a runner runs (package.json scripts, a Makefile recipe): the
+      // shell scan bash applies to written content (secret upload, reverse shell, download-exec).
+      if (CMD_DEF.test(filePath) && scan.cmdDefHigh(filePath, content)) {
+        deny('Writing a secret upload, reverse shell or install-time download-exec to a file that defines commands blocked', filePath);
+      }
+      if (ENCODED_METHOD_EXEC.test(flat)) {
+        pendingAsk = pendingAsk || { reason: 'exec/eval method call on decoded data in file content', snippet: filePath };
+      }
 
-      if (MARKDOWN_DANGEROUS_URL.test(flat)) {
+      if ((instructionSurface || RENDERED_DOC_EXT.test(filePath)) && MARKDOWN_DANGEROUS_URL.test(flat)) {
         deny('Markdown javascript:/data:/vbscript: URL blocked', filePath);
       }
 
       if (ANSI_TARGET_EXTENSIONS.test(filePath) && ANSI_ESCAPE_PATTERN.test(content)) {
-        deny('ANSI escape sequence in source file blocked', filePath);
+        if (instructionSurface) deny('ANSI escape sequence in an agent-instruction file blocked', filePath);
+        pendingAsk = pendingAsk || { reason: 'ANSI escape sequence in source file', snippet: filePath };
       }
 
       // Deferred: an ask must never pre-empt a deny, so this is emitted only after every deny
@@ -296,11 +439,16 @@ process.stdin.on('end', () => {
         if (hi) {
           deny('Prompt injection detected: ' + hi.signal + (hi.line ? ' (line ' + hi.line + ')' : ''), filePath);
         }
+        if (instructionSurface && inj.some(f => f.signal === 'decode-budget-exhausted')) {
+          pendingAsk = pendingAsk || { reason: 'Too many encoded tokens to inspect in an agent-instruction file', snippet: filePath };
+        }
         if (instructionSurface) {
           const med = inj.find(f => f.severity === 'medium' && f.category === 'injection');
           if (med) {
             deny('Prompt injection in agent-instruction file: ' + med.signal + (med.line ? ' (line ' + med.line + ')' : ''), filePath);
           }
+          const q = inj.find(f => f.signal === 'instruction-override-quoted');
+          if (q) pendingAsk = pendingAsk || { reason: 'Quoted instruction-override phrase in an agent-instruction file' + (q.line ? ' (line ' + q.line + ')' : ''), snippet: filePath };
         }
       }
     }
@@ -320,9 +468,10 @@ process.stdin.on('end', () => {
       filePath = input?.tool_input?.notebook_path || input?.tool_input?.file_path || '';
       break;
     case 'Glob': {
+      // Glob lists names and reads nothing (see below: it never denies); the walked directory is logged.
       const pattern = input?.tool_input?.pattern || '';
       const dir = input?.tool_input?.path || '';
-      filePath = dir ? `${dir}/${pattern}` : pattern;
+      filePath = [dir, pattern.replace(/(?:^|[\\/])[^\\/]*$/, '')].filter(Boolean).join('/');
       break;
     }
     case 'Grep': {
@@ -335,26 +484,49 @@ process.stdin.on('end', () => {
       }
       // keyword=value harvesting across a broad off-project path (a self-audit in your own
       // repo, i.e. a relative path, stays allowed).
-      if (BROAD_SEARCH_PATH.test(filePath) && GREP_KEYWORD_EXTRACTION.test(searchPattern)) {
+      if (isBroadSearchPath(filePath) && GREP_KEYWORD_EXTRACTION.test(searchPattern)) {
         deny('Searching for plaintext credentials across a home/system path blocked', searchPattern);
+      }
+      if (isBroadSearchPath(filePath) && GREP_TOKEN_SHAPE.test(searchPattern)) {
+        deny('Searching for secret token shapes across a home/system path blocked', searchPattern);
+      }
+      // The file filter selects what gets read: `glob: "**/.env*"` reads every .env.
+      const gl = input?.tool_input?.glob;
+      if (typeof gl === 'string' && gl) {
+        for (const p of pathForms(filePath ? filePath + '/' + gl : gl)) {
+          if (pathMatchesAnySensitive(p) || SENSITIVE_GLOB.test(p) || globNamesSecret(p)) {
+            deny('Grep over sensitive files blocked', p);
+          }
+        }
       }
       break;
     }
   }
 
   if (!filePath) { if (pendingAsk) ask(pendingAsk.reason, pendingAsk.snippet); process.exit(0); }
+  // Glob lists names and reads nothing: it never denies, whatever directory it walks.
+  if (tool === 'Glob') { audit('fallthrough', '', filePath); process.exit(0); }
 
-  // Check the path as given AND its symlink-resolved form.
-  const resolved = safeRealpath(filePath);
-  const candidates = resolved !== filePath ? [filePath, resolved] : [filePath];
-
-  for (const p of candidates) {
+  for (const p of pathForms(filePath)) {
     const reason = pathMatchesAnySensitive(p);
     if (reason) {
       deny('Access to sensitive file/path blocked: ' + reason, p);
     }
-    if (tool === 'Glob' && SENSITIVE_GLOB.test(p)) {
-      deny('Glob pattern targeting sensitive files blocked', p);
+    if (WRITE_TOOLS.has(tool) && (SHELLTER_SELF.test(p) || isTrustStore(p) || SHELLTER_PLUGIN_CACHE.test(p) ||
+        homeHooksPkg(p) || canon(p).toLowerCase() === HOOKS_PKG)) {   // any content: it decides how node loads the hooks
+      deny('Writing shellter\'s own trust store or hooks blocked', p);
+    }
+    if (WRITE_TOOLS.has(tool) && CLAUDE_SETTINGS.test(p)) {
+      pendingAsk = pendingAsk || { reason: 'Editing Claude Code settings (allow rules, hooks)', snippet: p };
+    }
+    // A credential-looking name under home and outside the project: asked, denied when it holds a token.
+    if ((tool === 'Read' || tool === 'Grep') && credHome) {
+      const v = scan.credVerdict(path.resolve(projectRoot, p), credHome, path.resolve(projectRoot));
+      if (v === 'deny') deny('Credential file blocked: its content holds a secret', p);
+      if (v === 'ask') pendingAsk = pendingAsk || { reason: 'File name looks like a credential store', snippet: p };
+    }
+    if (PERSONAL_HISTORY.test(p)) {
+      pendingAsk = pendingAsk || { reason: 'Shell history / Claude config may hold tokens', snippet: p };
     }
   }
 

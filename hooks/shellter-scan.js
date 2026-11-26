@@ -96,6 +96,13 @@ function utf16Decode(buf) {
     if (even > odd * 8) endian = 'be';
     else if (odd > even * 8) endian = 'le';
     else return null;                               // NULs on both parities: real binary
+  } else {
+    // A BOM followed by text that is not NUL-dense is a planted prefix (`FF FE` + script):
+    // decoding it as UTF-16 turns the payload into CJK noise.
+    let nul = 0;
+    const n = Math.min(buf.length, 8192);
+    for (let i = 2; i < n; i++) if (buf[i] === 0) nul++;
+    if (nul < (n - 2) * 0.3) return null;
   }
   let body = buf.subarray(start);
   if (endian === 'be') {                            // Node decodes LE only; swap pairs
@@ -205,6 +212,9 @@ function checkHooksManifest(rel, text, add) {
       });
       for (const h of (Array.isArray(g && g.hooks) ? g.hooks : [])) {
         if (!h) continue;
+        if (h.type === 'http' && typeof h.url === 'string' && remoteUrls(h.url).length) {
+          add({ rule: 'BH2', severity: 'medium', file: rel, detail: event + ' hook sends hook data to ' + h.url });
+        }
         // `commandWindows` is what actually runs on Windows -- shellter's own hooks.json
         // uses it. Reading only `command` lets a bundle put the payload in the variant
         // that executes and stay invisible.
@@ -229,16 +239,24 @@ function checkHooksManifest(rel, text, add) {
 
 // A bare tool name grants EVERY invocation of it -- `"Bash"` is broader than `"Bash(*)"`
 // is explicit about. Matching only the parenthesised form missed the actual blanket grant.
-const WILDCARD_ALLOW = /^(?:\*|[A-Za-z]+(?:\(\s*\*\s*\))?)$/;
+const WILDCARD_ALLOW = /^(?:\*|[A-Za-z]+(?:\(\s*(?:\*\*?|:\*|\*\s*:\s*\*|\*\s+\*)\s*\))?)$/;
 
 function checkSettings(rel, text, add) {
   let obj;
   try { obj = JSON.parse(text); } catch { return; }
   const perms = obj && obj.permissions;
   if (perms && typeof perms.defaultMode === 'string' &&
-      /bypass|acceptEdits|dontAsk/i.test(perms.defaultMode)) {
+      /bypass|acceptEdits|dontAsk|^auto$/i.test(perms.defaultMode)) {
     add({ rule: 'BH3', severity: 'high', file: rel,
           detail: 'ships defaultMode "' + perms.defaultMode + '"' });
+  }
+  // The status line runs a command on every render.
+  const sl = obj && obj.statusLine && typeof obj.statusLine.command === 'string' ? obj.statusLine.command : '';
+  if (sl) {
+    const sh = scan.scanShell(sl, { decode: true }).filter((f) => f.severity === 'high');
+    if (sh.length || (remoteUrls(sl).length && UPLOAD_VERB.test(sl))) {
+      add({ rule: 'BH2', severity: 'high', file: rel, detail: 'statusLine command: ' + (sh.length ? sh[0].signal : 'posts to ' + remoteUrls(sl)[0]) });
+    }
   }
   const allow = perms && Array.isArray(perms.allow) ? perms.allow : [];
   const wild = allow.filter((r) => typeof r === 'string' && WILDCARD_ALLOW.test(r.trim()));
@@ -248,10 +266,10 @@ function checkSettings(rel, text, add) {
   }
 }
 
-function checkMcpConfig(rel, text, add) {
-  let obj;
-  try { obj = JSON.parse(text); } catch { return; }
-  const servers = obj && (obj.mcpServers || obj.servers);
+function checkMcpConfig(rel, text, add, parsed) {
+  let obj = parsed;
+  if (!obj) { try { obj = JSON.parse(text); } catch { return; } }
+  const servers = obj && (obj.mcpServers || obj.servers || obj.lspServers);
   if (!servers || typeof servers !== 'object') return;
   for (const [name, s] of Object.entries(servers)) {
     if (!s || typeof s !== 'object') continue;
@@ -262,6 +280,15 @@ function checkMcpConfig(rel, text, add) {
       add({ rule: 'SC1', severity: 'medium', file: rel,
             detail: 'MCP server "' + name + '" runs an unpinned package: ' + argv.slice(0, 120) });
     }
+    // A loader option in the server's environment runs code before the server does.
+    const env = s.env && typeof s.env === 'object' ? s.env : {};
+    for (const [k, v] of Object.entries(env)) {
+      if (typeof v === 'string' && ((k === 'NODE_OPTIONS' && /--(?:require|import|loader|experimental-loader)\b|(?:^|\s)-r\b/.test(v)) || /^(?:LD_PRELOAD|DYLD_INSERT_LIBRARIES|BASH_ENV|PYTHONSTARTUP)$/.test(k))) {
+        add({ rule: 'SC3', severity: 'high', file: rel, detail: 'MCP server "' + name + '" loads code through ' + k });
+      }
+    }
+    const sh = scan.scanShell(argv, { decode: true }).filter((f) => f.severity === 'high');
+    if (sh.length) add({ rule: 'SC3', severity: 'high', file: rel, detail: 'MCP server "' + name + '" command: ' + sh[0].signal });
     if (typeof s.url === 'string' && /^http:\/\//i.test(s.url) && !LOOPBACK.test(s.url)) {
       add({ rule: 'SC2', severity: 'medium', file: rel,
             detail: 'MCP server "' + name + '" uses plaintext http: ' + s.url });
@@ -293,7 +320,7 @@ function checkSkillFrontmatter(rel, text, add) {
     if (!item) break;
     parts.push(item[1]);
   }
-  const v = parts.filter(Boolean).join(', ').trim();
+  const v = parts.filter(Boolean).join(', ').replace(/["']/g, '').trim();
   if (!v) return;
   const short = v.slice(0, 80);
   // Precision matters here or the rule cries wolf. `Bash(node *)` is SCOPED to node -- a
@@ -301,7 +328,7 @@ function checkSkillFrontmatter(rel, text, add) {
   if (/(?:^|[\s,\[])\*(?:[\s,\]]|$)/.test(v)) {
     add({ rule: 'LP2', severity: 'high', file: rel,
           detail: 'allowed-tools grants every tool: ' + short });
-  } else if (/\b[A-Za-z]+\(\s*\*\s*\)/.test(v) ||
+  } else if (/\b[A-Za-z]+\(\s*(?:\*\*?|:\*)\s*\)/.test(v) ||
              /(?:^|[\s,\[])(?:Bash|PowerShell)(?:[\s,\]]|$)/.test(v)) {
     add({ rule: 'LP2', severity: 'high', file: rel,
           detail: 'allowed-tools grants a tool unrestricted: ' + short });
@@ -363,7 +390,8 @@ function scanBundle(root) {
       if (r.skip) noteGap(r.skip + ': ' + rel);   // null = ordinary binary, not a gap
       continue;
     }
-    const text = r.text;
+    // Leading BOM / undecodable bytes would hide a shebang and the first line.
+    const text = r.text.replace(/^[\uFEFF\uFFFD]+/, '');
     inspected++;
     if (r.obfuscated) {
       add({ rule: 'OBF', severity: 'high', file: rel,
@@ -378,9 +406,10 @@ function scanBundle(root) {
     // A bundle is untrusted by definition, so BOTH injection tiers are reported here.
     // The agent-instruction-file gate the write path uses does not apply: every file in a
     // skill bundle is, in effect, an instruction file.
+    // B2 (LOW, advisory on the write path) stays medium here for the same reason.
     for (const f of scan.scanInjection(text, { decode: true })) {
-      if (f.severity === 'low') continue;
-      add({ rule: 'INJ', severity: f.severity, file: rel,
+      if (f.category === 'coverage') { noteGap(f.signal + ': ' + rel); continue; }
+      add({ rule: 'INJ', severity: f.severity === 'low' ? 'medium' : f.severity, file: rel,
             detail: f.signal + (f.line ? ' (line ' + f.line + ')' : '') });
     }
     // Shell rules belong on shell scripts. Gating on the extension alone let a hook script
@@ -402,6 +431,33 @@ function scanBundle(root) {
     if (base === 'hooks.json' || base === 'plugin.json' ||
         base === 'settings.json' || base === 'settings.local.json') {
       checkHooksManifest(rel, text, add);
+    }
+    if (base === 'plugin.json') {
+      // `"hooks": "./config/h.json"`: that file is a hooks manifest whatever it is named.
+      let obj = null;
+      try { obj = JSON.parse(text); } catch {}
+      const refs = obj && (typeof obj.hooks === 'string' ? [obj.hooks] : Array.isArray(obj.hooks) ? obj.hooks : []);
+      for (const ref of refs || []) {
+        if (typeof ref !== 'string') continue;
+        const target = path.resolve(path.dirname(file), ref);
+        const trel = path.relative(root, target).replace(/\\/g, '/');
+        if (trel.startsWith('..') || path.isAbsolute(trel)) { noteGap('hooks path outside the bundle: ' + ref); continue; }
+        const tr = readText(target);
+        if (tr.text !== undefined) checkHooksManifest(trel, tr.text, add);
+        else noteGap('hooks file unreadable: ' + trel);
+      }
+      // Inline or referenced MCP / LSP servers run commands like .mcp.json does.
+      for (const key of ['mcpServers', 'lspServers']) {
+        const v = obj && obj[key];
+        if (v && typeof v === 'object') checkMcpConfig(rel, '', add, { mcpServers: v });
+        else if (typeof v === 'string') {
+          const target = path.resolve(path.dirname(file), v);
+          const trel = path.relative(root, target).replace(/\\/g, '/');
+          if (trel.startsWith('..') || path.isAbsolute(trel)) { noteGap(key + ' path outside the bundle: ' + v); continue; }
+          const tr = readText(target);
+          if (tr.text !== undefined) checkMcpConfig(trel, tr.text, add); else noteGap(key + ' file unreadable: ' + trel);
+        }
+      }
     }
     if (base === 'settings.json' || base === 'settings.local.json') checkSettings(rel, text, add);
     if (base === '.mcp.json' || base === 'mcp.json') checkMcpConfig(rel, text, add);

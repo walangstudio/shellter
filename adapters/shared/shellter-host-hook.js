@@ -35,68 +35,97 @@ const FILE_HOOK = path.join(HOOKS, 'check-sensitive-files.js');
 const first = (...vals) => vals.find((v) => v !== undefined && v !== null && v !== '');
 const asCommand = (c) => (Array.isArray(c) ? c.join(' ') : typeof c === 'string' ? c : '');
 
-// Host payload -> { hook, name, input } in shellter's Claude-Code shape, or null
-// when this isn't a tool we gate.
+// A patch blob (`*** Begin Patch` / `*** Update File: x`) as one Write check per file: the
+// header path is checked, and the added (`+`) lines are what gets scanned. The parser lives beside
+// the hooks; without it the blob takes the generic write path below (whole blob, its `path` key).
+let patchTargets = () => [];
+try { ({ patchTargets } = require(path.join(HOOKS, 'patch-targets.js'))); } catch { /* older hooks dir */ }
+const patchWrites = (text) => patchTargets(text).map((input) => ({ hook: FILE_HOOK, name: 'Write', input }));
+
+// Host payload -> [{ hook, name, input }] in shellter's Claude-Code shape (empty when this
+// isn't a tool we gate). Tool shapes are best-effort: only the adapter side is verified.
 function mapTool(ev) {
   const toolName = String(first(ev.tool_name, ev.toolName, ev.toolCall && ev.toolCall.name, ev.tool && ev.tool.name) || '');
-  const args = first(ev.tool_input, ev.toolCall && ev.toolCall.args, ev.args, ev.input, {}) || {};
+  const rawArgs = first(ev.tool_input, ev.toolCall && ev.toolCall.args, ev.args, ev.input, {}) || {};
   const lname = toolName.toLowerCase();
+  // A string payload is the patch or command text itself.
+  const args = typeof rawArgs === 'string' ? { patch: rawArgs, command: rawArgs } : rawArgs;
+  // codex runs apply_patch through its shell tool as an argv: ["apply_patch", "<patch>"].
+  if (Array.isArray(args.command) && /^apply_?patch$/i.test(String(args.command[0])) && typeof args.command[1] === 'string') {
+    const w = patchWrites(args.command[1]);
+    if (w.length) return w;
+  }
+
+  // Write-shaped names first: `search_replace` is a write, and a patch tool may carry its blob
+  // in `command`.
+  const isWrite = /(write_to_file|write_file|file_write|str_replace|search_replace|replace_file_content|multi_replace|create_file|update_file|apply_patch|save_file|edit_file|multiedit|^patch$|^write$|^edit$|^replace$)/.test(lname);
+  if (isWrite) {
+    const blob = first(args.patch, args.patchText, args.input, args.changes, args.command);
+    if (typeof blob === 'string' && /^\s*\*\*\* (?:Begin Patch|(?:Add|Update|Delete) File:)|^\+\+\+ /m.test(blob)) {
+      const w = patchWrites(blob);
+      if (w.length) return w;
+    }
+    const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.AbsolutePath, args.filePath, args.TargetFile, '') || '');
+    // Pull the attacker-influenced new text from whatever shape the host uses.
+    // agy/Cascade write tools use PascalCase CodeContent / CodeEdit / ReplacementChunks.
+    let content = first(args.content, args.new_content, args.new_string, args.newText, args.newString, args.new_str, args.file_text, args.code_edit, args.code, args.text, args.CodeContent, args.CodeEdit);
+    const joinNew = (list) => list.map((e) => first(e && (e.newText || e.new_string || e.newString || e.content || e.ReplacementContent), '')).join('\n');
+    if (content === undefined && Array.isArray(args.edits)) content = joinNew(args.edits);
+    if (content === undefined && Array.isArray(args.replacements)) content = joinNew(args.replacements);
+    if (content === undefined && Array.isArray(args.ReplacementChunks)) content = joinNew(args.ReplacementChunks);
+    if (content === undefined) content = asCommand(first(blob, ""));
+    return [{ hook: FILE_HOOK, name: 'Write', input: { file_path, content: content || '' } }];
+  }
 
   const isShell = /(^|[_-])(bash|sh|shell|exec|run_command|run_shell_command|run_terminal|terminal|run_code|execute)([_-]|$)/.test(lname) ||
     (args && (args.command !== undefined || args.cmd !== undefined || args.script !== undefined || args.CommandLine !== undefined));
   if (isShell) {
     // agy/Cascade run_command carries the command in PascalCase `CommandLine`.
     const command = asCommand(first(args.command, args.cmd, args.script, args.CommandLine, args.command_line, ''));
-    if (!command) return null;
-    return { hook: BASH_HOOK, name: process.platform === 'win32' ? 'PowerShell' : 'Bash', input: { command } };
+    if (!command) return [];
+    return [{ hook: BASH_HOOK, name: process.platform === 'win32' ? 'PowerShell' : 'Bash', input: { command } }];
   }
 
   // Native file-READ tools (agy/Cascade view_file uses PascalCase AbsolutePath).
   // Without this, an agent reads .env via its own read tool, bypassing the shell rules.
-  const isRead = /(^|[_-])(view_file|read_file|cat_file|open_file|view|read|view_code_item|view_line_range|view_content_chunk)([_-]|$)/.test(lname);
+  const isRead = /(^|[_-])(view_file|read_file|readfile|read_many_files|cat_file|open_file|view|read|view_code_item|view_line_range|view_content_chunk)([_-]|$)/.test(lname);
   if (isRead) {
-    const file_path = String(first(args.path, args.file_path, args.AbsolutePath, args.absolute_path, args.filePath, args.target_file, args.TargetFile, '') || '');
-    if (!file_path) return null;
-    return { hook: FILE_HOOK, name: 'Read', input: { file_path } };
+    // Both keys: a host may pass `paths` and `path` together.
+    const one = first(args.path, args.file_path, args.AbsolutePath, args.absolute_path, args.filePath, args.target_file, args.TargetFile);
+    return [...(Array.isArray(args.paths) ? args.paths : []), one].filter((p) => typeof p === 'string' && p)
+      .map((file_path) => ({ hook: FILE_HOOK, name: 'Read', input: { file_path } }));
   }
 
   const isSearch = /(^|[_-])(grep|grep_search|search|ripgrep|rg)([_-]|$)/.test(lname);
   if (isSearch) {
     const pattern = String(first(args.pattern, args.query, args.Query, args.q, '') || '');
     const p = String(first(args.path, args.SearchDirectory, args.search_path, args.SearchPath, args.directory, '') || '');
-    if (!pattern && !p) return null;
-    return { hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p } };
+    if (!pattern && !p) return [];
+    // The file filter selects what gets read: pass every include glob through.
+    const globs = [].concat(first(args.glob, args.include, args.Includes, args.includes, []) || []).filter((g) => typeof g === 'string' && g);
+    return globs.length ? globs.map((glob) => ({ hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p, glob } }))
+      : [{ hook: FILE_HOOK, name: 'Grep', input: { pattern, path: p } }];
   }
 
   const isFind = /(^|[_-])(find|find_by_name|glob)([_-]|$)/.test(lname);
   if (isFind) {
     const pattern = String(first(args.pattern, args.Pattern, args.glob, args.query, '') || '');
-    if (!pattern) return null;
+    if (!pattern) return [];
     const p = String(first(args.path, args.SearchDirectory, args.directory, '') || '');
-    return { hook: FILE_HOOK, name: 'Glob', input: { pattern, path: p } };
+    return [{ hook: FILE_HOOK, name: 'Glob', input: { pattern, path: p } }];
   }
 
-  const isWrite = /(write_to_file|write_file|file_write|str_replace|replace_file_content|multi_replace|create_file|update_file|apply_patch|save_file|^patch$|^write$|^edit$)/.test(lname);
-  if (isWrite) {
-    const file_path = String(first(args.path, args.file_path, args.target_file, args.absolute_path, args.filePath, args.TargetFile, '') || '');
-    // Pull the attacker-influenced new text from whatever shape the host uses.
-    // agy/Cascade write tools use PascalCase CodeContent / CodeEdit.
-    let content = first(args.content, args.new_content, args.new_string, args.newText, args.text, args.CodeContent, args.CodeEdit);
-    if (content === undefined && Array.isArray(args.edits)) content = args.edits.map((e) => first(e && (e.newText || e.new_string || e.content), '')).join('\n');
-    if (content === undefined && Array.isArray(args.replacements)) content = args.replacements.map((e) => first(e && (e.newText || e.new_string || e.content), '')).join('\n');
-    // codex apply_patch / agy patch tools carry the change as one patch blob.
-    if (content === undefined) content = asCommand(first(args.patch, args.input, args.changes, ''));
-    return { hook: FILE_HOOK, name: 'Write', input: { file_path, content: content || '' } };
-  }
-  return null; // unknown / MCP tool -> fall through
+  return []; // unknown / MCP tool -> fall through
 }
 
 // The shim is always invoked as `node <shim>`, so node is on PATH by definition
 // (no bun/process.execPath fallback needed, unlike the in-process adapters).
+// Above the watchdog's worst case (hooks/watchdog.js BUDGET_MAX_MS): a hook always answers before this.
+const ADAPTER_TIMEOUT_MS = 25000;
 function runHook(hook, name, input, cwd) {
   const payload = JSON.stringify({ tool_name: name, tool_input: input, cwd: cwd || process.cwd() });
   try {
-    return execFileSync('node', [hook], { input: payload, encoding: 'utf8', timeout: 5000 });
+    return execFileSync('node', [hook], { input: payload, encoding: 'utf8', timeout: ADAPTER_TIMEOUT_MS });
   } catch (e) {
     if (e && e.stdout) return e.stdout.toString(); // hook printed then exited nonzero
     // True spawn failure (missing hook file, timeout, node not found). check-bash
@@ -104,6 +133,8 @@ function runHook(hook, name, input, cwd) {
     // does not throw. Only a thrown failure lands here, so warn loudly (still fall
     // open per shellter's never-brick-the-host policy) so the gap is diagnosable.
     process.stderr.write('[shellter] detector did NOT run (' + ((e && (e.code || e.message)) || 'unknown') + ') -- command NOT screened: ' + hook + '\n');
+    // agy honours ask: a detector that timed out asks there instead of failing open.
+    if (host === 'agy' && e && e.code === 'ETIMEDOUT') return JSON.stringify({ hookSpecificOutput: { permissionDecision: 'ask', permissionDecisionReason: 'shellter could not finish checking this call in time' } });
     return '';
   }
 }
@@ -144,8 +175,13 @@ process.stdin.on('data', (d) => { raw += d; });
 process.stdin.on('end', () => {
   let ev;
   try { ev = JSON.parse(raw); } catch { process.exit(0); } // unparseable -> fall open
-  const m = mapTool(ev || {});
-  if (!m) process.exit(0);
-  const { decision, reason } = decide(runHook(m.hook, m.name, m.input, ev.cwd || (ev.workspacePaths && ev.workspacePaths[0])));
-  emit(decision, reason);
+  const cwd = ev && (ev.cwd || (ev.workspacePaths && ev.workspacePaths[0]));
+  // Every mapped check runs; a deny anywhere wins over an ask.
+  let verdict = { decision: 'allow', reason: '' };
+  for (const m of mapTool(ev || {})) {
+    const v = decide(runHook(m.hook, m.name, m.input, cwd));
+    if (v.decision === 'deny') { verdict = v; break; }
+    if (v.decision === 'ask' && verdict.decision !== 'ask') verdict = v;
+  }
+  emit(verdict.decision, verdict.reason);
 });

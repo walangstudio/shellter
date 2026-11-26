@@ -39,12 +39,18 @@ const fixedTemplate = JSON.parse(templateStr);
 let existing = {};
 if (fs.existsSync(targetPath)) {
   try {
-    existing = JSON.parse(fs.readFileSync(targetPath, 'utf8'));
+    existing = JSON.parse(fs.readFileSync(targetPath, 'utf8').replace(/^\uFEFF/, ''));
     console.log('Found existing settings at', targetPath);
   } catch (e) {
     console.error('Failed to parse existing settings, backing up to', targetPath + '.bak');
     fs.copyFileSync(targetPath, targetPath + '.bak');
     existing = {};
+  }
+  // Valid JSON that is not an object (`[]`, `"x"`, `null`): writing hooks into it would
+  // replace the user's file with a fresh object. Stop instead.
+  if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+    console.error('Existing settings are not a JSON object -- not touching', targetPath);
+    process.exit(1);
   }
 } else {
   const dir = path.dirname(targetPath);
@@ -57,9 +63,7 @@ if (fs.existsSync(targetPath)) {
 // these hooks gate -- so a hook that failed to run (node not on PATH, a crash)
 // left unprompted file access behind, and every fallthrough verdict became a
 // silent allow. The plugin install path never granted it, so it was pure
-// asymmetric risk. This assignment also used to REPLACE the user's whole allow
-// list; never touch their permissions.
-if (fixedTemplate.permissions) existing.permissions = fixedTemplate.permissions;
+// asymmetric risk. The installer never touches the user's permissions.
 
 // Merge, don't clobber. `existing.hooks = fixedTemplate.hooks` wholesale-replaced the key,
 // silently deleting any OTHER plugin's (or the user's own) hooks -- the exact bug this
@@ -113,6 +117,12 @@ const filesHook = path.join(hooksDir, 'check-sensitive-files.js');
 // Runtime deps of the two hooks above -- must be installed alongside them.
 const scanHook = path.join(hooksDir, 'scan-content.js');
 const trustHook = path.join(hooksDir, 'shellter-trust.js');
+const watchdogHook = path.join(hooksDir, 'watchdog.js');
+const patchHook = path.join(hooksDir, 'patch-targets.js');
+// The nearest package.json decides how node loads the hooks: pin it beside an installed check-bash.js.
+if (fs.existsSync(bashHook)) try { fs.writeFileSync(path.join(hooksDir, 'package.json'), '{"type":"commonjs"}\n'); } catch (e) {
+  console.warn('WARNING: could not write ' + path.join(hooksDir, 'package.json') + ': ' + e.message);
+}
 
 function sha256(p) {
   try {
@@ -122,7 +132,7 @@ function sha256(p) {
   }
 }
 
-for (const p of [bashHook, filesHook, scanHook, trustHook]) {
+for (const p of [bashHook, filesHook, scanHook, trustHook, watchdogHook, patchHook]) {
   if (!fs.existsSync(p)) {
     console.warn('WARNING: Hook not found:', p);
     console.warn('  Copy it: cp ' + path.basename(p) + ' ' + hooksDir + '/');

@@ -55,7 +55,7 @@ function mapTool(toolName: string, input: any) {
       // an edit-like tool that delivers new text directly instead of in an edits array.
       return { hook: FILE_HOOK, name: "Edit", input: { file_path: a.path ?? "", new_string: Array.isArray(a.edits) ? a.edits.map((e: any) => e?.newText ?? "").join("\n") : (a.newText ?? a.new_string ?? a.content ?? "") } };
     case "grep":
-      return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
+      return { hook: FILE_HOOK, name: "Grep", input: { pattern: a.pattern ?? "", path: a.path ?? "", glob: a.glob ?? a.include ?? "" } };
     case "find":
       return { hook: FILE_HOOK, name: "Glob", input: { pattern: a.pattern ?? "", path: a.path ?? "" } };
     default:
@@ -65,11 +65,13 @@ function mapTool(toolName: string, input: any) {
 
 // Prefer node (shellter's tested runtime); fall back to whatever runs pi (bun)
 // so the gate still works if node isn't on PATH.
+// Above the watchdog's worst case (hooks/watchdog.js BUDGET_MAX_MS): a hook always answers before this.
+const ADAPTER_TIMEOUT_MS = 25000;
 function runHook(hook: string, event: any) {
   const input = JSON.stringify(event);
   for (const exe of ["node", process.execPath]) {
     try {
-      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: 5000 });
+      return execFileSync(exe, [hook], { input, encoding: "utf8", timeout: ADAPTER_TIMEOUT_MS });
     } catch (e: any) {
       if (e && e.code === "ENOENT") continue;        // runtime missing -> try next
       if (e && e.stdout) return e.stdout.toString();  // hook printed then exited nonzero

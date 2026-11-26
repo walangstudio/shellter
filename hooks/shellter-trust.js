@@ -20,8 +20,25 @@ const crypto = require('crypto');
 
 const TRUST_SCAN_BYTES = 256 * 1024;
 
+// SHELLTER_TRUST_FILE counts only as an absolute path outside the working directory and outside
+// any git checkout: a relative one, or one a repo ships (from any subdirectory), would let a cloned
+// repo bring its own trust store.
+function insideGitCheckout(p) {
+  for (let d = path.dirname(p), i = 0; i < 64; i++) {
+    if (fs.existsSync(path.join(d, '.git'))) return true;
+    const up = path.dirname(d);
+    if (up === d) return false;
+    d = up;
+  }
+  return true;
+}
 function trustStorePath() {
-  return process.env.SHELLTER_TRUST_FILE || path.join(os.homedir(), '.claude', 'shellter-trust.json');
+  const env = process.env.SHELLTER_TRUST_FILE;
+  if (env && path.isAbsolute(env)) {
+    const rel = path.relative(process.cwd(), env);
+    if ((rel.startsWith('..') || path.isAbsolute(rel)) && !insideGitCheckout(env)) return env;
+  }
+  return path.join(os.homedir(), '.claude', 'shellter-trust.json');
 }
 
 function readTrustStore() {
@@ -104,14 +121,14 @@ function listEntries() {
 
 let _allowCache = null;
 
-function collectAllow(file, toolName, out) {
+function collectAllow(file, toolName, out, dir) {
   try {
     const obj = JSON.parse(fs.readFileSync(file, 'utf8'));
     const allow = obj && obj.permissions && Array.isArray(obj.permissions.allow) ? obj.permissions.allow : [];
     const prefix = toolName + '(';
     for (const rule of allow) {
       if (typeof rule === 'string' && rule.startsWith(prefix) && rule.endsWith(')')) {
-        out.push(rule.slice(prefix.length, -1));
+        out.push({ inner: rule.slice(prefix.length, -1), dir });
       }
     }
   } catch { /* missing/corrupt -> ignore */ }
@@ -122,10 +139,11 @@ function claudeAllowRules(cwd, toolName) {
   const rules = [];
   let dir = cwd ? path.resolve(cwd) : process.cwd();
   for (let i = 0; i < 40; i++) {
-    // Only settings.local.json (gitignored, user-authored) is honored for
-    // script-flag suppression -- NOT the committed project settings.json, which a
-    // cloned malicious repo controls and could use to whitelist its own payload.
-    collectAllow(path.join(dir, '.claude', 'settings.local.json'), toolName, rules);
+    // Only settings.local.json (user-authored, where "don't ask again" lands) is honored for
+    // script-flag suppression -- NOT the committed project settings.json, which a cloned
+    // malicious repo controls. A settings.local.json the repo commits is ignored too
+    // (checked lazily, see localRulesHonoured).
+    collectAllow(path.join(dir, '.claude', 'settings.local.json'), toolName, rules, dir);
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -139,25 +157,73 @@ function claudeAllowRules(cwd, toolName) {
   return rules;
 }
 
-function commandAllowed(cmd, cwd, toolName) {
+// A settings.local.json outside any git checkout is the user's own (`~/.claude`, a scratch dir):
+// honoured. Inside a checkout it is honoured only when git positively says the repo does not ship
+// it: exit 0 and no entry, for the file in any letter case (the file system is case-insensitive on
+// Windows and macOS) and for `.claude` itself (a tracked symlink or submodule). A git error, a
+// timeout, or GIT_* steering the call elsewhere -> not honoured. Runs only when a rule from that
+// file matches a flagged script, so the hot path never spawns git.
+const _honoured = new Map();
+// The watchdog's allow check sets a deadline for all git calls together; past it a directory is not
+// honoured (and not cached).
+let gitDeadline = Infinity;
+function setGitDeadline(at) { gitDeadline = at; }
+function localRulesHonoured(dir) {
+  if (!_honoured.has(dir)) {
+    if (gitDeadline - Date.now() < 50) return false;
+    let ok = !insideGitCheckout(path.join(dir, '.claude', 'settings.local.json'));
+    if (!ok) try {
+      const env = {};
+      for (const [k, v] of Object.entries(process.env)) if (!/^GIT_/i.test(k)) env[k] = v;
+      const ls = (spec) => require('child_process').spawnSync('git', ['-C', dir, 'ls-files', '-z', '--', spec], { env, encoding: 'utf8', timeout: Math.max(1, Math.min(2000, gitDeadline - Date.now())), maxBuffer: 16 * 1024 * 1024 });
+      const file = ls(':(icase).claude/settings.local.json');
+      const top = ls(':(icase).claude');
+      ok = file.status === 0 && file.stdout === '' && top.status === 0 &&
+        !top.stdout.split('\0').some((e) => e.toLowerCase() === '.claude');
+      // An alias of the file (`CLAUDE~1/`, a trailing dot or space, an ignorable character) is
+      // tracked under another name: resolve every entry not in plain form two levels down (dir/file,
+      // the only shape that can name it).
+      if (ok) {
+        const all = ls(':(glob)*/*');
+        const odd = all.status === 0 ? all.stdout.split('\0').filter((e) => e.split('/').some((c) => /[~:]|[^\x00-\x7f]|[. ]$/.test(c))) : null;
+        if (!odd || odd.length > 2000) ok = false;
+        else {
+          const real = fs.realpathSync.native(path.join(dir, '.claude', 'settings.local.json')).toLowerCase();
+          ok = !odd.some((e) => {
+            try { return fs.realpathSync.native(path.join(dir, e)).toLowerCase() === real; } catch (err) { return err.code !== 'ENOENT'; }
+          });
+        }
+      }
+    } catch { /* no git */ }
+    _honoured.set(dir, ok);
+  }
+  return _honoured.get(dir);
+}
+
+// `cmd` is one command segment. `exactOnly` is for the whole compound command line: a `:*`
+// prefix matched against it would wave through anything chained after the prefix.
+function commandAllowed(cmd, cwd, toolName, exactOnly) {
   if (!cmd) return false;
   const c = cmd.trim();
-  for (const inner of claudeAllowRules(cwd, toolName)) {
+  for (const { inner, dir } of claudeAllowRules(cwd, toolName)) {
+    let hit;
     if (inner.endsWith(':*')) {
       const pfx = inner.slice(0, -2);
       // A `:*` prefix only silences a script flag when it names a specific script
       // (contains a space or path separator). A bare-interpreter prefix like
       // `bash` or `sh` is too broad to auto-trust arbitrary script contents.
-      if (!/[ \t/\\]/.test(pfx)) continue;
-      if (c === pfx || c.startsWith(pfx)) return true;
-    } else if (c === inner) {
-      return true;
+      if (exactOnly || !/[ \t/\\]/.test(pfx)) continue;
+      hit = c === pfx || c.startsWith(pfx + ' ');
+    } else {
+      hit = c === inner;
     }
+    if (hit && (!dir || localRulesHonoured(dir))) return true;
   }
   return false;
 }
 
 module.exports = {
+  setGitDeadline,
   TRUST_SCAN_BYTES, trustStorePath, readTrustStore, writeTrustStore, isTrusted,
   sha256OfScan, sha256OfFileBounded, addPath, removeKey, listEntries,
   claudeAllowRules, commandAllowed,
