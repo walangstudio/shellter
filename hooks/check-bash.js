@@ -5447,7 +5447,9 @@ const POSH_WRITE = /^(?:Remove-Item|ri|rm|rmdir|del|erase|rd|Set-Content|sc|Add-
 const POSH_REDIR = /^\d?\*?>>?$/;
 const poshTokens = (stage) => (stage.trim().match(/(?:'[^']*'|"[^"]*"|[^\s'"><{}()&])+|\d?\*?>>?|[{}()&]/g) || [])
   .flatMap((t) => { const m = /^(-[A-Za-z]+):(.+)$/.exec(t); return m ? [m[1], m[2]] : [t]; });
-const poshPath = (t) => t.replace(/^['"]|['"]$/g, '').replace(/^(?:\$env:USERPROFILE|\$\{env:USERPROFILE\}|\$env:HOME|\$HOME)(?=[\\/]|$)/i, '~');
+// PowerShell takes `\` as a separator on every platform; Node on POSIX does not.
+const poshSep = process.platform === 'win32' ? (t) => t : (t) => t.replace(/\\/g, '/');
+const poshPath = (t) => poshSep(t.replace(/^['"]|['"]$/g, '').replace(/^(?:\$env:USERPROFILE|\$\{env:USERPROFILE\}|\$env:HOME|\$HOME)(?=[\\/]|$)/i, '~'));
 // `-Dest` is `-Destination`: a parameter is any prefix of its name.
 const poshParam = (t, ...names) => /^-[A-Za-z]+$/.test(t) && names.some((n) => n.toLowerCase().startsWith(t.slice(1).toLowerCase()));
 const POSH_SWITCH = /^-(?:Force|Recurse|Append|NoNewline|NoClobber|Confirm|WhatIf|PassThru|Verbose|Debug)$/i;

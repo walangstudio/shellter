@@ -209,7 +209,10 @@ let projectRoot = process.cwd();
 let credHome = '';
 try { credHome = require('os').homedir(); } catch (_) { /* no home: the name heuristic is off */ }
 const testKey = (p) => {
-  const r = path.relative(projectRoot, path.resolve(projectRoot, p));
+  const abs = path.resolve(projectRoot, p);
+  let r = path.relative(projectRoot, abs);
+  // `p` may already be canonical while the root is not (macOS /private/var, a Windows 8.3 temp name).
+  if (r.startsWith('..') || path.isAbsolute(r)) try { r = path.relative(fs.realpathSync(projectRoot), abs); } catch (_) { /* keep r */ }
   if (r.startsWith('..') || path.isAbsolute(r) || !TEST_KEY.test(r)) return false;
   // A symlink out of the project (`tests/k -> /etc/ssl/private`) is not fixture data.
   try { const rr = path.relative(fs.realpathSync(projectRoot), fs.realpathSync(path.resolve(projectRoot, p))); return !rr.startsWith('..') && !path.isAbsolute(rr); } catch (_) { return true; }
