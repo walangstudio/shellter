@@ -212,10 +212,10 @@ const testKey = (p) => {
   const abs = path.resolve(projectRoot, p);
   let r = path.relative(projectRoot, abs);
   // `p` may already be canonical while the root is not (macOS /private/var, a Windows 8.3 temp name).
-  if (r.startsWith('..') || path.isAbsolute(r)) try { r = path.relative(fs.realpathSync(projectRoot), abs); } catch (_) { /* keep r */ }
+  if (r.startsWith('..') || path.isAbsolute(r)) try { r = path.relative(fs.realpathSync.native(projectRoot), abs); } catch (_) { /* keep r */ }
   if (r.startsWith('..') || path.isAbsolute(r) || !TEST_KEY.test(r)) return false;
   // A symlink out of the project (`tests/k -> /etc/ssl/private`) is not fixture data.
-  try { const rr = path.relative(fs.realpathSync(projectRoot), fs.realpathSync(path.resolve(projectRoot, p))); return !rr.startsWith('..') && !path.isAbsolute(rr); } catch (_) { return true; }
+  try { const rr = path.relative(fs.realpathSync.native(projectRoot), fs.realpathSync.native(path.resolve(projectRoot, p))); return !rr.startsWith('..') && !path.isAbsolute(rr); } catch (_) { return true; }
 };
 
 // Wallet / crypto / browser cookie files.
